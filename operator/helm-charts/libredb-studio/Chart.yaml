@@ -1,8 +1,8 @@
 apiVersion: v2
 name: libredb-studio
-description: Web-based SQL IDE for cloud-native teams supporting eighteen engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra, libSQL, Prometheus and Apache Kafka
+description: Web-based SQL IDE for cloud-native teams supporting twenty-six engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra, libSQL, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3 and Oxia
 type: application
-version: 0.1.71
+version: 0.1.77
 appVersion: "0.17.0"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
@@ -45,6 +45,17 @@ keywords:
   # One keyword only, like duckdb above: `kafka` is the type-id and also the word an evaluator
   # looking for a Kafka client types, so there is no second spelling to catch.
   - kafka
+  # One keyword only, like kafka above: `etcd` is the type-id and the word an evaluator looking
+  # for an etcd client types, so there is no second spelling to catch.
+  - etcd
+  # Two keywords, like the libsql pair above: `db2` is the type-id, and `ibm-db2` is what an
+  # evaluator who searches by vendor types, since the product is IBM Db2.
+  - db2
+  - ibm-db2
+  # Two keywords, like the prometheus pair above: `neo4j` is the type-id and the product, and
+  # `cypher` is what an evaluator looking for a Cypher client types.
+  - neo4j
+  - cypher
   # A relative, not a provider: VictoriaMetrics answers the Prometheus HTTP API and connects as
   # `prometheus` at the tier its gate-4 probe measured (docs/providers/README.md). The first
   # wire-compatible relative given a keyword, because an evaluator looking for a VictoriaMetrics
@@ -54,6 +65,19 @@ keywords:
   # protocol and connects as `kafka` at the tier its live read-only check measured
   # (docs/providers/README.md), and an evaluator looking for a Redpanda client types that name.
   - redpanda
+  # One keyword each, like kafka above: `milvus` and `qdrant` are the type-ids and the words an
+  # evaluator looking for a Milvus or Qdrant client types, so there is no second spelling to catch.
+  - milvus
+  - qdrant
+  # Three keywords, like the prometheus pair above with one more: `influxdb` and `influxdb3` are
+  # the two type-ids and the products, and `influxql` is what an evaluator looking for an
+  # InfluxQL client types.
+  - influxdb
+  - influxql
+  - influxdb3
+  # One keyword, like kafka above: `oxia` is the type-id and the word an evaluator looking for an
+  # Oxia client types, so there is no second spelling to catch.
+  - oxia
   - web-ide
 maintainers:
   - name: cevheri
@@ -143,7 +167,24 @@ annotations:
   # redirects, while Trino followed any nextUri a coordinator sent with the connection's
   # credential attached. An operator running managed seeds or HTTP-family engines should read
   # both; no chart template or value moves for either, so the upgrade is the image.
-  artifacthub.io/containsSecurityUpdates: "true"
+  # False: 0.1.72 adds one value, config.passkeyOrigin, and changes no behaviour on its
+  # own - unset (the default) writes no PASSKEY_ORIGIN, so every existing install renders
+  # exactly as before. Set, it is written to PASSKEY_ORIGIN, the public origin passkey
+  # sign-in (#785) is bound to. That needs an application image that includes passkey
+  # sign-in, and appVersion 0.17.0 does not read the variable, so the value acts only once
+  # an application release moves appVersion. Unlike the 0.1.52 precedent, which exposed a
+  # setting the image already read, this one exposes a setting ahead of the image.
+  # False: 0.1.73 changes chart metadata only, naming etcd in the description, the keywords and
+  # the README; no template, value or default moves.
+  # False: 0.1.74 changes chart metadata only, naming Neo4j in the description, the keywords and
+  # the README; no template, value or default moves.
+  # False: 0.1.75 changes chart metadata only, naming Db2 LUW in the description, the keywords and
+  # the README; no template, value or default moves.
+  # False: 0.1.76 changes chart metadata only, naming Milvus, Qdrant and InfluxDB in the
+  # description, the keywords and the README; no template, value or default moves.
+  # False: 0.1.77 changes chart metadata only, naming Oxia in the description, the keywords and
+  # the README; no template, value or default moves.
+  artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
       image: ghcr.io/libredb/libredb-studio:0.17.0
@@ -158,14 +199,7 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "The image serves a read-only Model Context Protocol server at /api/mcp, so the mcp block added in chart 0.1.70 takes effect with this release. Nothing is served until mcp.enabled is true. A client authenticates with a bearer token each user mints at /settings/mcp, reaches only seed connections marked mcp true whose roles admit it, and gets three read-only tools; run_read_query runs on PostgreSQL, SQLite, DuckDB and SQL Server and needs a least-privilege login on PostgreSQL and SQL Server. Setup and limits are in docs/MCP.md"
-    - "Prometheus joins as a read-only provider over its HTTP API, with no driver dependency: PromQL in the editor, and metrics, rule groups, rules, scrape pools and targets in the explorer. VictoriaMetrics connects through it. A response is parsed whole under a 32 MiB cap, and a body well under that cap can exhaust the 384 MiB heap the image runs with, so an install pointed at a large server should raise resources.limits.memory and NODE_OPTIONS together (D110 in docs/BACKLOG.md)"
-    - "Apache Kafka joins as a read-only provider: topics, consumer groups and brokers in the explorer, messages read with one JSON request from earliest, latest, an offset or a timestamp, and consumer lag per partition. It never joins a consumer group, commits an offset or creates a topic, it refuses a SASL login without TLS, and it needs Apache Kafka 3.1 or later. Redpanda connects through it"
-    - "GET /api/connections/managed withholds every field the connection store classifies as secret. It removed only password and connectionString, so the Elasticsearch API key pair and ssl.clientKey of a managed seed reached every signed-in user whose role matched the seed. A seed file that fails to parse no longer quotes the failing line in the error body of every seed route"
-    - "The ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, libSQL and Couchbase transports validate host and port before a URL exists and refuse to follow a redirect, and Trino holds every nextUri link to the connection's own origin, where it used to request any link the coordinator sent with the connection's Authorization header attached"
-    - "Redis connections walk one database's key space in the sidebar with SCAN, shown as a sample against the server's DBSIZE, and a Redis database that is not a number or that the server does not have is refused at connect instead of reading database 0; a MongoDB collection in a database other than the connected one is read from its own database instead of answering 0 rows; and a table row in the object tree expands to its columns again"
-    - "Agent mode can pause and resume a run from the rail, a run a crashed process left running is picked up and driven again by a sweep instead of staying open, and a resumed run continues its statement and database-time spend instead of starting a fresh budget"
-    - "Track app release 0.17.0 (appVersion bump; default image tag follows)"
+    - "The application image gains the Oxia provider; no template, value or default moves, and it acts once an application release moves appVersion."
 dependencies:
   - name: postgresql
     version: "16.x.x"

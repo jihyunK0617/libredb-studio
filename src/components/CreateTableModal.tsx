@@ -10,6 +10,9 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Plus, Trash2, Table as TableIcon, Type, Settings2, LoaderCircle } from "lucide-react";
 import { toast } from "sonner";
 import type { DatabaseType } from "@/lib/types";
+import type { ProviderCapabilities } from "@/lib/db/types";
+import { objectPathLabel } from "@/lib/db/object-path";
+import { quoteObjectPath } from "@/lib/query-generators";
 
 interface ColumnDefinition {
   name: string;
@@ -25,6 +28,16 @@ interface CreateTableModalProps {
   onClose: () => void;
   onTableCreated: (sql: string) => void;
   dbType?: DatabaseType;
+  /**
+   * The container the table is created in: the path of the object-tree folder it was asked
+   * for in. Without it the statement named the table alone and it landed in the session's
+   * default container, measured on MySQL 26.7.0 as `e2e.ct_other` for a Create Table asked
+   * for under `e2e_other` (#1391). Empty or absent keeps the bare name, which is what the
+   * flat explorer's button and an engine with no container level ask for.
+   */
+  container?: readonly string[];
+  /** The connection's capabilities, which quote the qualified name in its own dialect. */
+  capabilities?: ProviderCapabilities;
 }
 
 /**
@@ -40,6 +53,9 @@ interface CreateTableModalProps {
  * resolves it against the connected engine.
  */
 const AUTO_INCREMENT = "__auto_increment__";
+
+/** No container, so the bare table name. One shared reference rather than a literal per render. */
+const NO_CONTAINER: readonly string[] = [];
 
 /**
  * Per-engine spellings for the two things this form actually offers.
@@ -248,12 +264,13 @@ const DIALECTS: Partial<Record<DatabaseType, CreateTableDialect>> = {
 };
 
 /**
- * PostgreSQL is the fallback for an unknown or absent `dbType` because it is what this
- * form emitted for every engine before #648: an unconnected modal keeps the behaviour it
- * had rather than picking a new one.
+ * PostgreSQL is the dialect for an absent `dbType` because it is what this form emitted
+ * for every engine before #648: an unconnected modal keeps the behaviour it had rather
+ * than picking a new one. A connected engine with no row answers `undefined`, which the
+ * component refuses rather than writing PostgreSQL DDL for it.
  */
-function resolveDialect(dbType: DatabaseType | undefined): CreateTableDialect {
-  return (dbType && DIALECTS[dbType]) || POSTGRES_DIALECT;
+function resolveDialect(dbType: DatabaseType | undefined): CreateTableDialect | undefined {
+  return dbType === undefined ? POSTGRES_DIALECT : DIALECTS[dbType];
 }
 
 /** The first column the form starts with, which is an auto-increment key wherever there is one. */
@@ -270,8 +287,29 @@ function defaultColumns(dialect: CreateTableDialect): ColumnDefinition[] {
   ];
 }
 
-export function CreateTableModal({ isOpen, onClose, onTableCreated, dbType }: CreateTableModalProps) {
-  const dialect = resolveDialect(dbType);
+/**
+ * The modal is mounted for every connection (`StudioOverlays`), so an engine without a
+ * dialect renders nothing while closed. OPENING it for one is a caller that skipped the
+ * `supportsCreateTable` gate, and that throws: the form has no grammar to write for it.
+ */
+export function CreateTableModal(props: CreateTableModalProps) {
+  const dialect = resolveDialect(props.dbType);
+  if (dialect === undefined) {
+    if (props.isOpen) throw new Error(`CreateTableModal: no create-table dialect for "${props.dbType}"`);
+    return null;
+  }
+  return <CreateTableForm {...props} dialect={dialect} />;
+}
+
+function CreateTableForm({
+  isOpen,
+  onClose,
+  onTableCreated,
+  dbType,
+  container = NO_CONTAINER,
+  capabilities,
+  dialect,
+}: CreateTableModalProps & { dialect: CreateTableDialect }) {
   const [tableName, setTableName] = useState("");
   const [columns, setColumns] = useState<ColumnDefinition[]>(() => defaultColumns(dialect));
   const [isSubmitting] = useState(false);
@@ -314,6 +352,18 @@ export function CreateTableModal({ isOpen, onClose, onTableCreated, dbType }: Cr
     setColumns(columns.map((col, i) => (i === index ? { ...col, ...updates } : col)));
   };
 
+  // Qualified only when there is a container AND the capabilities to quote it with. The
+  // tree offers the item only once capabilities have loaded, so the second half guards an
+  // imperative caller rather than a reachable state.
+  //
+  // Only the CONTAINER is quoted. The container is a catalog name read back from the engine,
+  // so quoting keeps it exact; the table name is what the user typed, and it stays exactly as
+  // the flat button writes it. Quoting it too would make the two buttons create different
+  // objects on an engine that folds case: on Oracle, `APP."orders"` is a lowercase table a
+  // later `SELECT * FROM orders` does not find.
+  const qualified = container.length > 0 && capabilities !== undefined;
+  const nameInContainer = (name: string) => (qualified ? `${quoteObjectPath(container, capabilities)}.${name}` : name);
+
   const generateSQL = () => {
     if (!tableName.trim()) return "";
 
@@ -341,8 +391,10 @@ export function CreateTableModal({ isOpen, onClose, onTableCreated, dbType }: Cr
           // fails the second time. The surviving sequence resumes its count, which costs
           // a few ids and nothing else.
           const sequence = `${tableName}_${col.name}_seq`;
-          prelude.push(`CREATE SEQUENCE IF NOT EXISTS ${sequence};`);
-          clause += ` DEFAULT nextval('${sequence}')`;
+          // In the table's own container, so the two land side by side.
+          const sequenceName = nameInContainer(sequence);
+          prelude.push(`CREATE SEQUENCE IF NOT EXISTS ${sequenceName};`);
+          clause += ` DEFAULT nextval('${sequenceName.replaceAll("'", "''")}')`;
         }
         return `  ${clause}`;
       }
@@ -363,7 +415,7 @@ export function CreateTableModal({ isOpen, onClose, onTableCreated, dbType }: Cr
       return `  ${def}`;
     });
 
-    const create = `CREATE TABLE ${tableName} (\n${colDefs.join(",\n")}\n);`;
+    const create = `CREATE TABLE ${nameInContainer(tableName)} (\n${colDefs.join(",\n")}\n);`;
     return prelude.length ? `${prelude.join("\n")}\n${create}` : create;
   };
 
@@ -395,7 +447,9 @@ export function CreateTableModal({ isOpen, onClose, onTableCreated, dbType }: Cr
             </div>
             <div>
               <DialogTitle className="text-xs font-medium">Create New Table</DialogTitle>
-              <p className="text-xs text-fg-muted mt-1 font-medium">Define schema structure</p>
+              <p className="text-xs text-fg-muted mt-1 font-medium">
+                {qualified ? `In ${objectPathLabel(container)}` : "Define schema structure"}
+              </p>
             </div>
           </div>
         </DialogHeader>

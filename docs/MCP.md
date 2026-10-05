@@ -10,9 +10,13 @@ It is off by default.
   It speaks revision 2026-07-28 and, without sessions, the 2025 revisions 2025-11-25 and 2025-06-18 that most clients still use.
 - Three tools, each annotated read-only and closed-world:
   - `list_connections` lists the connections opted in for MCP that your token's role may use, without credentials.
-    It works for every engine.
+    It works for every engine but etcd and Oxia, whose connections the seed file cannot opt in.
   - `inspect_schema` lists one connection's tables with their columns and, on request, their indexes.
-    It works on every engine: it lists every object kind the engine reads rows from, such as views beside tables, MongoDB collections, Redis keyspaces and search indexes, and `kind` names which one each entry is.
+    It works on every engine but etcd and Oxia: it lists every object kind the engine reads rows from, such as views beside tables, MongoDB collections, Redis keyspaces and search indexes, and `kind` names which one each entry is.
+    A column an engine only inferred from sampled data, rather than read from a declaration, is never listed, so a table may hold fields the answer does not show; `columns_omitted` counts only the columns beyond the 50-column cap, and agent grounding and the AI panels never receive such a column either.
+    On Milvus it lists the collection's declared fields, with the dynamic field as one `$meta` column and never a key inside it.
+    On Qdrant it lists payload-index fields and vectors only, and says that other payload keys may exist: the keys Studio samples from points never reach an MCP client.
+    On InfluxDB (InfluxQL) it lists measurements with their tag and field keys, and on InfluxDB 3 (SQL) tables with their columns; the `_internal` database and the `system.*` tables of a 3.x server are never returned.
   - `run_read_query` runs one read-only statement: a `SELECT` (a `WITH` is fine), `VALUES`, `TABLE`, or `EXPLAIN` without `ANALYZE`.
     Runs on PostgreSQL, SQLite, DuckDB and SQL Server; other engines refuse it, so use inspect_schema there.
 - Read-only is the database's own enforcement, not a filter over SQL text: `run_read_query` takes the connection under Studio's agent read-only execution profile and runs through the provider's read-only statement path, which PostgreSQL enforces with a read-only transaction, SQLite and DuckDB with a read-only open, and SQL Server by verifying the principal cannot write.
@@ -108,12 +112,13 @@ It shows whether MCP is ready on this server, what an operator has to set when i
 When it is ready, **Create token** mints one for you and shows it once: copy it then, because it is not shown again and nothing about it is stored.
 
 - A token is valid for `LIBREDB_MCP_TOKEN_TTL_DAYS` days, 30 by default.
-- It carries the role you had when you minted it, so a lowered role keeps working until the token expires or the label changes.
-- Changing `LIBREDB_MCP_TOKEN_LABEL` revokes every MCP token at once, and it is the only revocation there is.
-- Creating a token needs a sign-in from the last ten minutes: an older session is asked to sign in again, because a session lives 24 hours and cannot be ended on the server.
-- Deleting a local user, disabling an OIDC account or changing a password leaves that user's MCP tokens valid until they expire.
-  Removing a person's access therefore takes two steps: stop them signing in, then rotate `LIBREDB_MCP_TOKEN_LABEL` once ten minutes have passed, so no session they still hold can mint under the new label.
-  Rotating `JWT_SECRET` instead ends every session and revokes every MCP token at once.
+- It carries the role you had when you minted it.
+- Creating a token needs a sign-in from the last ten minutes: an older session is asked to sign in again, because a session lives 24 hours.
+- With local sign-in and `STORAGE_PROVIDER=sqlite` or `postgres`, every call checks the token against the stored account, as a session is checked, so a token stops working at its next call when its account is disabled, changes role, has its password set by an admin, is deleted, removes one of its passkeys, or has its passkeys removed by an admin.
+- Changing `LIBREDB_MCP_TOKEN_LABEL` revokes every MCP token at once.
+  Under OIDC and with `STORAGE_PROVIDER=local` there is no stored account to check, so that is the one revocation there: a lowered role, a disabled OIDC account or a changed password leaves the tokens valid until they expire or the label changes.
+  Removing a person's access there takes two steps: stop them signing in, then rotate `LIBREDB_MCP_TOKEN_LABEL` once ten minutes have passed, so no session they still hold can mint under the new label.
+- Rotating `JWT_SECRET` ends every session and revokes every MCP token at once.
 - A changed `LIBREDB_MCP_URL`, and under npx a changed `--host` or `--port`, invalidates every token too.
 
 ## Client configuration
@@ -270,6 +275,7 @@ For the first few seconds after that service starts, `opencode mcp list` can say
 
 - Authentication is a static bearer token that Studio mints: there is no OAuth and no protected resource metadata document, so a client needs its `Authorization` header configured.
 - `run_read_query` reads at most 1000 rows and 1 MiB from the database, and answers at most `max_rows` rows (default 100, at most 500) and 32 KiB; `truncated`, `truncated_by`, `pagination.hasMore` and `pagination.nextOffset` say what was cut and where the next page starts.
+- A NaN, Infinity or -Infinity cell in a `run_read_query` answer is the string `"NaN"`, `"Infinity"` or `"-Infinity"`; it used to be `null`, which a client could not tell from SQL NULL. A text cell holding one of those words looks the same.
 - A query with its own `LIMIT` or `TOP`, and `VALUES`, `TABLE` or `EXPLAIN`, cannot be paged with `offset`; the answer says how to page it in SQL.
 - `inspect_schema` and `list_connections` fit each page to 32 KiB, and `has_more` and `next_offset` say where the next page starts.
 - Every `POST` spends one slot of the same per-user budget the database routes use (`RATE_LIMIT_QUERY_MAX`, 120 a minute by default), so a session and an MCP token of one person share it.

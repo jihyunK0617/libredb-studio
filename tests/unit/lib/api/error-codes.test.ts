@@ -31,6 +31,8 @@ const GROUPS = {
   ],
   llm: ["LLM_SAFETY", "LLM_AUTH", "LLM_RATE_LIMIT", "LLM_CONFIG", "LLM_UNCONFIGURED", "LLM_STREAM", "LLM_ERROR"],
   rateLimit: ["RATE_LIMITED"],
+  session: ["AUTH_REQUIRED"],
+  connectionPolicy: ["CUSTOM_CONNECTIONS_DISABLED"],
   generic: ["INTERNAL_ERROR", "NETWORK_ERROR"],
 } as const;
 
@@ -57,6 +59,16 @@ describe("ApiErrorCode", () => {
 
   test("contains generic error codes", () => {
     for (const code of GROUPS.generic) expect(ApiErrorCode[code]).toBe(code);
+  });
+
+  test("contains the session-required code, distinct from a database's AUTH_ERROR", () => {
+    expect(ApiErrorCode.AUTH_REQUIRED).toBe("AUTH_REQUIRED");
+    expect(ApiErrorCode.AUTH_REQUIRED).not.toBe(ApiErrorCode.AUTH_ERROR);
+  });
+
+  test("contains the custom-connections refusal code, distinct from a role refusal's AUTH_ERROR", () => {
+    expect(ApiErrorCode.CUSTOM_CONNECTIONS_DISABLED).toBe("CUSTOM_CONNECTIONS_DISABLED");
+    expect(ApiErrorCode.CUSTOM_CONNECTIONS_DISABLED).not.toBe(ApiErrorCode.AUTH_ERROR);
   });
 
   test("contains the application rate-limit error code", () => {

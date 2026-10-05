@@ -28,7 +28,7 @@ RUN bun install --frozen-lockfile
 # between whichever ones are present. Every stage here is glibc, so the glibc
 # package is the one installed and the one loaded; keeping the stages on the
 # same base is what makes that hold.
-FROM node:26.9.0-trixie-slim AS builder
+FROM node:26.10.0-trixie-slim AS builder
 WORKDIR /usr/src/app
 COPY --from=deps /usr/src/app/node_modules ./node_modules
 COPY . .
@@ -98,6 +98,14 @@ RUN node scripts/copy-monaco.mjs && npx next build
 # image DOES load would otherwise surface as a provider failing at runtime, long
 # after the build went green.
 #
+# db2-node (#786) is the opposite of the @duckdb case: one package with all
+# eight prebuilt addons at its root, which its index.js reaches through static
+# require literals, so file tracing copies every one of them into
+# .next/standalone/node_modules/db2-node and nothing else needs a COPY. Only
+# that traced tree reaches the runner, so only it is pruned, to the glibc addon
+# for the build arch (glob plus $ARCH, as above), then counted and loaded:
+# builder and runner share the trixie-slim base, so a load here is a load there.
+#
 # oracledb keeps every platform's addon on purpose. This is the only variant
 # where Thick mode can be turned on at all, the whole build/ directory is ~3 MB,
 # and the package resolves the addon at runtime from its own __dirname.
@@ -112,6 +120,10 @@ RUN set -eux; \
       rm -rf "$root/better-sqlite3/deps" "$root/better-sqlite3/src" "$root/better-sqlite3/binding.gyp"; \
       true; \
     done; \
+    find .next/standalone/node_modules/db2-node -maxdepth 1 -type f -name 'db2-node.*.node' ! -name "db2-node.linux-${ARCH}-gnu.node" -delete; \
+    test -f ".next/standalone/node_modules/db2-node/db2-node.linux-${ARCH}-gnu.node"; \
+    test "$(find .next/standalone/node_modules/db2-node -name '*.node' | wc -l)" -eq 1; \
+    node -e "require('/usr/src/app/.next/standalone/node_modules/db2-node')"; \
     test -f "node_modules/@duckdb/node-bindings-linux-${ARCH}/libduckdb.so"; \
     test -d "node_modules/@img/sharp-libvips-linux-${ARCH}"; \
     test -f "node_modules/better-sqlite3/prebuilds/linux-${ARCH}.node"; \
@@ -125,7 +137,7 @@ RUN set -eux; \
 
 # Production image - use Node.js slim for lower memory footprint
 # trixie-slim: glibc must match the stage where native modules were built (see builder).
-FROM node:26.9.0-trixie-slim AS runner
+FROM node:26.10.0-trixie-slim AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
@@ -208,6 +220,10 @@ COPY --from=builder /usr/src/app/node_modules/detect-libc ./node_modules/detect-
 # Keep in sync with scripts/build-standalone-payload.sh.
 COPY --from=builder /usr/src/app/node_modules/oracledb ./node_modules/oracledb
 
+# Notices for the Rust crates compiled into db2-node's addons, which its npm
+# tarball does not carry (keep scripts/build-standalone-payload.sh in sync).
+COPY --from=builder /usr/src/app/THIRD_PARTY_NOTICES.txt ./THIRD_PARTY_NOTICES.txt
+
 # Vendored sample database templates (the SQLite employees sample). Read at
 # runtime via fs relative to process.cwd() (/app), so output file tracing
 # never sees them — copy explicitly (keep scripts/build-standalone-payload.sh
@@ -235,6 +251,13 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # outside the standalone payload so the native channels - which bind 127.0.0.1
 # by design (#134) - can never inherit container bind policy.
 COPY docker/bind-address.mjs /usr/local/lib/libredb-studio/bind-address.mjs
+# The CapRover discovery exporter (docker/discover.mjs) sits next to it for the
+# same two reasons. The auto-connect template runs it as a second app, as root
+# and with the Docker socket mounted, so it is copied WITHOUT --chown: the
+# uid 1001 web process must never be able to rewrite a script that holds the
+# socket. No image creates the directory it writes to; Docker creates the named
+# volume's root as root:root 0755, the only shape the exporter accepts.
+COPY docker/discover.mjs /usr/local/lib/libredb-studio/discover.mjs
 
 # Render uses PORT env variable, default to 3000
 EXPOSE 3000/tcp

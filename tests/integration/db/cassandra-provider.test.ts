@@ -518,6 +518,13 @@ describe("capabilities", () => {
     expect(capabilities.statementTerminator).toBeUndefined();
   });
 
+  test("no constant predicate and no multi-row INSERT, so the generators write neither (#1410)", () => {
+    // Measured on 5.0.9: `... WHERE 1=1 LIMIT 100;` is "no viable alternative at input
+    // '1'", and `INSERT ... VALUES (...), (...)` is "mismatched input ',' expecting EOF".
+    expect(capabilities.supportsConstantPredicate).toBe(false);
+    expect(capabilities.supportsMultiRowInsert).toBe(false);
+  });
+
   test("the schema tree reloads on the DDL that changes it", () => {
     const pattern = new RegExp(capabilities.schemaRefreshPattern, "i");
 
@@ -2112,7 +2119,7 @@ describe("the object surface declaration", () => {
    * The source declaration, both directions (#789).
    *
    * `sql` and NOT `cql` on every one of the six. MEASURED in this epic's Monaco census: the
-   * installed monaco-editor 0.56.0 bundle registers 89 language ids and `cql` is not among
+   * installed monaco-editor 0.57.0 bundle registers 89 language ids and `cql` is not among
    * them, and an unregistered id degrades to plain text with no throw and nothing observable.
    * `docs/providers/cassandra.md` states that as a limitation rather than hiding it.
    *

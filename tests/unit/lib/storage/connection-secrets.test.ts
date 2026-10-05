@@ -91,6 +91,8 @@ describe("the classification is exhaustive by construction", () => {
       [
         "agentPassword",
         "agentUser",
+        // Db2's consent to a cleartext password (#786). A choice about the transport, so `public`.
+        "allowInsecureAuth",
         // Elasticsearch's API key pair (#708). Unlike `user`, an id is one generated,
         // opaque half of a credential pair rather than a name an operator chose, so
         // both halves are classified secret below.
@@ -102,6 +104,8 @@ describe("the classification is exhaustive by construction", () => {
         "color",
         "connectionString",
         "createdAt",
+        // Oxia's data-server addresses. Addresses, as host is; the token they receive is the secret.
+        "dataServers",
         "database",
         "schema",
         "environment",
@@ -117,6 +121,9 @@ describe("the classification is exhaustive by construction", () => {
         "password",
         "port",
         "queryTimeout",
+        // Whether the provider refuses writes on this connection (#1089). A mode, not a credential:
+        // it grants nothing, and the browser reads it to draw the Read-only marker.
+        "readOnly",
         // Kafka's SASL mechanism (#1088). A mechanism NAME (`SCRAM-SHA-512`), which the
         // broker's own configuration lists in the clear, so `public`; the password it checks
         // is the secret and is classified above.
@@ -167,6 +174,12 @@ describe("the classification is exhaustive by construction", () => {
 
   test("a SASL mechanism names how the password is checked, and is no secret itself", () => {
     expect(CONNECTION_FIELDS.saslMechanism).toBe("public");
+  });
+
+  test("the read-only mode is public, because the browser reads it to draw the marker (#1089)", () => {
+    // Classified secret, it would be stripped from every managed seed the browser is sent
+    // (`withoutSecretFields`), and a read-only seed would lose its marker and its Operations line.
+    expect(CONNECTION_FIELDS.readOnly).toBe("public");
   });
 });
 
@@ -371,6 +384,18 @@ describe("withoutSecretFields", () => {
     const withheld = withoutSecretFields({ ...fullConnection(), password: "" });
     expect(withheld.password).toBe("");
     expect("apiKeySecret" in withheld).toBe(false);
+  });
+
+  test("a managed connection keeps dataServers and loses its password", () => {
+    const managed: DatabaseConnection = {
+      ...fullConnection(),
+      managed: true,
+      dataServers: "oxia-0.internal:6648,oxia-1.internal:6648",
+    };
+    const withheld = withoutSecretFields(managed);
+    expect(withheld.dataServers).toBe("oxia-0.internal:6648,oxia-1.internal:6648");
+    expect("password" in withheld).toBe(false);
+    expect(CONNECTION_FIELDS.dataServers).toBe("public");
   });
 
   test("leaves the connection it was given untouched", () => {

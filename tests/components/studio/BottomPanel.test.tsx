@@ -136,6 +136,23 @@ mock.module("@/components/SchemaDiff", () => ({
   },
 }));
 
+// Captured: the graph tests assert the masking inputs reach it exactly as they reach
+// the grid. Its own behaviour is tested against a headless canvas in GraphView.test.tsx.
+// A recorded exception to the graph view spec's "no mock.module() in new tests": the
+// panel gives no way to hand GraphView its injectable canvas factory, and the real one
+// needs a canvas happy-dom lacks, so the real view cannot render here. This file
+// already replaces every other lazy view the same way, and runs in its own process.
+let capturedGraphViewProps: Record<string, unknown> = {};
+
+mock.module("@/components/results-graph/GraphView", () => ({
+  GraphView: (props: Record<string, unknown>) => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const React = require("react");
+    capturedGraphViewProps = props;
+    return React.createElement("div", { "data-testid": "graphview" }, "GraphView");
+  },
+}));
+
 // ---- Mock storage so the ChartDashboardLazy saved-charts grid is controllable ----
 
 const mockGetSavedCharts = mock(() => [] as SavedChartConfig[]);
@@ -174,17 +191,26 @@ function makeSavedChart(overrides: Partial<SavedChartConfig> = {}): SavedChartCo
 }
 
 function createDefaultProps(overrides: Partial<Record<string, unknown>> = {}) {
+  // The panel no longer receives the whole tab (X5), so a `currentTab` override is
+  // unpacked into the granular fields the panel reads; the rest is spread untouched.
+  const { currentTab, ...rest } = overrides;
+  const tab = (currentTab ?? {}) as {
+    query?: string;
+    result?: unknown;
+    runError?: string;
+    resultQuery?: string;
+    explainPlan?: unknown;
+  };
   return {
     mode: "results" as BottomPanelMode,
     onSetMode: mock(() => {}),
-    currentTab: {
-      id: "tab-1",
-      name: "Query 1",
-      query: "SELECT 1",
-      result: null,
-      isExecuting: false,
-      type: "sql" as const,
-    },
+    result: tab.result ?? null,
+    explainPlan: tab.explainPlan,
+    // The shell hands the statement only while the explain view is open (X5); a fixture
+    // passes it regardless, since the panel reads it only in that view.
+    explainQuery: tab.query ?? "SELECT 1",
+    resultQuery: tab.resultQuery,
+    runError: tab.runError,
     schema: [],
     schemaContext: "[]",
     activeConnection: null,
@@ -212,9 +238,16 @@ function createDefaultProps(overrides: Partial<Record<string, unknown>> = {}) {
     isLoadingMore: false,
     onExportResults: mock(() => {}),
     onCopyResults: mock(() => {}),
-    ...overrides,
+    ...rest,
   };
 }
+
+const GRAPH_RESULT = {
+  rows: [{ n: { "~graph": "node", elementId: "4:a", labels: ["Person"], properties: { name: "Alice" } } }],
+  fields: ["n"],
+  rowCount: 1,
+  executionTime: 2,
+};
 
 describe("BottomPanel", () => {
   /*
@@ -225,8 +258,8 @@ describe("BottomPanel", () => {
     more importantly, stay independent of the order the tests happen to run in.
   */
   beforeAll(async () => {
-    for (const mode of ["charts", "pivot", "docs", "schemadiff", "explain"] as const) {
-      const props = createDefaultProps({ mode });
+    for (const mode of ["charts", "pivot", "docs", "schemadiff", "explain", "graph"] as const) {
+      const props = createDefaultProps({ mode, currentTab: { result: GRAPH_RESULT } });
       await act(async () => {
         render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
       });
@@ -329,6 +362,56 @@ describe("BottomPanel", () => {
     expect(queryByText("Export")).toBeNull();
   });
 
+  /**
+   * A script that stopped on a failing statement keeps the earlier statements' result AND says it
+   * stopped (#1385). With no rows to show, the grid is left out: its "The operation was
+   * successful" would contradict the failure.
+   */
+  describe("a script that stopped on a failing statement", () => {
+    const scriptTab = (rows: Record<string, unknown>[]) => ({
+      id: "tab-1",
+      name: "Query 1",
+      query: "SELECT 1 AS a; SELECT * FROM nope",
+      result: { rows, fields: ["a"], rowCount: rows.length, executionTime: 5 },
+      runError: "Statement 2 of 3 failed: unknown catalog item 'nope'\nSELECT * FROM nope",
+      isExecuting: false,
+      type: "sql" as const,
+    });
+
+    test("shows the failure above the earlier statement's rows", () => {
+      const props = createDefaultProps({ mode: "results", currentTab: scriptTab([{ a: 1 }]) });
+      const { getByTestId, queryByTestId } = render(
+        <BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />,
+      );
+
+      expect(getByTestId("script-failure").textContent).toContain("The script stopped at a failing statement.");
+      expect(getByTestId("script-failure-message").textContent).toContain("Statement 2 of 3 failed");
+      expect(getByTestId("resultsgrid")).toBeTruthy();
+      expect(queryByTestId("run-failure")).toBeNull();
+    });
+
+    test("leaves out an empty grid, so nothing says the operation was successful", () => {
+      const props = createDefaultProps({ mode: "results", currentTab: scriptTab([]) });
+      const { getByTestId, queryByTestId } = render(
+        <BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />,
+      );
+
+      expect(getByTestId("script-failure-message").textContent).toContain("unknown catalog item");
+      expect(queryByTestId("resultsgrid")).toBeNull();
+    });
+
+    test("a result without a run error shows no banner", () => {
+      const tab = { ...scriptTab([{ a: 1 }]), runError: undefined };
+      const props = createDefaultProps({ mode: "results", currentTab: tab });
+      const { queryByTestId, getByTestId } = render(
+        <BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />,
+      );
+
+      expect(queryByTestId("script-failure")).toBeNull();
+      expect(getByTestId("resultsgrid")).toBeTruthy();
+    });
+  });
+
   test("tab click fires onSetMode with correct mode", () => {
     const onSetMode = mock(() => {});
     const props = createDefaultProps({ onSetMode });
@@ -418,6 +501,14 @@ describe("BottomPanel", () => {
       expect(capturedResultsGridProps.supportsResultPagination).toBe(true);
     });
 
+    test("the columns the editor must not write are the provider's own (K24)", () => {
+      const refused = { type: "^(CLOB|DBCLOB|BLOB)$", reason: "not written" };
+      const props = pagedProps({ supportsResultPagination: true, inlineEditRefusedColumns: refused });
+      render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      expect(capturedResultsGridProps.inlineEditRefusedColumns).toBe(refused);
+    });
+
     test("a provider that cannot page hands down its false, not an absent flag", () => {
       // Criterion 4. `false` and `undefined` render identically — the grid gates on
       // `=== true` — so only reading the value back tells a provider that declared it
@@ -463,6 +554,78 @@ describe("BottomPanel", () => {
       } else {
         expect(scope.textContent).toContain(shortfall);
       }
+    });
+  });
+
+  describe("the Graph tab (graph view spec)", () => {
+    const PLAIN_RESULT = { rows: [{ id: 1 }], fields: ["id"], rowCount: 1, executionTime: 1 };
+
+    test("is offered only when the result holds a graph value", () => {
+      const plain = createDefaultProps({ currentTab: { result: PLAIN_RESULT } });
+      const { queryByText, rerender } = render(
+        <BottomPanel {...(plain as React.ComponentProps<typeof BottomPanel>)} />,
+      );
+      expect(queryByText("Graph")).toBeNull();
+
+      const empty = createDefaultProps();
+      rerender(<BottomPanel {...(empty as React.ComponentProps<typeof BottomPanel>)} />);
+      expect(queryByText("Graph")).toBeNull();
+
+      // Found at any depth, here a node inside a list.
+      const nested = createDefaultProps({
+        currentTab: { result: { ...GRAPH_RESULT, rows: [{ n: [GRAPH_RESULT.rows[0].n] }] } },
+      });
+      rerender(<BottomPanel {...(nested as React.ComponentProps<typeof BottomPanel>)} />);
+      expect(queryByText("Graph")).not.toBeNull();
+    });
+
+    test("sits right after Results, and a click asks for the graph mode", () => {
+      const onSetMode = mock(() => {});
+      const props = createDefaultProps({ onSetMode, currentTab: { result: GRAPH_RESULT } });
+      const { getByText, getAllByRole } = render(
+        <BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />,
+      );
+      expect(
+        getAllByRole("button")
+          .map((button) => button.textContent?.trim())
+          .slice(0, 2),
+      ).toEqual(["Results", "Graph"]);
+      fireEvent.click(getByText("Graph"));
+      expect(onSetMode).toHaveBeenCalledWith("graph");
+    });
+
+    test("draws the tab's result with the grid's own masking inputs", () => {
+      const maskingConfig = { ...createDefaultProps().maskingConfig, enabled: true };
+      const props = createDefaultProps({
+        mode: "graph",
+        currentTab: { result: GRAPH_RESULT },
+        maskingEnabled: true,
+        userRole: "user",
+        maskingConfig,
+      });
+      const { getByTestId, getByText, queryByTestId } = render(
+        <BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />,
+      );
+      expect(getByTestId("graphview")).not.toBeNull();
+      expect(queryByTestId("resultsgrid")).toBeNull();
+      expect(getByText("Graph").closest("button")?.className).toContain("text-hue-green");
+      expect(capturedGraphViewProps.result).toBe(GRAPH_RESULT);
+      expect(capturedGraphViewProps.maskingEnabled).toBe(true);
+      expect(capturedGraphViewProps.userRole).toBe("user");
+      expect(capturedGraphViewProps.maskingConfig).toBe(maskingConfig);
+      // The result's own export menu belongs to the grid; the graph has its own.
+      expect(queryByTestId("export-row-count")).toBeNull();
+    });
+
+    test("a graph mode left over from a graph result shows the grid for a result without one", () => {
+      const props = createDefaultProps({ mode: "graph", currentTab: { result: PLAIN_RESULT } });
+      const { getByTestId, queryByTestId, getByText } = render(
+        <BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />,
+      );
+      expect(queryByTestId("graphview")).toBeNull();
+      expect(getByTestId("resultsgrid")).not.toBeNull();
+      expect(getByText("Results").closest("button")?.className).toContain("text-hue-blue");
+      expect(queryByTestId("export-row-count")).not.toBeNull();
     });
   });
 
@@ -536,6 +699,80 @@ describe("BottomPanel", () => {
     });
     const { queryByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
     expect(queryByText("Export")).not.toBeNull();
+  });
+
+  // A masked result is exported masked, and the menu says so (#1433). The notice names only the
+  // columns the file builder will actually mask, and SQL INSERT is withheld while there are any.
+  describe("export of a masked result (#1433)", () => {
+    const EMAIL_RESULT = {
+      rows: [{ id: 1, email: "a@b.co" }],
+      fields: ["id", "email"],
+      rowCount: 1,
+      executionTime: 3,
+    };
+    const emailMasking = {
+      enabled: true,
+      patterns: [
+        {
+          id: "p-email",
+          name: "Email",
+          columnPatterns: ["email"],
+          maskType: "email" as const,
+          enabled: true,
+          isBuiltin: true,
+        },
+      ],
+      roleSettings: {
+        admin: { canToggle: true, canReveal: true },
+        user: { canToggle: false, canReveal: false },
+      },
+    };
+    const maskedProps = (overrides: Record<string, unknown>) =>
+      createDefaultProps({
+        mode: "results",
+        currentTab: { result: EMAIL_RESULT },
+        maskingConfig: emailMasking,
+        ...overrides,
+      });
+
+    test("names the masked columns and withholds SQL INSERT in both lists", async () => {
+      const props = maskedProps({ maskingEnabled: true });
+      const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      await userEvent.click(getByText("Export"));
+      const menu = within(document.body as HTMLElement);
+
+      expect(menu.getByTestId("export-masked").textContent).toContain("Masked columns (email)");
+      expect(menu.queryByText("Export as SQL INSERT")).toBeNull();
+      expect(menu.queryByText("Copy as SQL INSERT")).toBeNull();
+      expect(menu.queryByText("Export as CSV")).not.toBeNull();
+      expect(menu.queryByText("Export as DDL (CREATE TABLE)")).not.toBeNull();
+    });
+
+    test("says nothing while masking is off", async () => {
+      const props = maskedProps({ maskingEnabled: false });
+      const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      await userEvent.click(getByText("Export"));
+      const menu = within(document.body as HTMLElement);
+
+      expect(menu.queryByTestId("export-masked")).toBeNull();
+      expect(menu.queryByText("Export as SQL INSERT")).not.toBeNull();
+    });
+
+    test("says nothing when masking is on but no column of the result matches a pattern", async () => {
+      const props = maskedProps({
+        maskingEnabled: true,
+        currentTab: { result: { ...EMAIL_RESULT, rows: [{ id: 1 }], fields: ["id"] } },
+      });
+      const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      await userEvent.click(getByText("Export"));
+      const menu = within(document.body as HTMLElement);
+
+      expect(menu.queryByTestId("export-masked")).toBeNull();
+      expect(menu.queryByText("Copy as SQL INSERT")).not.toBeNull();
+    });
   });
 
   // An export writes the rows the grid HOLDS, and the grid holds one page. The count

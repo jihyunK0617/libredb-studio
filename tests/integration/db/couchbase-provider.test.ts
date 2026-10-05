@@ -175,8 +175,16 @@ let queryHttpCode = 200;
 let deferredIndexRows: Record<string, unknown>[] = [];
 let networkFailure: Error | null = null;
 
+/**
+ * A body sent as these exact bytes rather than through `JSON.stringify`, which
+ * cannot write the unquoted integer past 2^53 a live cluster sends.
+ */
+class RawBody {
+  constructor(readonly text: string) {}
+}
+
 function jsonResponse(payload: unknown, httpCode: number): Response {
-  return new Response(JSON.stringify(payload), {
+  return new Response(payload instanceof RawBody ? payload.text : JSON.stringify(payload), {
     status: httpCode,
     headers: { "content-type": "application/json" },
   });
@@ -380,6 +388,73 @@ describe("CouchbaseProvider validation", () => {
     expect(() => new CouchbaseProvider(makeConnection({ database: undefined }))).toThrow(/bucket/i);
   });
 
+  test.each([undefined, ""])("uses the URI bucket when database is %s", async (database) => {
+    const config = makeConnection({ host: undefined, database, connectionString: "couchbase://localhost/travel" });
+    const provider = new CouchbaseProvider(config);
+    await provider.connect();
+    await provider.getStorageStats();
+    await provider.query("SELECT 1");
+
+    expect(manageUrls).toContain("http://localhost:8091/pools/default/buckets/travel");
+    expect(bodyOf("SELECT 1").query_context).toBe("default:`travel`");
+    expect(config.database).toBe(database);
+    await provider.disconnect();
+  });
+
+  test("explicit database overrides the URI bucket for management and queries", async () => {
+    const provider = await connectProvider({ connectionString: "couchbase://localhost/other" });
+    await provider.getStorageStats();
+    await provider.query("SELECT 1");
+
+    expect(manageUrls.some((url) => url.endsWith("/buckets/travel"))).toBe(true);
+    expect(bodyOf("SELECT 1").query_context).toBe("default:`travel`");
+    await provider.disconnect();
+  });
+
+  test("accepts a bucket path with the secure Couchbase scheme", () => {
+    expect(
+      () => new CouchbaseProvider(makeConnection({ database: "", connectionString: "couchbases://localhost/travel" })),
+    ).not.toThrow();
+  });
+
+  test("decodes only the first URI path segment as the bucket", async () => {
+    const provider = await connectProvider({
+      database: undefined,
+      connectionString: "couchbase://localhost/travel%2Dsample/ignored?bucket=other#fragment",
+    });
+    await provider.getStorageStats();
+    await provider.query("SELECT 1");
+
+    expect(manageUrls.some((url) => url.endsWith("/buckets/travel-sample"))).toBe(true);
+    expect(bodyOf("SELECT 1").query_context).toBe("default:`travel-sample`");
+    await provider.disconnect();
+  });
+
+  test.each([
+    ["couchbase://localhost/100%", "100%"],
+    ["couchbase://localhost/%ZZ", "%ZZ"],
+  ])("keeps a literal %% in the URI bucket %s verbatim", async (connectionString, bucket) => {
+    const provider = await connectProvider({ database: undefined, connectionString });
+    await provider.getStorageStats();
+    await provider.query("SELECT 1");
+
+    expect(manageUrls.some((url) => url.endsWith(`/buckets/${encodeURIComponent(bucket)}`))).toBe(true);
+    expect(bodyOf("SELECT 1").query_context).toBe(`default:\`${bucket}\``);
+    await provider.disconnect();
+  });
+
+  test.each([undefined, "couchbase://localhost", "couchbase://localhost/", "not a url", "file:travel"])(
+    "rejects a missing or malformed URI bucket (%s) with a configuration error",
+    (connectionString) => {
+      expect(() => new CouchbaseProvider(makeConnection({ database: undefined, connectionString }))).toThrow(
+        DatabaseConfigError,
+      );
+      expect(() => new CouchbaseProvider(makeConnection({ database: undefined, connectionString }))).toThrow(
+        /URL path or.*database/,
+      );
+    },
+  );
+
   test("accepts a connection string instead of a host and targets its hostname", async () => {
     const provider = await connectProvider({
       host: undefined,
@@ -460,6 +535,33 @@ describe("CouchbaseProvider query", () => {
     expect(result.executionTime).toBe(1);
   });
 
+  test("keeps an integer past 2^53 exact, as its digits, at any depth", async () => {
+    // Measured on 8.0.2 CE on 2026-10-04: the query service sends a document's
+    // 9007199254740993 as that UNQUOTED number, and a plain JSON.parse showed
+    // 9007199254740992 in the grid, the API and every export. A value in the safe
+    // range, and the metrics the provider reads itself, stay numbers.
+    const provider = await connectProvider();
+    queryHandler = () =>
+      new RawBody(
+        '{"requestID":"req-1","signature":{"big":"number","max":"number","small":"number","d":"object"},' +
+          '"results":[{"big":9007199254740993,"max":9223372036854775807,"small":42,' +
+          '"d":{"big":-9007199254740993,"note":"id 9007199254740993"}}],"status":"success",' +
+          '"metrics":{"elapsedTime":"2.5ms","executionTime":"1.234ms","resultCount":1,"mutationCount":0}}',
+      );
+
+    const result = await provider.query('SELECT d.big FROM `travel`.`inventory`.`hotel` AS d WHERE META(d).id = "h1"');
+
+    expect(result.rows).toEqual([
+      {
+        big: "9007199254740993",
+        max: "9223372036854775807",
+        small: 42,
+        d: { big: "-9007199254740993", note: "id 9007199254740993" },
+      },
+    ]);
+    expect(result.rowCount).toBe(1);
+  });
+
   test("derives fields from the rows when the projection is a wildcard", async () => {
     const provider = await connectProvider();
     queryHandler = () => queryPayload([{ hotel: { city: "Bursa" } }, { hotel: {}, __id: "hotel::2" }]);
@@ -471,7 +573,7 @@ describe("CouchbaseProvider query", () => {
 
   test("wraps SELECT RAW scalars so the grid gets one honest column", async () => {
     // SELECT RAW / SELECT VALUE return bare scalars, not objects. Handing those
-    // through unchanged makes deriveFields call Object.keys on a string, which
+    // through unchanged makes the column union call Object.keys on a string, which
     // yields one column per character index.
     const provider = await connectProvider();
     queryHandler = () => queryPayload(["Grand Plaza", "Seaside Inn"] as unknown as Record<string, unknown>[]);

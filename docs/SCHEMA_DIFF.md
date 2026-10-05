@@ -9,6 +9,11 @@ index drops include `ON <table>`. Oracle uses `ADD (<definition>)`, places `DEFA
 `NOT NULL`, and emits no transaction wrapper because DDL commits implicitly. Oracle table,
 index and constraint drops use the unconditional forms, which avoid depending on a particular
 release's support for `IF EXISTS`. A generated migration is not an idempotent script.
+Db2 LUW keeps the PostgreSQL `ADD COLUMN` and `DROP COLUMN` forms, which it accepts, and emits no
+transaction wrapper, because a Db2 `BEGIN` opens a compound block; its constraint and index drops
+use the unconditional forms too, because Db2 refuses `IF EXISTS` there, and a column modification
+is written as a comment, because Db2 needs `ALTER COLUMN ... SET DATA TYPE` and may leave the table
+REORG-pending ([providers/db2.md](./providers/db2.md#11-schema-diff)).
 
 Removed foreign keys and indexes precede column changes, so an indexed column can be removed
 and an index name can be reused in the same table diff. Changes to an existing index's columns,
@@ -16,7 +21,14 @@ column order or uniqueness replace its old definition; a uniqueness change can f
 data violates the new constraint. Identifier quoting escapes delimiters;
 line breaks in informational comments are flattened so metadata cannot start a SQL statement.
 
-MongoDB, Redis, LibreDB, Couchbase, Druid, Elasticsearch, OpenSearch, Prometheus and Apache Kafka receive an explanatory
+A created table's primary key is written inside its `CREATE TABLE`, which builds the key's index
+with it, so the unique index over exactly the key's columns that PostgreSQL (`<table>_pkey`) and
+MySQL (`PRIMARY`) report in the index list is not created again (#1395). Emitting it stopped a
+PostgreSQL 18.6 replay with `relation "<table>_pkey" already exists`. Every other index of the
+table is still created. An existing table's added indexes are all emitted, because the generator
+writes no key for one.
+
+MongoDB, Redis, LibreDB, Couchbase, Druid, Elasticsearch, OpenSearch, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant and Oxia receive an explanatory
 comment instead of relational table DDL. Trino and ClickHouse refuse foreign-key clauses;
 Trino refuses primary keys too. Trino has no index grammar, and the diff does not retain enough
 ClickHouse index metadata to distinguish and recreate its index kinds, so those index changes

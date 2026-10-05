@@ -27,21 +27,22 @@ None of it is a GitHub issue.
 
 **Sections**
 
-- [SQL statement reading](#sql-statement-reading) — S2–S6 · 4
-- [Drivers and connections](#drivers-and-connections) — D1-D129, U17 · 73
+- [SQL statement reading](#sql-statement-reading) — S2–S7 · 5
+- [Drivers and connections](#drivers-and-connections) — D1-D240, U17 · 144
 - [Value interpolation](#value-interpolation) — V1
 - [Row editing](#row-editing) — R1–R3 · 3
-- [Studio UI and query execution](#studio-ui-and-query-execution) — X2-X19, U2-U54 · 41
-- [Dependencies](#dependencies) — P1–P5 · 5
-- [Documentation](#documentation) — DOC3-DOC8 · 5
-- [Release pipeline](#release-pipeline) — REL1–REL4 · 4
+- [Studio UI and query execution](#studio-ui-and-query-execution) — X2-X26, U2-U92 · 84
+- [Dependencies](#dependencies) — P1-P9 · 7
+- [Documentation](#documentation) — DOC3-DOC18 · 15
+- [Release pipeline](#release-pipeline) — REL1-REL8 · 8
 - [Chart configuration surface](#chart-configuration-surface) — N1 · 1
 - [Security Phase 1 deferrals](#security-phase-1-deferrals) — H1–H14 · 4
-- [Security Phase 2 deferrals](#security-phase-2-deferrals) — C3–C11 · 7
-- [Security Phase 3 deferrals](#security-phase-3-deferrals) — K4
+- [Security Phase 2 deferrals](#security-phase-2-deferrals) — C3–C11 · 6
+- [Security Phase 3 deferrals](#security-phase-3-deferrals) — K4-K8 · 5
 - [Security scanner triage](#security-scanner-triage) — SCAN1 · 1
 - [Agent M1 deferrals (#328)](#agent-m1-deferrals-328) — A1–A8 · 7
-- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2-B89 · 30
+- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2-B100 · 36
+- [Passkey deferrals (#785)](#passkey-deferrals-785) — PK1-PK9 · 8
 - [MCP server deferrals (#246)](#mcp-server-deferrals-246)
 
 ---
@@ -112,6 +113,22 @@ Apache Cassandra 5.0.9, ScyllaDB 2026.2.4 and ClickHouse 26.7.1 (a line comment 
 refused on PostgreSQL 18, MySQL 26.7.0, SQLite, Oracle, SQL Server 2022 and Trino 476. It is undecided
 for elasticsearch and opensearch, and absent with the whole row for couchbase, druid and libredb -
 recorded in the table in `docs/editor/query-optimization.md`.
+
+### S7. Compound statements on MySQL, Db2 and Trino are still cut at their inner `;`
+
+#1312 gave `SqlGrammar` a `script` fact and read procedural bodies for Oracle (PL/SQL units), SQLite
+and libSQL (trigger bodies), and batches for SQL Server. Three dialects with `BEGIN … END` bodies were
+left at the default because no reading of them was measured: MySQL and MariaDB
+(`CREATE PROCEDURE | FUNCTION | TRIGGER | EVENT … BEGIN … END`, which the `mysql` client cuts with
+`DELIMITER`, a client command the server never sees), Db2 SQL PL (`BEGIN ATOMIC … END` and routine
+bodies) and Trino SQL routines (`CREATE FUNCTION … BEGIN … END`). On those the editor still cuts the body
+at its inner `;` and the multi-statement route runs the fragments, the shape #1312 measured on Oracle.
+Oracle's own inline PL/SQL in a query (`WITH FUNCTION f RETURN NUMBER IS BEGIN … END; SELECT f FROM dual`)
+is the same gap inside a dialect that is read: it is not a unit, so it is still cut at its inner `;`.
+
+**Done when:** each dialect's body rule is measured on a live server and written as its `script` row, with
+a test per dialect in `tests/unit/sql/statement-splitter.test.ts` (the MySQL one there pins today's cut).
+MySQL's `BEGIN` alone is a transaction, as SQLite's is, so its rule is not Oracle's `pl-sql`.
 
 ---
 
@@ -276,38 +293,6 @@ and a refusal sentence that has never been seen from the server is exactly what 
 the counts it feeds carry the same distinction - measured against a live cluster with a document-only
 role, not inferred from the code.
 
-### D33. Every parameterised read still prepares, so an engine without PREPARE loses all of them
-
-Measured 2026-08-27 against `datafuselabs/databend:v1.2.925-patch-11` (issue #424, Phase 0).
-Databend replies `Prepare is not support in Databend` to mysql2's prepared protocol, and that one
-answer takes the object reads, `getActiveSessions()`, `getTableStats()`, `getIndexStats()` and
-`getStorageStats()` - the whole object browser and every statistics panel - while the editor keeps
-working.
-
-**The catalogs are there.** Asked with literal SQL on the same connection,
-`information_schema.tables` returns the true 3 and 2000 rows with `data_length` 124 and 49000, and
-`information_schema.columns` answers in full. So the engine has the data and we cannot read it.
-
-This is **D8 one step further in**, and the remaining step is the harder half. D8 moved every
-*parameterless* statement onto MySQL's text protocol; these six reads carry placeholders
-(`WHERE table_schema = ?`) and therefore still prepare. Moving them means either interpolating the
-schema name into the statement - which is where a placeholder was the safe choice, so it needs an
-identifier-quoting decision rather than a string concat - or asking mysql2 for the text protocol
-with the parameters bound client-side. Neither is a one-line change, which is why this is filed
-rather than done inside a labelling PR, and why Databend's registry row reads `query-only` today.
-
-**A second, smaller defect surfaced on the same engine, and it is a crash rather than a failure.**
-`runMaintenance('analyze')` throws `TypeError: rows.filter is not a function`: Databend answers
-`ANALYZE TABLE` with an object where the reader expects an array of `Msg_type` rows. A provider
-that cannot run a maintenance action should report that, not throw a type error out of the route -
-and this is the same shape already recorded once, a mysql2 reply whose type depends on the
-statement.
-
-**Done when:** the six reads above answer on Databend, with the identifier path decided rather
-than concatenated, and `runMaintenance` on an engine that answers `ANALYZE` with a non-array
-reports a result instead of throwing - both verified against the container, and the reading
-unchanged on MySQL, MariaDB and one analytics relative.
-
 ### D34. A pinned SSH host key has no way to be set, so the protection resets on restart
 
 Giving the tunnel a `hostVerifier` created two sources for the expected fingerprint: a durable
@@ -343,6 +328,10 @@ Found 2026-08-27 in the #511 review (issue #424, Phase 5). Not libSQL's - libSQL
 fifth of five instances of one gap, and the fix already exists in the codebase.
 Amended 2026-09-23: the fix now exists twice, and the second copy is deliberate.
 Amended 2026-09-25: the mapping now exists three times, the third in the Kafka provider (#1088), deliberate for the same reason.
+Amended 2026-09-30: the mapping now exists four times, the fourth in the etcd provider (#1089), `connection-options.ts`, deliberate for the same reason; like Kafka's it is a mapping only, over grpc-js's own TLS, and it adds the IP-identity rule of the etcd design's E5.
+Amended 2026-10-03: the shared helper this entry asks for now exists outside any provider directory, `src/lib/db/http/node-transport.ts`: `createNodeTransport` is the request path for plaintext and TLS alike, built on the Prometheus shape with `rejectRedirect` on both, and `nodeTlsMaterial` is the one TLS mapping a REST provider takes, so later providers reuse it instead of adding a copy; no provider uses it yet, the Qdrant provider will be its first consumer, and moving Couchbase and Prometheus onto it, and the five `fetch` transports, stays open under this entry.
+Amended 2026-10-03 again: the mapping now exists five times, the fifth in the Milvus provider's `connection-options.ts` (vector-family spec 5.1, decision Q1a), deliberate for the reason the fourth was; like etcd's it is a mapping over grpc-js's own TLS, with the IP-identity rule, and the copied channel options add `grpc.enable_retries: 0`, which is an addition and not a copy.
+Amended 2026-10-04: the two gRPC copies are one, `readGrpcTlsPanel` and `grpcTlsIdentity` in `src/lib/db/grpc/tls.ts` with the credentials in `src/lib/db/grpc/credentials.ts`, which etcd and Milvus both take, so the mapping exists four times: Couchbase's, Prometheus's, Kafka's and the shared gRPC one, beside `nodeTlsMaterial`; a new gRPC provider takes the shared one, and the done-when below, which is about the HTTP providers, is unchanged.
 
 `ssl.caCert`, `ssl.clientCert`, `ssl.clientKey` and `ssl.rejectUnauthorized` reach the
 driver on every provider that uses one. On the providers that speak HTTP through global
@@ -380,47 +369,32 @@ One test per transport pins that a supplied CA and a `verify-*` mode reach the r
 
 ### D39. A slow-query source nobody could read is still a row, and on the other path it is silence
 
-Found 2026-08-27 by the audit that closed the curated health projection's cap-as-count defect. #512
-removed MySQL's fabricated "Performance schema not available" row; three providers still ship the
-same shape, in the same field:
+Found 2026-08-27 by the audit that closed the curated health projection's cap-as-count defect.
+#512 removed MySQL's fabricated "Performance schema not available" row; four providers still ship the same shape, in the same field:
 
-- `src/lib/db/providers/sql/postgres.ts:1241` - a database without `pg_stat_statements` answers
-  `[{ query: "pg_stat_statements extension not enabled", calls: 0, avgTime: "N/A" }]`.
-- `src/lib/db/providers/document/mongodb.ts:785` - a database whose profiler is off answers
-  `[{ query: "Profiler not enabled. Run db.setProfilingLevel(1) to enable." }]`, and the outer catch
-  at `:830` answers `[{ query: "Error fetching health info" }]` for a read that failed entirely.
-- `src/lib/db/providers/sql/sqlite.ts:707-717` - EVERY SQLite database answers two synthetic rows,
-  `Integrity: OK|FAILED` and `Journal Mode: <mode>`, about statements that were never executed.
+- `getHealth()` in `src/lib/db/providers/sql/postgres.ts`: a database without `pg_stat_statements` answers `[{ query: "pg_stat_statements extension not enabled", calls: 0, avgTime: "N/A" }]`.
+- `getHealth()` in `src/lib/db/providers/document/mongodb.ts`: a database whose profiler is off answers `[{ query: "Profiler not enabled. Run db.setProfilingLevel(1) to enable." }]`, and the outer catch of the same method answers `[{ query: "Error fetching health info" }]` for a read that failed entirely.
+- `getHealth()` in `src/lib/db/providers/sql/sqlite.ts`: EVERY SQLite database answers two synthetic rows, `Integrity: OK|FAILED` and `Journal Mode: <mode>`, about statements that were never executed.
+- `readHealth()` in `src/lib/db/providers/sql/libsql/introspect.ts`: every libSQL database answers the same two synthetic rows, `Integrity: OK|FAILED` and `Journal Mode: <mode>`.
 
-A sentence wearing a row's clothes is the fabrication the absence rule (#477) forbids, and here it is
-worse than a zero: a caller counting the list gets 1, 1 and 2 rather than 0. Nothing counts it in the
-app any more - the agent's curated reading stopped, and `HealthInfo.slowQueries` now has no
-production consumer at all - but `POST /api/db/health` serialises the whole `HealthInfo`
-(`docs/API_DOCS.md`), so anyone embedding `@libredb/studio` and reading that body inherits all three.
+A sentence wearing a row's clothes is the fabrication the absence rule (#477) forbids, and here it is worse than a zero: a caller counting the list gets 1, 1, 2 and 2 rather than 0.
+Nothing counts it in the app any more - the agent's curated reading stopped, and `HealthInfo.slowQueries` now has no production consumer at all - but `POST /api/db/health` serialises the whole `HealthInfo` (`docs/API_DOCS.md`), so anyone embedding `@libredb/studio` and reading that body inherits all four.
 
 **The fix is a type change with a 15-type-id blast radius, which is why it is here and not in #512's
 PR.** `HealthInfo.slowQueries` is a required `SlowQuery[]` (`src/lib/db/types.ts`) with no field a
-reason could travel in, so "nobody could look" has no representation. Making it optional the way
-`activeConnections` already is touches every provider, every provider doc and every provider test
-file, and falsifies `src/lib/db/compatibility.ts:267`, `docs/providers/postgres.md:164`,
-`tests/integration/db/postgres-provider.test.ts:1325`, `tests/integration/db/sqlite-provider.test.ts`
-and `tests/helpers/sqlite-node-harness.ts:104`, all of which pin the current sentences.
+reason could travel in, so "nobody could look" has no representation.
+Making it optional the way `activeConnections` already is touches every provider, every provider doc and every provider test file, and falsifies the AlloyDB Omni caveat in `WIRE_COMPATIBLE_ENGINES` (`src/lib/db/compatibility.ts`), section "3.5 Resilient monitoring" of `docs/providers/postgres.md`, the test "pg_stat_statements fallback when extension is not enabled" in `tests/integration/db/postgres-provider.test.ts`, `tests/integration/db/sqlite-provider.test.ts`, `tests/integration/db/sqlite-node-harness.ts`, `tests/integration/db/libsql-provider.test.ts` and `tests/unit/db/libsql/introspect.test.ts`, all of which pin the current sentences.
 
-**The other path swallows instead of fabricating, and that is not better.** On the `slow-queries`
-reading the agent actually uses, `src/lib/db/providers/keyvalue/redis.ts:622-624` and
-`src/lib/db/providers/document/mongodb.ts:1041-1043` `return []` from their catch where MySQL now
-rejects. So a denied grant reaches the model as an empty reading, and the run prompt tells it
-`"A reading that comes back EMPTY is an answer, not a failure - no blocked session, no slow query,
-no unused index is what a healthy server looks like"` (`src/lib/agent/investigation.ts:1485`). It
-also costs the operator the reason: `getMonitoringData` records `errors.slowQueries` from a REJECTION
-(`src/lib/db/base-provider.ts:147`), and a resolved `[]` records nothing, so the panel says "no slow
-queries" where the truth is that the profiler is off.
+**The other path swallows instead of fabricating, and that is not better.**
+On the `slow-queries` reading the agent actually uses, `getSlowQueries()` in `src/lib/db/providers/keyvalue/redis.ts` and `getSlowQueries()` in `src/lib/db/providers/document/mongodb.ts` `return []` from their catch where MySQL now rejects.
+So a denied grant reaches the model as an empty reading, and the run prompt tells it `"A reading that comes back EMPTY is an answer, not a failure - no blocked session, no slow query, no unused index is what a healthy server looks like"` (`WORKFLOW_TOOL_RULES` in `src/lib/agent/investigation.ts`).
+It also costs the operator the reason: `getMonitoringData()` in `src/lib/db/base-provider.ts` records `errors.slowQueries` from a REJECTION, and a resolved `[]` records nothing, so the panel says "no slow queries" where the truth is that the profiler is off.
 
 **Done when:** a slow-query source that could not be read is absent-with-a-reason on both paths - no
 provider answers a sentence as a row, and no provider answers `[]` for a read that failed - and the
 count of type-ids the type change touched is stated in the PR rather than discovered during it.
 
-### D44. `databaseSizeBytes` is fabricated as 0 wherever the size is unknown, in 11 of 18 type-ids
+### D44. `databaseSizeBytes` is fabricated as 0 wherever the size is unknown, in 4 of 19 type-ids
 
 Found 2026-08-27 by the sweep that closed the overview connection count's fabricated zero (D40, PR
 round 17). `DatabaseOverview.activeConnections` and `DatabaseOverview.databaseSizeBytes` are optional
@@ -428,24 +402,14 @@ for the SAME stated reason (`src/lib/db/types.ts`, the D17 docblock): absence an
 facts. The round closed the first field on three providers. The second is unclosed almost everywhere.
 
 **Two providers get it right, and one of them wrote the argument down.**
-`src/lib/db/providers/sql/cassandra/introspect.ts:582` omits the key with the comment "a zero is a
-measurement, and the Storage tab read `?? 0` and rendered '0 B' with a 0.0% breakdown from it", and
-MongoDB's `getOverview()` catch now omits it too.
+`getOverview()` in `src/lib/db/providers/sql/cassandra/introspect.ts` omits the key with the comment "a zero is a measurement, and the Storage tab read `?? 0` and rendered '0 B' with a 0.0% breakdown from it", and MongoDB's `getOverview()` catch now omits it too.
 
 **The rest fabricate.** Measured by reading every `databaseSizeBytes` assignment under
 `src/lib/db/providers/`:
-- Self-contradicting within one object, and the clearest cases, because the sibling string field
-  already says the figure is unavailable: `sql/trino/introspect.ts:621` pairs a literal `0` with
-  `databaseSize: TRINO_UNAVAILABLE_TEXT`, and `sql/search/index.ts:849` pairs `sizeBytes ?? 0` with
-  `databaseSize: SEARCH_UNKNOWN_TEXT` for both `elasticsearch` and `opensearch`.
-- Swallowed into an initialiser the way D40's connection counts were: `sql/mssql.ts:1111`,
-  `sql/oracle.ts:1154`, `sql/sqlite.ts:794`.
-- Coerced by a helper that returns 0 for an absent row: `sql/druid/introspect.ts:578` and
-  `sql/clickhouse/index.ts:833` through their local `asNumber`.
-- Coerced inline: `sql/postgres.ts:1360` and `sql/mysql.ts:1158` (`parseInt(... || "0")`),
-  `sql/libsql/introspect.ts:399` and `document/couchbase/index.ts:606` (`?? 0`),
-  `keyvalue/redis.ts:590`, and `embedded/libredb.ts:709`, whose `fileSizeBytes()` returns 0 when the
-  `statSync` throws.
+- Self-contradicting within one object, and the clearest cases, because the sibling string field already says the figure is unavailable: `sql/trino/introspect.ts` pairs a literal `0` with `databaseSize: TRINO_UNAVAILABLE_TEXT`, and `sql/search/index.ts` pairs `sizeBytes ?? 0` with `databaseSize: SEARCH_UNKNOWN_TEXT` for both `elasticsearch` and `opensearch`.
+- Swallowed into an initialiser the way D40's connection counts were: `sql/mssql.ts`, `sql/oracle.ts`, `sql/sqlite.ts`.
+- Coerced by a helper that returns 0 for an absent row: `sql/druid/introspect.ts` and `sql/clickhouse/index.ts` through their local `asNumber`.
+- Coerced inline: `sql/postgres.ts` and `sql/mysql.ts` (`parseInt(... || "0")`), `sql/libsql/introspect.ts` and `document/couchbase/index.ts` (`?? 0`), `keyvalue/redis.ts`, and `embedded/libredb.ts`, whose `fileSizeBytes()` returns 0 when the `statSync` throws.
 
 **The consumer makes it visible.** `src/components/monitoring/tabs/StorageTab.tsx` keys its entire
 breakdown off `overview?.databaseSizeBytes !== undefined`: present, and the card renders percentages
@@ -460,17 +424,21 @@ file. That round also measured a mechanism this entry had missed: Couchbase does
 wraps the read in `degradeTo(..., {})`, so a REFUSED bucket read reaches `basicStats?.diskUsed ?? 0` and
 publishes a measured-looking zero - see D51, which is the same shape on the field beside this one.
 
+**Seven of the eleven are closed on main since** - they now leave `databaseSizeBytes` out when the size is unknown.
+PostgreSQL and MySQL in #627, SQLite and LibreDB in #1050 (for #546), SQL Server and Oracle in #579, and libSQL in #569.
+The symbols are `getOverview()` in `src/lib/db/providers/sql/postgres.ts`, `src/lib/db/providers/sql/mysql.ts`, `src/lib/db/providers/sql/sqlite.ts`, `src/lib/db/providers/sql/mssql.ts` and `src/lib/db/providers/sql/oracle.ts`, `readOverview()` in `src/lib/db/providers/sql/libsql/introspect.ts`, and `getOverview()` in `src/lib/db/providers/embedded/libredb.ts`.
+
 **The counts moved for a second reason.** DuckDB arrived as a seventeenth type-id in #516 and gets this
 right without being asked: `duckdb/introspect.ts` spreads the key conditionally and spells the string
 `"N/A"` when the database is in-memory. So it is a fourth correct provider rather than a fifteenth
 fabricating one, and it independently reached the same encoding this entry prescribes.
-Prometheus, the eighteenth type-id (#1085), leaves the key absent too (`overviewFrom` in `src/lib/db/providers/timeseries/prometheus/monitoring.ts`), so the eleven that fabricate are eleven of eighteen.
+Prometheus, the eighteenth type-id (#1085), leaves the key absent too (`overviewFrom` in `src/lib/db/providers/timeseries/prometheus/monitoring.ts`).
+Kafka, the nineteenth type-id (#1088), does the same (`overviewFrom` in `src/lib/db/providers/stream/kafka/monitoring.ts`), so the four that fabricate are four of nineteen.
 
-**Done when:** an unknown size is absent rather than 0 on the remaining eleven type-ids, a real zero
+**Done when:** an unknown size is absent rather than 0 on the remaining four type-ids, a real zero
 still reads as zero, each provider's doc records it, and each provider's test pins both arms - the same
-shape D40 used, applied to the field beside it. Remaining: `sql/postgres.ts`, `sql/mysql.ts`,
-`sql/sqlite.ts`, `sql/mssql.ts`, `sql/oracle.ts`, `sql/libsql/introspect.ts`, `sql/druid/introspect.ts`,
-`sql/clickhouse/index.ts`, `document/couchbase/index.ts`, `keyvalue/redis.ts` and `embedded/libredb.ts`.
+shape D40 used, applied to the field beside it.
+Remaining: `getOverview()` in `src/lib/db/providers/sql/druid/introspect.ts` and in `src/lib/db/providers/sql/clickhouse/index.ts` (the local `asNumber`, which returns 0 for an absent value), `getOverview()` in `src/lib/db/providers/document/couchbase/index.ts` (`basicStats?.diskUsed ?? 0`), and `getOverview()` in `src/lib/db/providers/keyvalue/redis.ts` (`parseInt(parsed.used_memory || "0")`).
 MongoDB is NOT on that list: its catch and its success path both spread conditionally already.
 
 Doing it per family, one PR each, is the cheap ordering, and #517 is the pattern to copy - including the
@@ -582,30 +550,6 @@ is a major already carrying seventeen providers.
 **Done when:** a Couchbase connection reaches the query service on a node published behind a port
 mapping, with the precedence between the node map, the external addresses and the user's own port
 stated where a reader meets it.
-
-### D54. The data profiler can only profile columns on PostgreSQL-family engines
-
-`src/app/api/db/profile/route.ts:132-133` casts every column with `${safeCol}::text` to take
-its `MIN` and `MAX`. That is PostgreSQL's cast syntax, and it is written once for every engine:
-SQL Server, Oracle, MySQL, ClickHouse and the rest reject it, so each column comes back as
-"Could not profile this column" while the row count and the column list beside it are correct.
-The failure is per column and the panel still renders, which is why it reads as a data problem
-rather than a dialect one.
-
-Measured in a browser during #789's review, on SQL Server 2022 against `shop.dbo.customers`:
-three columns, three refusals, two rows counted correctly.
-
-Pre-existing and not caused by #789: `git show main:src/app/api/db/profile/route.ts` carries the
-identical two lines. It became visible because the object tree's row menu now offers Profile on
-every relation of every engine, where the flat explorer offered it on the tables it listed.
-
-Closing it is a per-dialect text cast measured on each engine rather than a one-line change:
-Oracle has `TO_CHAR`, SQL Server `CAST(x AS NVARCHAR(MAX))`, MySQL `CAST(x AS CHAR)`, ClickHouse
-`toString`, and `MIN`/`MAX` over a cast do not order the same way everywhere, so what the two
-numbers MEAN needs stating per engine rather than assuming a lexicographic answer is wanted.
-
-**Done when:** a column profiles on every engine whose provider offers the action, or the action
-is not offered where it cannot answer, with the engine's own sentence rather than a generic one.
 
 ### D55. The admin Operations table list does not print a row's schema
 
@@ -805,20 +749,25 @@ from the pane.
 **Done when:** either the pane shows the cluster's own bytes, or the edit half is refused on a
 definition whose re-serialisation is not byte-identical to what was read.
 
-### D62. Two PostgreSQL source refusals are unverified on CockroachDB and Materialize
+### D62. The PostgreSQL source refusals never fire on Materialize, which answers XX000
 
 `PostgresProvider.readObjectSource` reports exactly two SQLSTATEs as a refusal part, 42883 (`pg_get_*`
-absent) and 42703 (`pg_proc.prokind` absent), and both arms exist because this type id also serves
-CockroachDB and Materialize.
+absent) and 42703 (`pg_proc.prokind` absent), and the docblock on `isMissingSourceCatalogError` in
+`src/lib/db/providers/sql/postgres.ts` still says both arms are reachable because this type id
+serves CockroachDB and Materialize.
 
-The sentences in `tests/integration/db/postgres-provider.test.ts` are the SHAPE PostgreSQL 18.4
-answers for a missing function and a missing column, measured; neither fork was brought up. The
-provider carries no string of its own, so a wording difference cannot break it, and what is
-unverified is only the claim that those two SQLSTATEs are what a fork answers there.
+Both forks have been measured since, and the docblock is wrong about both (recorded in
+`docs/providers/postgres.md` §3.1.5): CockroachDB v26.2.5 has every surface and needs neither arm,
+and Materialize (v26.40.0, and again v26.44.1 on 2026-10-04) answers `XX000` for
+`pg_get_functiondef`, `pg_get_triggerdef` and `p.prokind` alike, so every routine and trigger source
+read there RAISES rather than answering a refusal part. The object counts hit the same `XX000` and
+now key on the column name instead of the code (#1351); the source read was left alone because
+`XX000` is Materialize's generic internal error, and keying on it would turn real internal
+failures into refusals.
 
-**Done when:** each fork is brought up, a view's and a routine's source is asked for through the
-shipped statements, and the SQLSTATE and the sentence are recorded in `docs/providers/postgres.md`.
-If either answers a third code, that arm is a code change and not a doc change.
+**Done when:** the source read decides by the identifier the refusal names (as the counts and
+every schema fallback in that file do) or the decision to keep it raising is recorded, and the
+`isMissingSourceCatalogError` docblock states what the forks actually answer.
 
 ### D63. `postgres.ts`'s `describeObject` still binds `[path[0], path[1]]`
 
@@ -943,8 +892,7 @@ sentences or its docblock says why a 400 raised before the provider is a differe
 
 `docs/providers/duckdb.md` section 3.11 says a multi-statement string runs the first statement only, that the rest is
 silently discarded, and that there is no error and no second result.
-`src/lib/db/providers/sql/duckdb/index.ts:699-703` says `client.run()` executes only the FIRST statement and that the
-method guarantees the tail is never executed.
+`src/lib/db/providers/sql/duckdb/index.ts:873-876` says `client.run()` executes only the FIRST statement and that the method guarantees the tail is never executed.
 
 Measured 2026-09-13 on DuckDB v1.5.5 through `@duckdb/node-api` 1.5.5-r.4, while grounding #778 Phase 3.
 `CREATE TABLE probe_c(i INTEGER); CREATE TABLE probe_c(i INTEGER)` answers
@@ -1003,6 +951,11 @@ Read in the tree at the same commit: `src/lib/db/providers/sql/postgres.ts` retu
 from `query()`, and `src/app/api/db/query/route.ts` reads `result.rows.length`.
 
 Found while probing D74. Not caused by it and not fixed by it.
+
+The route's `explain` arm refuses such a text since #1311 (`Only a single statement can be explained`,
+read under the connection type's grammar, before a provider is opened), because there the second
+statement was not only a 500: the background plan request re-ran the INSERT after a leading SELECT. A
+plain run without `explain` still reaches the provider and is what this entry is about.
 
 **Done when:** the route either refuses a text carrying more than one statement with a sentence, or the
 provider names which result of an array it answers with. The first is the smaller change and is what
@@ -1113,6 +1066,12 @@ ENDER to the caller's own scope, which is what makes the first backend's transac
 all, and this entry is about the script's own statements being spread across backends in the first
 place.
 
+The same gap has a T-SQL shape that needs no concurrency to describe. Since #1312 the editor sends each
+batch between `GO` lines as one request, so a variable or `#temp` table survives inside a batch, but
+two batches are two `provider.query()` calls on `pool.request()`. A `#temp` table is scoped to its
+SESSION, so `CREATE TABLE #t (a INT)` / `GO` / `SELECT * FROM #t` finds the table only when the second
+batch borrows the same pooled connection, which sqlcmd and SSMS guarantee and this route does not.
+
 **Done when:** either a probe forces the interleave and the result is recorded, or the route holds
 one client for the script's scope. The second changes pool semantics for every caller of `query()`
 and is the larger change, which is why this is filed rather than folded into D87.
@@ -1199,25 +1158,27 @@ test pins the behaviour that was chosen.
 
 ---
 
-### D85. The `@/lib/auth` mock is hand-copied across a layer, untyped, and already misses two exports
+### D85. The `@/lib/auth` mock is hand-copied across a layer, untyped, and already misses four exports
 
-`grep -rl 'mock.module("@/lib/auth"' tests/` returns exactly 39 hits, re-measured 2026-09-23. Seven of
-them spread the real module and replace one function (`{ ...realAuth, getSession: mockGetSession }`,
-the agent routes' pattern). Thirty write out the same five-key object - `getSession`, `signJWT`,
-`verifyJWT`, `login`, `logout` - down to the same `mock(async () => "mock-token")` for a token
-nothing reads, and one of those thirty is `tests/helpers/object-edit-route-harness.ts`, a shared
-harness that could have been the factory and copied the stub instead. The remaining two write a
-shorter stub of their own, one with two keys and one with a single `getSession`.
+`grep -rl 'mock.module("@/lib/auth"' tests/` returns exactly 48 hits, re-measured 2026-10-05.
+Sixteen of them spread the real module and replace one function (`{ ...realAuth, getSession: mockGetSession }`, the agent routes' pattern).
+Thirty write out the same five-key object - `getSession`, `signJWT`, `verifyJWT`, `login`, `logout` - down to the same `mock(async () => "mock-token")` for a token nothing reads, and one of those thirty is `tests/helpers/object-edit-route-harness.ts`, a shared harness that could have been the factory and copied the stub instead.
+The remaining two write a shorter stub of their own, one with two keys and one with a single `getSession`.
 
-`src/lib/auth.ts` exports seven names. The two no hand-written stub carries are
-`shouldMarkCookieSecure` and `resetCookieSecurityWarning`:
-`grep -rn 'shouldMarkCookieSecure' tests/` returns exactly one hit, and it is a sentence in a comment
-rather than a stub key, while `resetCookieSecurityWarning` appears only in
-`tests/unit/lib/auth.test.ts`, which imports the real module.
+`src/lib/auth.ts` exports nine names. The four no hand-written stub carries are
+`shouldMarkCookieSecure`, `resetCookieSecurityWarning`, `readCookieSecureOverride` and
+`isLoopbackHost`: `grep -rn 'shouldMarkCookieSecure' tests/` returns exactly one hit, and it is a
+sentence in a comment rather than a stub key. `resetCookieSecurityWarning` appears only in
+`tests/unit/lib/auth.test.ts`, which imports the real module, and in
+`tests/api/admin/discovery.test.ts`, which calls it on the real module it spreads.
+`readCookieSecureOverride` and `isLoopbackHost` appear in `tests/unit/lib/auth.test.ts` and
+otherwise only in a comment of `tests/api/admin/discovery.test.ts`.
 `src/app/api/auth/oidc/login/route.ts` imports `shouldMarkCookieSecure` and awaits it to decide the
-auth cookie's `secure` flag, so every one of those stubs is already an export short of the module it
-replaces. Nothing has hit that yet only because `tests/api/auth/oidc-login.test.ts` is one of the
-route tests that does NOT mock `@/lib/auth`.
+auth cookie's `secure` flag, and `src/app/api/admin/discovery/route.ts` imports
+`readCookieSecureOverride` to report whether `AUTH_COOKIE_SECURE` is off, so every one of those
+stubs is already short of exports a route imports from the module it replaces. Nothing has hit that
+yet only because `tests/api/auth/oidc-login.test.ts` is one of the route tests that does NOT mock
+`@/lib/auth`, and `tests/api/admin/discovery.test.ts` spreads the real module.
 
 Nothing can catch it either. `mock.module` is declared `module(id: string, factory: () => any)` in
 `node_modules/bun-types/test.d.ts`, so a stub that has drifted from the module it stands in for is
@@ -1231,7 +1192,7 @@ process boundary cannot do is make the stub the right SHAPE.
 **Done when:** one factory in `tests/helpers/`, typed `(): typeof import("@/lib/auth")`, replaces the
 hand-written stubs, so adding an export to `src/lib/auth.ts` fails `typecheck` in every file that
 mocks it instead of at run time in one of them. The same shape then covers the other layer-wide
-mocks, `@/lib/db` in fifteen files and `@/lib/audit` in four.
+mocks, `@/lib/db` in twenty-two files and `@/lib/audit` in six.
 
 ### D86. `bun test --isolate` has not been re-probed, and the runner pays a process per test file
 
@@ -1444,12 +1405,12 @@ the provider as a non-owner role rather than asserting the statement text.
 ### D103. `noAbstainingKinds` is enforced over the expectation's kinds, not the provider's declarations
 
 `assertColumnDeclarations` builds `abstained` by walking `listings`
-(`tests/helpers/object-surface-conformance.ts:595-603`), and `listings` holds only the kinds the
-expectation gave a non-zero `want` (`:307-335`). The field's own docblock (`:195-200`) defines it
+(`tests/helpers/object-surface-conformance.ts:618-626`), and `listings` holds only the kinds the
+expectation gave a non-zero `want` (`:330-358`). The field's own docblock (`:201-208`) defines it
 over something else: "This provider declares `hasColumns` on EVERY kind it has". A provider that
 declares one kind without `hasColumns` and whose fixture happens to hold none of that kind is
 therefore indistinguishable, to the guard, from a provider that has no abstaining kind at all, and
-the refusal at `:643` tells the author to set a flag whose stated meaning that provider's own
+the refusal at `:666` tells the author to set a flag whose stated meaning that provider's own
 declarations contradict.
 
 It is worse than one wrong direction, and the control that shows it is the one worth keeping.
@@ -1505,7 +1466,7 @@ D37's consolidation removes this if the shared TLS path is built on the Promethe
 ### D105. `StorageStats.sizeBytes` and `TableStats.totalSizeBytes` are required, so an engine that measures no size publishes a zero
 
 `StorageStats` in `src/lib/db/types.ts` declares `sizeBytes: number`, so a storage row carries a number even where the engine publishes no byte count for what the row names.
-Trino writes `size: "N/A"` with `sizeBytes: 0` (`src/lib/db/providers/sql/trino/introspect.ts:877-878`), and since #1085 the Prometheus head-block row does the same, because neither its TSDB status nor its runtime information publishes a stored byte count.
+Trino writes `size: "N/A"` with `sizeBytes: 0` (`src/lib/db/providers/sql/trino/introspect.ts:877-878`), and its per-table "0 B" comes from `readTableStatistics` summing `data_size ?? 0` (`:637-644`), and since #1085 the Prometheus head-block row does the same, because neither its TSDB status nor its runtime information publishes a stored byte count.
 The agent's `storage` reading forwards the field unchanged (`sizeBytes: store.sizeBytes` in `CURATED_READINGS`, `src/lib/agent/tools.ts`), so a model is handed a zero-byte store that nobody measured.
 The search provider takes the other route and emits no storage row for a size it was not given (`toStorageStats` in `src/lib/db/providers/sql/search/index.ts`).
 D44 is the same fabrication on `DatabaseOverview.databaseSizeBytes`, where the type already allows absence; here the type itself forbids it.
@@ -1551,7 +1512,7 @@ Not fixed in #1085: each remedy costs the inventory's read, which every connecti
 ### D108. One redirected listing fails the whole Elasticsearch or OpenSearch object count
 
 `countObjects` in `src/lib/db/providers/sql/search/index.ts` reads the five kinds together and turns a failed listing into that kind's `unavailable` answer, but only for the transport's own error: anything that is not a `SearchTransportError` is rethrown (`:1189`).
-Since #1086 the transport refuses a 3xx through the shared `rejectRedirect` of `src/lib/db/http/endpoint.ts` (`src/lib/db/providers/sql/search/http-transport.ts:1531`), and that throws a `ConnectionError`, outside the class the count catches.
+Since #1086 the transport refuses a 3xx through the shared `rejectRedirect` of `src/lib/db/http/endpoint.ts` (`src/lib/db/providers/sql/search/http-transport.ts:1556`), and that throws a `ConnectionError`, outside the class the count catches.
 So one listing a proxy redirects rejects the whole count with the redirect's message, where a refusal of the same listing marks only that kind and still counts the other four.
 
 Reproduced 2026-09-23 through the provider's own `countObjects`, with `fetch` replaced and the pipeline listing answering a 302 and then, as the control, a 403, from the repository root:
@@ -1687,6 +1648,7 @@ Measured 2026-09-24 through the real tunnel client, factory and providers, again
 MSSQL, MongoDB, Redis, Cassandra and Oracle were read, not measured; MySQL and Oracle pass `verify-ca`, because that mode does not check the name there.
 It fails closed, so no identity check is skipped, but it leaves a tunnel user who needs a working connection with `require`, which encrypts without verifying.
 Over a tunnel the HTTP providers also send no SNI and a `Host` of `127.0.0.1:<local port>`, so a reverse proxy that routes by either can send the request elsewhere; that was observed as the headers sent, not measured against a proxy.
+Amended 2026-09-30: the etcd provider (#1089) checks a tunnelled connection's certificate against `TUNNEL_FAR_END`, as the server name for a DNS name and through `checkServerIdentity` for an address, so the sentence above that nothing reads `TUNNEL_FAR_END` for TLS no longer holds; every other driver still verifies `127.0.0.1`.
 
 Found 2026-09-24 while checking the Prometheus provider's TLS path after #1104.
 Not fixed there: the rewrite and every driver's TLS options are shared by all engines.
@@ -1720,19 +1682,6 @@ Found 2026-09-24 by the review of the fix that withholds a managed seed's secret
 Not fixed there: both digests are compared server-side exactly as they are, so changing what they hash changes every stored plan and every run's recorded identity.
 
 **Done when:** neither digest can be recomputed from what a caller can learn, by keying both with a server secret or by hashing the connection string with its credentials masked, or the fingerprint no longer reaches the client, and a test holds that a digest differs from the plain SHA-256 of its own framing.
-
-### D117. The provider cache key reads neither half of the Elasticsearch API key pair
-
-`credentialDigest` in `src/lib/db/provider-cache-key.ts` frames the password, the agent pair, the TLS material and the tunnel's secrets, and neither `apiKeyId` nor `apiKeySecret`; `connectionFingerprint` frames neither either.
-So two Elasticsearch connections that differ only in the pair share one cache entry, and `getOrCreateProvider` in `src/lib/db/factory.ts` returns the provider built with the first pair.
-A key rotated behind a `${vault:...}` reference, which `docs/SEED_CONNECTIONS.md` says becomes visible within 120 seconds, keeps the old provider until the 30-minute idle sweep, and steady use keeps it from ever idling, so a revoked key answers 401 until the process restarts.
-Measured 2026-09-24: `providerCacheKey` returned the same key for two Elasticsearch connections differing only in the pair, and for one with a pair and one without; changing only the password changed it.
-A caller cannot use it to reach another user's pool: a claimed `seed:` id is re-resolved in `src/lib/seed/resolve-connection.ts`, and a browser connection's id is random.
-
-Found 2026-09-24 by the review of the fix that withholds a managed seed's secrets from the browser.
-Not fixed there: the cache key is shared by every engine.
-
-**Done when:** `credentialDigest` frames the API key pair, and a test holds that two connections differing only in either half get different keys.
 
 ### D118. MongoDB maintenance and monitoring read only the connected database, so a deep link from another one lands on the wrong collection
 
@@ -1874,7 +1823,7 @@ Not fixed there: the change is to the adapter's log-dir read, whose error table 
 
 ### D126. Concurrent first acquisitions of one connection and profile each open a provider
 
-`acquireExecutionProfileProvider` (`src/lib/db/factory.ts:715-812`) checks the profiled cache, and on a miss constructs and connects a provider, then stores it (`:809`).
+`acquireExecutionProfileProvider` (`src/lib/db/factory.ts:969-1075`) checks the profiled cache, and on a miss constructs and connects a provider, then stores it (`:1071`).
 Two callers that miss at the same time each construct one, and the later store overwrites the earlier entry, so the earlier provider stays connected with nothing left to close it.
 The editor and agent paths reach this function the same way.
 `/api/mcp` avoids it on its own side, with an in-flight map keyed on the exported `profiledCacheKey` (`src/lib/mcp/context.ts`).
@@ -1883,7 +1832,7 @@ The editor and agent paths reach this function the same way.
 
 ### D127. Two seed-loading paths drop a connection without telling the caller
 
-`resolveAllCredentials` skips a seed whose credentials fail to resolve and only logs it (`src/lib/seed/credential-resolver.ts:89-99`).
+`resolveAllCredentials` skips a seed whose credentials fail to resolve and only logs it (`src/lib/seed/credential-resolver.ts:133-143`).
 The built-in samples are left out on a filesystem error by an empty `catch` (`src/lib/seed/index.ts:57-59`, `:68-70`).
 Both reach the caller as a shorter list with no reason: `GET /api/connections/managed` and MCP's `list_connections` show fewer connections and say nothing.
 
@@ -1891,7 +1840,7 @@ Both reach the caller as a shorter list with no reason: `GET /api/connections/ma
 
 ### D128. A read-only statement cannot be cancelled, so a cancelled or timed-out MCP query keeps running
 
-`queryReadOnly` takes no signal (`src/lib/db/types.ts:951`), and `cancelQuery` cannot find its statement.
+`queryReadOnly` takes no signal (`DatabaseProvider.queryReadOnly` in `src/lib/db/types.ts`), and `cancelQuery` cannot find its statement.
 When an MCP client cancels by closing the request, or `timeout_ms` passes, `run_read_query` stops waiting but the statement runs on: on PostgreSQL until `statement_timeout`, on SQL Server until the provider's deadline, on DuckDB to completion, and on SQLite while blocking the process (A1).
 A 2025-era `notifications/cancelled` sent in its own `POST` does not even stop the wait: the stateless server answers it 202 without knowing the call, which runs to completion or `timeout_ms` (`tests/integration/mcp/http-route.test.ts`).
 This departs from the MCP rule that a server should stop work on a cancelled request as soon as practical.
@@ -1911,6 +1860,727 @@ Measured on 2026-09-27, on `main` at ef1748e3:
 Do it after #1148 has merged, in a PR of its own, and not alongside another architectural change: the owner asked for the two to stay apart.
 
 **Done when:** which object-path shapes an engine accepts is part of its declaration, read through one kernel reader in the way `acceptedContainerShapes()` reads `containerPathShapes`; `attachedSegment` is gone from `ObjectPathShapeEngine`; the three local `shapeList` object-path sentences go through the shared renderer; the object routes refuse a path the engine does not accept by the same reader, before the provider is called; and every provider refusal sentence stays byte-identical.
+
+### D130. A Kubernetes protobuf value is withheld and never decoded
+
+The etcd provider withholds a value that begins with the Kubernetes protobuf envelope `k8s\x00`, labelled with the `apiVersion` and `kind` of its `runtime.Unknown` header (`withheldLabel` in `src/lib/db/providers/keyvalue/etcd/values.ts`), and never reads the object's fields (#1089, spec section 2).
+So a Pod, a ConfigMap or a Deployment stored in etcd is shown as "Kubernetes protobuf (v1, Pod), 1,204 bytes", which is safe and tells an operator nothing about the object.
+Decoding needs the Kubernetes API types for every stored kind, a dependency set this PR did not take on.
+
+Found 2026-09-30 while designing the etcd provider (#1089, spec section 2).
+
+**Done when:** a Kubernetes protobuf value that is not a Secret is decoded behind the withheld label, on demand, with the Secret rule of spec E9 unchanged, and a test over `tests/fixtures/etcd/`'s Pod envelope shows its decoded fields and no Secret's.
+
+### D131. An etcd connection names one endpoint, so a cluster without a DNS name that resolves to its members has no failover
+
+The etcd connection has one Host and one Port (`buildEtcdConnectionOptions` in `src/lib/db/providers/keyvalue/etcd/connection-options.ts`); grpc-js's `pick_first` fails over across the addresses one name resolves to, which the etcd live check measures (KE13), but a cluster addressed by member IPs has no such name.
+etcdctl takes `--endpoints` as a list.
+A list field needs a new connection field through the whole checklist of `docs/ADDING_A_PROVIDER.md`, which the etcd PR did not open.
+
+Found 2026-09-30 while designing the etcd provider (#1089, spec 6.1).
+
+**Done when:** an etcd connection can name several endpoints, the channel fails over across them, E3's rule that Studio dials only configured endpoints holds for each, and a live check stops the answering member and the next call is answered by another.
+
+### D132. grpc-js sends an IP-literal target as the TLS server name, which Node 25 and later and Bun refuse
+
+`@grpc/grpc-js` 1.14.5 sets the TLS `servername` from the dial target (`connectionOptions.servername = remoteHost` in `build/src/channel-credentials.js`), and Node 25 and later and Bun refuse an IP address as a server name with `ERR_INVALID_ARG_VALUE`, "Setting the TLS ServerName to an IP address is not permitted".
+The etcd provider works around it with a server-name override that is not an IP and a `checkServerIdentity` that verifies the IP (spec E5), which depends on grpc-js internals and is why grpc-js is pinned exactly.
+Amended 2026-10-04: the override now lives once, in `grpcTlsIdentity` (`src/lib/db/grpc/tls.ts`) and `grpcChannelCredentials` (`src/lib/db/grpc/credentials.ts`), for every gRPC provider.
+No open grpc-node issue covers it; the closed #1919 is about `0.0.0.0`.
+An upstream issue is drafted in the etcd PR's final report and is posted only with the maintainer's approval.
+
+Found 2026-09-30 by the client measurement of the etcd design (R07, M6).
+
+**Done when:** grpc-node answers the issue with a release that sends no IP as the server name, the shared gRPC transport drops its override for an IP identity, and `tests/unit/db/etcd/tls-handshake.test.ts` and `tests/unit/db/milvus/tls-handshake.test.ts` still pass on Node 24, Node 26 and Bun.
+
+### D133. Application secret roots in etcd are shown by default
+
+The etcd provider withholds Kubernetes secrets by prefix and by envelope (spec E9), and nothing else: Apache APISIX's `ssls`, `secrets`, `credentials` and `consumers` roots hold private keys and credentials as they were sent unless APISIX's own data encryption is configured, and the provider shows them.
+Measured in the design's landscape review (R09 7.1) against APISIX's documented layout; read, not driven against a live APISIX.
+
+Found 2026-09-30 while designing the etcd provider (#1089).
+
+**Done when:** a declared list of application secret roots, APISIX's four among them, is withheld by default with a label naming the application, a connection can opt out per root, and a test over each root shows the label and no value byte.
+
+### D134. A write under an application's coordination prefix is not warned about
+
+Patroni's `leader`, `failover` and `sync` keys, Vitess's topology and Calico's IPAM blocks live in etcd, and a hand write there can fail over a database or corrupt a network (R09 7.3); the etcd provider refuses only the Kubernetes prefixes (spec E8) and asks nothing more for these.
+
+Found 2026-09-30 while designing the etcd provider (#1089).
+
+**Done when:** a declared list of advisory prefixes makes a write that meets one ask for a typed confirmation naming the application, never a refusal, and a test drives a `put` under Patroni's `leader` through the confirmation gate.
+
+### D135. kine and Xline are not registered as etcd relatives
+
+kine, the k3s default datastore, implements a subset of the etcd API and refuses `DeleteRange`, serializable and sorted reads and lease listing, registers no Auth service, answers `LeaseGrant` with an id equal to the TTL and accepts four `txn` shapes; Xline claims full compatibility, answered every read and lease call measured, and refuses `Defragment` (R09 3.8, section 4).
+Neither is refused by the etcd provider, and neither is claimed.
+
+Found 2026-09-30 while designing the etcd provider (spec section 8).
+
+**Done when:** each has its own gate-4 probe against a live instance, answering the questions of the etcd design's section 8, and a `WIRE_COMPATIBLE_ENGINES` entry at the tier it measured, or a recorded refusal.
+
+### D136. `MongoDBProvider.runMaintenance` checks its operation with a set lookup the compiler does not read
+
+`runMaintenance` in `src/lib/db/providers/document/mongodb.ts` refuses an unknown operation with `SUPPORTED_MAINTENANCE_TYPES.has(type)`, a `ReadonlySet<MaintenanceType>` lookup that narrows nothing, and then ends its work in a `switch` over the six members of `MaintenanceType` with no `default`.
+So the set and the `switch` are two hand-kept lists of one union, and a seventh member makes the method's result possibly undefined to the compiler instead of failing at the lookup.
+That is why `MaintenanceType` stayed at six when etcd added `compact`, `defragment` and `disarm`: they went into a union of their own, `MaintenanceOperation` in `src/lib/db/types.ts`, whose docblock records the reason.
+
+Found 2026-09-30 while widening the maintenance operations for the etcd provider (#1089, section 7.2).
+Not fixed there: the etcd work edits no other provider's file.
+
+**Done when:** the MongoDB dispatch is exhaustive by construction, a `switch` whose `default` asserts `never` or a record keyed by the operation, the set is gone, and a unit test drives an unknown operation to its refusal.
+
+### D137. A connection's query timeout is checked on the server for etcd alone
+
+`createDatabaseProvider` in `src/lib/db/factory.ts` hands `options.queryTimeout ?? connection.queryTimeout` to the provider as it came, and the `BaseDatabaseProvider` constructor in `src/lib/db/base-provider.ts` keeps it, so only the etcd provider refuses a query timeout that is not a whole number of milliseconds from 1 to 2147483647, at connect.
+The connection dialog checks the field (`validateQueryTimeout` in `src/hooks/use-connection-form.ts`), but an inline connection posted to `POST /api/db/query`, and a caller of the published `createDatabaseProvider` or `getOrCreateProvider`, reach every other engine with any value.
+Measured 2026-10-01 under Bun against a listener that never answers: a ClickHouse connection with 2147483648 had no answer after 4,000 ms, 0 and 1.5 timed out within 2 ms, and `"abc"` failed with "Failed to connect to ClickHouse: Value NaN is outside the range [0, 9007199254740991]", while etcd refused all four with "Query timeout must be a whole number between 1 and 2147483647 milliseconds."
+Under Node 24.14.0 and 26.7.0 (the image runs Node 26.10.0), 2147483648 raised `TimeoutOverflowWarning` and timed out within 3 ms, and 1.5 and `"abc"` failed with Node's own `delay` argument errors, worded as a failed connection.
+
+Found while building the etcd provider (#1089), which checks the field itself, and measured again by its review.
+Not fixed there: the factory and the base constructor serve every engine.
+
+**Done when:** a query timeout outside whole milliseconds from 1 to 2147483647 is refused for every engine before a provider is built, and a unit test drives 0, 1.5, 2147483648 and a string through `createDatabaseProvider` to that refusal.
+
+### D138. A forward the SSH bastion refuses reaches the provider as a connection that closed
+
+The `forwardOut` callback in `createSSHTunnel` (`src/lib/ssh/tunnel.ts`) ends the local socket when the bastion refuses the channel, `if (err) { socket.end(); return; }`, and records the error nowhere, so the provider behind the tunnel meets a connection that closed and words it as a failure of its own.
+Measured 2026-10-01 through the real tunnel, factory and error mapping against an in-process ssh2 bastion that answers `CHANNEL_OPEN_FAILURE`: ssh2 handed the callback "(SSH) Channel open failure: Connection refused", "Name or service not known" or "open failed", and the user read "No etcd answered a plaintext connection at" the far end, or under TLS that no TLS connection was established, "Connection terminated unexpectedly" on PostgreSQL and "Connection lost: The server closed the connection." on MySQL.
+The sharpest case is a bastion with forwarding disabled in front of a healthy plaintext etcd: the user is told that no etcd answered and is pointed at TLS first.
+
+Found while building the etcd provider (#1089), whose connection sentences name the tunnel among the things to check, and measured again by its review.
+Not fixed there: the tunnel serves every engine.
+
+**Done when:** a refused forward reaches the caller as a connection error that names the bastion's refusal and the far end, on every tunnelled provider, and a test through an in-process ssh2 bastion that refuses the channel pins it.
+
+### D139. A SQLite DDL statement reports the row count of the write before it
+
+`SQLiteProvider.query` (`src/lib/db/providers/sql/sqlite.ts`) answers a statement that returns no rows with `rowCount: result.rows.length || result.changes`, and `changes` is the driver's `run()` answer, which SQLite does not reset for a statement that changes no row: a `CREATE TABLE` or `DROP TABLE` reports the count of the last `INSERT`, `UPDATE` or `DELETE` on that connection.
+Measured 2026-10-02 in the etcd branch's regression pass, the same on `origin/main` 82c729f7: after a `DELETE` of 2 rows, a `CREATE TABLE` in the editor answered "2 rows", and on a fresh connection it answered 0 (`t28/compare.md`, `t28/branch/editor.json`).
+
+Found by the etcd provider's regression pass on SQLite (#1089), which changes no SQL provider.
+Not fixed there: the SQLite provider is outside that PR.
+Since #1323 routes on the driver's result column count, a value-setting `PRAGMA` such as `PRAGMA foreign_keys = ON` reaches `run()` as well, so node:sqlite reports the previous write's count for it too, while bun:sqlite reports 0.
+
+**Done when:** a statement that changes no row reports no changed rows on both SQLite drivers, read from the statement itself rather than the connection's last count, and a test runs a `DELETE` then a `CREATE TABLE` on one connection and pins the second answer.
+
+### D140. Neo4j calls no APOC procedure, so a measured read-only subset is unavailable
+
+The Neo4j read policy refuses the `apoc.` and `gds.` namespaces whole and allows eight procedures (`NEO4J_POLICY_PROFILE` in `src/lib/db/providers/graph/neo4j/profile.ts`), because `apoc.load.*` reaches the network and the file system and READ mode does not stop it (`docs/providers/neo4j.md` section 3.4).
+Many APOC procedures and functions are pure reads, such as `apoc.meta.*` and the text and collection helpers, and users of a graph with APOC installed reach for them.
+The compose image installs no APOC, so no capture says which of them stay within the database.
+
+Found 2026-10-03 while designing the Neo4j provider (decision N10).
+
+**Done when:** a named APOC subset is allowlisted by exact name after each one is measured against a server with APOC installed for network, file and write reach, the policy corpus holds each allowed name and a refused neighbour, and the provider doc lists the subset.
+
+### D141. Memgraph has no provider on the graph layer
+
+Memgraph speaks Bolt and Cypher, and the graph layer (`src/lib/db/graph/`) was designed for a second engine, but the Memgraph 3.13.1 probe of the Neo4j design found that its catalog has none of the `db.*` procedures, its `EXPLAIN` reports `rw` for reads and writes alike, it enforces READ mode only in an explicit transaction and never on an auto-commit `session.run`, and it stops a running statement only on its timeout or `TERMINATE TRANSACTIONS <id>`, not on a closed session.
+So it needs its own catalog and gate, and an execution strategy the Bolt transport does not have yet: explicit READ transactions and a terminate by transaction id.
+Memgraph Community is licensed under the Business Source License 1.1, whose clause on competing works is a question for the maintainer before any design.
+
+Found 2026-10-03 while designing the Neo4j provider (decision N6).
+
+**Done when:** the licence question has a recorded answer, and then a `memgraph` provider supplies its own `GraphEngineProfile` and adds its execution strategy to the Bolt transport in its own PR, editing nothing under `src/lib/db/providers/graph/neo4j/`, with a live probe of every surface.
+
+### D142. A Neo4j connection through an SSH tunnel cannot verify the server's certificate
+
+`boltEndpointOf` in `src/lib/db/graph/bolt/uri.ts` refuses a verifying TLS mode on a tunnelled connection, because the driver would check the certificate against the tunnel's local `127.0.0.1` rather than the server's name, so a tunnelled Neo4j connection runs TLS only with verification off.
+`neo4j-driver-lite` 6.2.0 has a `resolver` option that could dial the tunnel while the URI keeps the server's name, and it has not been measured; the provider passes no resolver, by its fixed configuration.
+
+Found 2026-10-03 while designing the Neo4j provider's TLS mapping.
+
+**Done when:** the resolver, or another measured route, verifies the far end's certificate through a real tunnel, `verify-full` connects through it and refuses an address the certificate does not carry, and `tests/unit/db/graph/bolt-client.test.ts` pins the configuration.
+
+### D143. A Neo4j connection reads one database
+
+A Neo4j connection's one container is its `database`, or the user's home database resolved at connect (`GraphBaseProvider.connect` in `src/lib/db/graph/graph-base-provider.ts`), and another database is another connection.
+An Enterprise server with several databases therefore needs one connection per database, and the tree cannot show them side by side.
+One container was chosen so that a statement can never run against a database the tree is not showing.
+
+Found 2026-10-03 while designing the Neo4j provider.
+
+**Done when:** a connection lists every database the user may read as its containers, each statement runs on the database its tab names and on no other, the database a statement ran on is shown with its result, and a test drives two databases through one connection.
+
+### D144. Two first requests for one connection can orphan a connected provider
+
+`getOrCreateProvider` in `src/lib/db/factory.ts` awaits `providerCacheKey`, `createSSHTunnel` and `provider.connect()` between its cache lookup and its `providerCache.set`, and nothing records a creation in flight.
+Two requests that miss the cache for the same connection at once each build and connect a provider, and the later `providerCache.set` overwrites the earlier entry, whose provider is never disconnected and is out of reach of the idle sweep.
+It predates the Neo4j provider, but a Bolt provider now leaks a driver holding up to four pooled sockets rather than only HTTP handles; `GraphBaseProvider.connect` already makes an overlapping connect on one instance await the attempt in flight, which this race does not reach.
+
+Found 2026-10-03 while reviewing the Neo4j provider (PR #1239, review N6).
+
+**Done when:** concurrent `getOrCreateProvider` calls for one cache key share one creation, or the loser disconnects its provider and closes a tunnel it created, and a test drives two overlapping first calls with a provider that counts its connects and disconnects.
+
+### D145. Db2 Create Table is off until the dialog and the import have Db2 column types
+
+Inline row edit and the import into an existing table came back with `db2-node` 1.0.24, which reads non-ASCII text back as written and refuses a DECIMAL that does not fit its column, measured on Db2 12.1 and 11.5 by `tests/live/db2-live-check.ts` (K1 and K22 in `docs/providers/db2.md`), and 1.0.25 stores a BOOLEAN edit too (K16, fixed).
+`db2Capabilities` (`src/lib/db/providers/sql/db2/capabilities.ts`) still sets `supportsCreateTable` to false, which also withholds an import into a new table, because neither path can spell a Db2 table.
+`CreateTableModal` (`src/components/CreateTableModal.tsx`) has no Db2 row in `DIALECTS` and refuses to open without one, and `inferSqlType` in `src/components/DataImportModal.tsx` writes `TEXT`, which Db2 refuses (SQL0204N), and `NUMERIC`, which Db2 reads as `DECIMAL(5,0)` and so cuts every fraction.
+
+Found 2026-10-03 by the Db2 provider's driver spike (#786); narrowed to Create Table 2026-10-04 when writes came back.
+
+**Done when:** `CreateTableModal` carries a Db2 row whose every type was measured in a `CREATE TABLE` on 12.1 and 11.5, an import into a new Db2 table infers Db2 types that keep the imported values exactly, with a round trip of non-ASCII text and a fractional number in the live check, and Db2 declares `supportsCreateTable`.
+
+### D146. Db2 monitoring reads only the version and two catalog counts
+
+`src/lib/db/providers/sql/db2/monitoring.ts` reads the service level and the table and index counts, and answers every other panel empty with a label that says so.
+The #787 branch carried measured SQL for sessions (`MON_GET_CONNECTION`), slow queries (`MON_GET_PKG_CACHE_STMT`, which is empty unless `mon_req_metrics` or `mon_act_metrics` is on), buffer-pool hit ratio, storage, uptime, deadlocks and index statistics, measured on Db2 11.5 through `ibm_db`.
+
+Found 2026-10-03 while scoping the Db2 provider's first version (#786).
+
+**Done when:** each panel is read through `db2-node`, re-measured on 12.1 and 11.5, refused reads answer an empty panel rather than throwing, and `docs/providers/db2.md` section 9 names what each panel reads.
+
+### D147. The Db2 schema diff writes a column modification as a comment
+
+`NO_COLUMN_MODIFICATION` in `src/lib/schema-diff/migration-generator.ts` holds `db2`, because Db2 changes a column with `ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE` and may leave the table REORG-pending, after which most statements on it fail with SQL0668N until a REORG.
+The #787 branch drafted a branch that emits `SET DATA TYPE`, `SET`/`DROP NOT NULL` and `SET`/`DROP DEFAULT` with a REORG advisory comment, never measured live.
+
+Found 2026-10-03 while scoping the Db2 provider's first version (#786).
+
+**Done when:** the column modification is expressed through a declared capability rather than a `dialect === "db2"` branch, each statement it emits runs on Db2 12.1 against the fixture, the REORG-pending advisory names the table, and `tests/unit/schema-diff/migration-generator.test.ts` moves `db2` out of the comment-only coverage.
+
+### D148. Db2 has no transactions, SANDBOX or query cancel
+
+`db2Capabilities` sets `supportsTransactions` to false and the provider implements no `cancelQuery`: it holds one `Client` with no session of its own for a transaction.
+`db2-node` 1.0.22 offered no interrupt (K14 in `docs/providers/db2.md`); 1.0.24 offers `Client.cancel()`, a `queryTimeout` that cancels the statement on the server through `SYSPROC.WLM_CANCEL_ACTIVITY` on a second session and then closes the connection, and `beginTransaction()`, so the driver no longer stands in the way.
+Cancel needs the connecting user to hold activity-monitoring privileges and `EXECUTE` on `WLM_CANCEL_ACTIVITY`, which a plain application user may not, so what an unprivileged user sees has to be measured.
+
+Found 2026-10-03 by the Db2 provider's driver spike (#786).
+
+**Done when:** the provider implements `cancelQuery` over `Client.cancel()` and the transaction lifecycle on a held connection, a user without the cancel privileges gets a refusal that names them, and a live test cancels a long statement and sees it end on the server.
+
+### D149. Windows channels and the Visual C++ runtime the Db2 addon needs
+
+The win32 addon of `db2-node` imports `VCRUNTIME140.dll`, so a Windows machine without the Microsoft Visual C++ 2015-2022 x64 redistributable cannot load the Db2 driver.
+winget and Chocolatey declare it as a dependency; the portable zip, Scoop and `npx @libredb/studio` on Windows rely on the machine having it, and nothing has been measured on a clean Windows install.
+
+Found 2026-10-03 while packaging the Db2 provider (#786).
+
+**Done when:** a clean Windows 11 VM without the redistributable is measured on every Windows channel, each channel either installs the runtime or says what to install before the first Db2 connection, and a missing runtime reaches the user as a sentence naming it rather than a load error.
+
+### D150. The Db2 schema diff mixes schemas and writes views as tables, and nothing can turn it off
+
+Nothing in the provider capabilities disables schema diff or migration DDL for an engine, so a Db2 connection offers both with the shared engine's limits, measured on the Db2 provider branch.
+The diff keys objects by name only, so `APP.T` and `REPORTING.T` collide; it writes a view or a materialized query table as `CREATE TABLE`; and it quotes a cross-schema reference `SCHEMA.TABLE` as one identifier.
+The nearest lever is the migration generator's `NO_TABLE_DDL` type set in `src/lib/schema-diff/migration-generator.ts`, which declines the whole diff.
+
+Found 2026-10-03 while building the Db2 provider (#786); the schema-diff engine was left untouched.
+
+**Done when:** either the diff keys objects by schema and name, keeps a view or MQT a view, and quotes each part of a qualified name on its own, each pinned by a test over a two-schema Db2 fixture, or a declared capability turns schema diff and migration DDL off for an engine that cannot be served correctly, with the Db2 provider declaring it and the UI saying why.
+
+### D151. MongoDB and Couchbase read their fields from a sample and do not mark them sampled
+
+`describeObject` in `src/lib/db/providers/document/mongodb.ts` infers a collection's fields from up to `OBJECT_SAMPLE_SIZE` (100) documents and sets no `provenance` on the columns it builds.
+`src/lib/db/providers/document/couchbase/index.ts` does the same with the engine's `INFER` sampler, because Couchbase stores no schema to read, and sets no `provenance` either.
+So every field name either reports, which comes from the stored documents rather than from a declaration, reaches MCP `inspect_schema`, agent grounding and the four AI panels.
+`ColumnSchema.provenance: "sampled"` exists for that case, and `machineColumns` in `src/lib/db/detailed-object.ts` keeps a marked column from every one of those surfaces.
+Adopting it is one assignment in the column builder and its test, but the consequence is not small: every MongoDB and Couchbase field is sampled, so marking them removes each engine's whole field list from MCP, agent grounding and the AI panels, where a model drafts queries from those names today.
+That trade needs the owner's decision before anyone makes it, once for both engines.
+Measured 2026-10-03: no `provenance:` assignment exists in either provider, and MongoDB's `OBJECT_SAMPLE_SIZE` is 100.
+
+**Done when:** the owner has decided whether MongoDB's and Couchbase's sampled fields stay visible to models, and for each engine either its column builder sets `provenance: "sampled"` with a test that `inspect_schema` and the agent inventory hold none of them, or its provider doc (`docs/providers/mongodb.md`, `docs/providers/couchbase.md`) states that its sampled fields reach those surfaces; then this entry is deleted.
+
+### D153. The etcd connection-options test can outrun bun's five-second hook timeout
+
+The file-level `beforeAll` in `tests/unit/db/etcd/connection-options.test.ts` makes its certificates at test time with `openssl`, eight of them over a new RSA-2048 key, and passes no timeout, so bun's default of 5000 ms bounds the whole setup.
+On the `Unit & Integration Tests` run of #1246 on 2026-10-03 (12:03 UTC) the hook timed out after 5001 ms while `openssl req` made the eighth key, the one for `etcd-server`, and the file failed with no test run; later runs of the same job passed.
+The same eight keys took 14 to 88 ms each on a development machine the same day, so the setup normally ends far inside the limit, but RSA key generation searches for primes and has no fixed duration, and a busy runner stretches it further.
+
+Found on #1246, whose change does not touch etcd.
+Not fixed there: the test is etcd's, and that PR touched no other provider.
+
+Amended 2026-10-04: the same default bounds each test of `tests/unit/db/etcd/seam-guard.test.ts`, and `descriptor readers: exactly the files spec E11 names` ran out of it in one full coverage run on `main` at `6dcc67fd6` at a load average of about 40.
+That file's `beforeAll` already parses the repository once under a 60-second budget, so what ran out was the rule's own walk over the parsed files.
+The file passed alone (59 tests in 6.3 s there, and 60 tests in 3.9 s on `main` at `d994ad72f`), in every full run after that one, and in three runs beside 40 busy loops on a 20-core machine (7 to 10 s each, on `main` at `6dcc67fd6`), so it needs more load than that to fail again.
+This entry is done only when that test also passes repeated runs at the CI job's concurrency, through a timeout of its own or a cheaper walk.
+
+**Done when:** the hook carries a timeout sized for a busy runner (bun's `beforeAll` takes one as its second argument), or makes RSA keys only where a test needs RSA, and the file passes repeated runs at the CI job's concurrency.
+
+### D154. Qdrant Cloud is not claimed
+
+Qdrant Cloud speaks the Qdrant REST API and connects as a `qdrant` connection: its address pasted into the Host box, SSL mode `verify-system`, and a key in API key or JWT.
+No test cluster has passed gate 4 of #424, so no listing, README or doc claims it (vector-family spec 6.2).
+Its keys are JWTs, with manage access to the whole cluster and an expiry of 90 days by default, and they never expire when the expiry is left empty, which the connection dialog's credential warning names.
+Its strict mode answers "Limit exceeded", "Index required but not found", "Exact search disabled" and HTTP 429 with `Retry-After` in normal use, and the provider maps each of them by the answer, never by the host name.
+
+Found 2026-10-03 while designing the Qdrant provider (vector-family spec 6.2).
+
+**Done when:** a Qdrant Cloud test cluster passes gate 4 of #424 (captures, the live check and the browser pass), and the provider doc, the README and the listings name it with the tier it measured.
+
+### D157. Zilliz Cloud is not claimed
+
+Zilliz Cloud speaks the Milvus API and connects as a `milvus` connection (its address pasted into the Host box, SSL mode `verify-system`, an API key in Password or token, or `db_admin` and its password), and the provider doc says how to try it, but no test cluster has passed gate 4 of #424, so no listing, README or doc claims it (vector-family decision Q13).
+Its known gaps (no GetMetrics or GetReplicas, databases only on Dedicated) are found by the server's answer, never by the host name.
+
+Found 2026-10-03 while designing the Milvus provider (vector-family spec 5.2).
+
+**Done when:** a Zilliz Cloud test cluster passes gate 4 of #424 (captures, the live check and the browser pass), and the provider doc, the README and the listings name it with the tier it measured.
+
+### D158. A Milvus request body takes no `//` comment
+
+The Milvus dialect declares `bodyComments: false` (`src/lib/db/providers/vector/milvus/routes.ts`, `MILVUS_CONSOLE`), so a pasted Milvus body with a `//` comment is refused before anything is sent, while the Qdrant dialect accepts one; `#` comment lines before the request line work in both.
+Measured 2026-10-03 on the branch: `parseConsole` refuses `{"dbName": "default" // the default}` with the reason `body-comment`.
+
+Found 2026-10-03 while building the Milvus console (vector-family spec 5.4, R33 5).
+
+**Done when:** users paste commented Milvus bodies; then the dialect declares `bodyComments: true` in one data change, with corpus cases for a comment inside a string, after a value and at the end of the body.
+
+### D160. The Db2 compose service can skip its object fixture on a fresh volume
+
+On the first start of a fresh volume, `docker/db2-init/01-object-fixture.sh` printed "db2-init: fixture already loaded", yet `SELECT COUNT(*) FROM SYSCAT.TABLES WHERE TABSCHEMA IN ('APP','REPORTING')` returned 0.
+Running `/var/custom-fixture/01-object-fixture.sql` by hand then loaded it with no SQL error.
+The script loads the fixture only when its count query prints exactly `0`, and prints the skip message for anything else, so a query that fails or warns at that point of the start reads as a loaded fixture.
+
+Found 2026-10-03 by the browser pass of #1246.
+Seen again on 2026-10-04, on three fresh volumes in a row (12.1.0.0 twice, 11.5.9.0 once), each printing the skip message over an empty `APP`; run by hand moments after "Setup has completed", the same count query answered `SQL1024N A database connection does not exist`, which the script reads as a loaded fixture.
+
+**Done when:** the script tells a failed or warning count query from a non-zero count and fails loudly on the first, a fresh volume gets the fixture, and the check that the fixture loaded is part of the service's own start.
+
+### D161. A PostgreSQL session's duration can read below zero
+
+The sessions query in `src/lib/db/providers/sql/postgres.ts` (lines 1779-1792) reads each session's duration as `now() - query_start`, or `now() - xact_start` for a session in a transaction, and the slow-query list (lines 1752-1753) reads `total_time` and `avg_time` the same way.
+`now()` is the time the reading transaction started, so a statement or transaction that began after it reads below zero.
+Measured 2026-10-03 in the acceptance pass of the vector-family work: with Studio's own monitoring statements in flight on other pooled connections, the Sessions tab of /monitoring showed `-0.002352s`, `-0.001511s`, `-0.001256s` and `-0.000480s` beside four of them.
+
+Found by the acceptance pass of the vector-family work; the arithmetic predates it.
+
+**Done when:** the durations count to `clock_timestamp()`, so no session reads below zero, and an integration test reads the sessions of a live PostgreSQL while another connection runs a statement and finds no negative duration.
+
+### D162. Under Bun, the plaintext path of seven HTTP providers follows proxy variables and sends a PUT twice
+
+`httpTransportFetch` (`src/lib/db/http/egress-policy.ts:123-124`) returns `globalThis.fetch(input, init)` while `DB_HTTP_BLOCK_PRIVATE_HOSTS` is off, so when the server runs under Bun, every plaintext request of ClickHouse, Couchbase, Elasticsearch and OpenSearch, libSQL, Prometheus, Trino and Druid goes through Bun's `fetch`.
+Measured 2026-10-02 on Bun 1.4.2 for the Qdrant provider research, against a counting proxy and a cut-connection proxy: Bun's `fetch` sends the request through `HTTP_PROXY` or `HTTPS_PROXY` and hands the proxy the credential header in clear text for an `http://` target, `127.0.0.1` included, and it sends a PUT a second time when its reused keep-alive connection drops after the server applied it; Node 24.14.0 and 26.10.0 did neither, and `node:http` with an explicit agent did neither on any runtime.
+The production image runs Node 26 (`Dockerfile`, `CMD ["node", "server.js"]`), so today this reaches the test suite and anyone who runs the server under Bun; it was not measured provider by provider.
+Re-read 2026-10-03 on `main` after the vector-family work: the seven transports still call `httpTransportFetch`, and only the Qdrant provider dials through the shared `src/lib/db/http/node-transport.ts`.
+
+Found while researching the Qdrant provider, whose transport is `node:http(s)` with an explicit agent for this reason.
+Not fixed there: the path serves seven providers.
+
+**Done when:** the plaintext path of every HTTP provider dials through `node:http` with an explicit agent, for example through `src/lib/db/http/node-transport.ts`, and a test under Bun with proxy variables naming a counting listener records zero proxy connections, and a cut-connection proxy sees exactly one PUT.
+
+### D163. The Prometheus TLS path uses the global https agent while the egress guard is off
+
+`sendOverTls` (`src/lib/db/providers/timeseries/prometheus/request.ts:278-288`) builds its `node:https` request from `...tls` and `...guardedNodeOptions(hostname)`, and with `DB_HTTP_BLOCK_PRIVATE_HOSTS` off `guardedNodeOptions` (`src/lib/db/http/egress-policy.ts:111-116`) returns `{}`, so no `agent` is set and the process-wide global agent carries the request.
+Measured 2026-10-03 for `http:` only, on Node 24.14.0, Node 26.10.0 and Bun 1.4.2: with `NODE_USE_ENV_PROXY=1` the global agent sends through `HTTP_PROXY`, while `agent: false` and an explicit agent never do.
+Whether an `https:` request through the global agent goes through a proxy under `NODE_USE_ENV_PROXY=1` was not measured.
+
+Found while researching the Qdrant provider's transport.
+Not fixed there: the Prometheus provider is outside that work.
+
+**Done when:** the Prometheus TLS request is measured under `NODE_USE_ENV_PROXY=1` with `HTTPS_PROXY` naming a counting listener, and it either carries an explicit agent of the provider, pinned by that test, or the measured behaviour is stated in `docs/providers/prometheus.md`.
+
+### D164. A pasted http or https URL loses an explicit default port
+
+`parseGenericURL` (`src/lib/connection-string-parser.ts:657-668`) takes the port as `url.port || defaultPort`, and the WHATWG URL parser reports an explicit default port of a special scheme as an empty string, so `https://host:443` pasted into the connection-string box becomes ClickHouse on port 8443 and `http://host:80` becomes port 8123.
+Measured 2026-10-03 on Node 24.14.0: `new URL("https://h.example:443").port` and `new URL("http://h.example:80").port` are both `""`, while `new URL("https://h.example:8443").port` is `"8443"`.
+Only `http:` and `https:` are affected, because other schemes have no default port in the URL standard; the user who typed the port explicitly gets another one with no notice.
+
+Found while designing the address paste of the vector providers, whose Host-box parser (`src/lib/connection-host-uri.ts`) reads the port from the address text for this reason.
+Not fixed there: the ClickHouse paste path is outside that work.
+
+**Done when:** a port typed in a pasted `http://` or `https://` URL is kept as typed, including 80 and 443, and a test pastes `https://host:443` and `http://host:80` and pins both ports.
+
+### D165. A Db2 definition longer than 32672 bytes is shown cut, and the driver can now read it whole
+
+`readObjectSource` in `src/lib/db/providers/sql/db2/objects.ts` reads a definition as at most two 16336-byte `HEX(VARCHAR(SUBSTRING(...)))` chunks beside its length (`src/lib/db/providers/sql/db2/catalog.ts`), so a longer one is shown partial.
+That bound came from `db2-node` 1.0.22, which could not fetch a CLOB at all (K7 in `docs/providers/db2.md`).
+1.0.24 fetches a CLOB selected on its own: `SELECT TEXT FROM SYSCAT.VIEWS WHERE ...` answered all 40067 bytes of a view definition four times running on 12.1, and 1.0.25 reads a LOB beside other columns exactly too (K4, fixed), measured on 12.1 and 11.5 with a 50000-byte CLOB, so the length and `ORIGIN` can share the statement.
+
+Found 2026-10-04 while moving the Db2 provider to `db2-node` 1.0.24.
+
+**Done when:** a definition of any length reads whole through a statement that selects the CLOB alone, a non-ASCII definition longer than 32672 bytes reads back byte for byte in `tests/live/db2-live-check.ts` on 12.1 and 11.5, and the partial form and its reason are gone from section 6.5 of `docs/providers/db2.md`.
+
+### D166. A pending inline edit outlives a failed save onto the next query's result
+
+After a save of an inline edit fails, the edit stays pending, as #882 asks, and running another query keeps it pending over the new result.
+`handleApplyChanges` in `src/hooks/use-inline-editing.ts` keeps `pendingChanges` on a refusal, and nothing clears them when `currentTab.result` is replaced, so the grid and the Apply bar show a change addressed by row position against rows it was never made on.
+The apply itself checks each change's `originalValue` before it writes, so this is a display and intent defect rather than a wrong write.
+
+Found 2026-10-04 by the browser check of #1303 on a Db2 connection; the behaviour is the shared editor's and not the provider's.
+
+**Done when:** a pending change is tied to the result it was made on, so a new result either drops it with a notice or keeps it only where it still addresses the same row, and a hook test fails a save, runs a second query and finds no pending change shown against the second result.
+
+### D167. The import table picker names a table without its schema
+
+The existing-table picker in `src/components/DataImportModal.tsx` (`#import-target-table`) is valued by the object's path and labelled by `t.name` alone, so two tables of one name in two schemas read as two identical options and the user cannot tell which one an import writes to.
+The value is right since #789; only the label loses the container.
+
+Found 2026-10-04 by the browser check of #1303 on a Db2 connection with tables in `APP` and `REPORTING`; every engine with more than one container has it.
+
+**Done when:** each option's label names its container path wherever the engine has containers, the way the object tree qualifies a name, and a component test with two same-named tables in two schemas finds two distinct labels.
+
+### D180. The etcd live check still points at a worktree that no longer exists
+
+`tests/live/etcd-live-check.ts` holds `LANE_E`, the absolute path of the lane worktree the etcd provider was built in, as the working directory of its `--idempotence` run, the compose file its `--service measure --seed` run reads and the mount its `--drive-cluster-container` run takes; its header and `docs/providers/etcd.md` section 11.4 also name the compose project `etcd-lane-e`.
+That worktree was removed after the provider merged, so `--idempotence` fails before any check, with `posix_spawn 'docker'` in a working directory that does not exist (measured 2026-10-04); the four `--service` runs of section 11.4 do not need it and pass.
+Under Node the `etcd-auth` run also stops at its own snapshot: the harness reads the gateway with the global `fetch`, which cannot present the client certificate that fixture requires, while Bun's `fetch` takes one.
+So the Node runs that work are `etcd`, `etcd-cluster` and, with `NODE_EXTRA_CA_CERTS` naming the fixture CA, `etcd-auth-password`.
+
+Found 2026-10-04 while running the live check over the shared gRPC transport.
+
+**Done when:** the script takes the repository root from its own location and the compose project from a flag, `--idempotence` passes from any worktree, and the `etcd-auth` snapshot under Node goes through `node:https` with the client pair.
+
+### D196. A Flux console would be a server-side code surface, so v1 has none
+
+The InfluxDB providers send InfluxQL and SQL only: the route tables in `src/lib/db/providers/timeseries/influxdb/routes.ts` hold no Flux route, and the InfluxQL policy (`influxql-policy.ts`) refuses Flux text before any request.
+Flux is a programming language the server runs, not a query text a lexical policy can bound: from a read-only token it reaches HTTP, TCP and the server's metadata store, so a policy in front of it would promise a boundary it cannot keep.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** a design for Flux that does not rely on a lexical policy is decided by the owner, or the entry is closed as declined.
+
+### D197. InfluxDB 3 reads JSON, so types are lossy and the server never sees a cancel
+
+The `influxdb3` provider reads `/api/v3/query_sql` as `format=jsonl` (`src/lib/db/providers/timeseries/influxdb/sql-results.ts`), so a column's Arrow type reaches the grid only as JSON allows, and a cancel closes the socket while the server finishes the query.
+Arrow Flight over gRPC carries the exact types and a server-side cancel, and needs its own path inside the HTTP egress guard.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** an Arrow Flight path inside the egress guard returns exact 3.x types and cancels server-side, with a live measurement.
+
+### D198. No EXPLAIN strategy for InfluxQL or DataFusion text plans
+
+Both InfluxDB providers declare `supportsExplain: false` (`influxql-provider.ts`, `sql-provider.ts` in `src/lib/db/providers/timeseries/influxdb/`), so the Explain button is hidden, although a typed `EXPLAIN` already returns its plan as rows in the grid.
+No `explainFormat` and no strategy in `src/lib/explain/` reads an InfluxQL or a DataFusion text plan.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** an `explainFormat` and a strategy for each exist, measured on 1.13.1, 2.9.1 and 3.12.
+
+### D199. Retention policies are not a tree level
+
+The `influxdb` tree lists databases and their measurements, and a tree read goes through the database's default retention policy (`"db".."m"`, `src/lib/db/providers/timeseries/influxdb/influxql-objects.ts`), so a measurement written only into a non-default policy previews empty.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** the tree lists policies under a 1.x or 2.x database, and a measurement written only into a non-default policy previews non-empty.
+
+### D200. InfluxDB monitoring shows the overview only
+
+The monitoring page of both InfluxDB types reads `/ping` and `/health` and nothing else (`src/lib/db/providers/timeseries/influxdb/monitoring.ts`): no running queries, performance or storage figures, and `/metrics` is never read.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** running queries, performance and storage come from `/metrics` or the system tables, without exposing other users' query text to non-admins.
+
+### D201. Enterprise resource tokens are handled from documentation, not measured
+
+An InfluxDB 3 Enterprise database token answers `/ping` with 403, and the providers handle it from InfluxData's documentation: the only capture of that answer is synthetic (`tests/fixtures/influxdb/3.12.0-core/ping-forbidden-synthetic.json`), because the pinned Core image cannot produce it.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** a live Enterprise server with a `db:<name>:read` token passes the 403 `/ping` path.
+
+### D202. The InfluxDB cloud products are documented as untested
+
+The providers were measured against InfluxDB 1.13.1, 2.9.1 and 3.12.0 Core only (`tests/fixtures/influxdb/README.md`); InfluxDB Cloud (TSM), Cloud Serverless, Cloud Dedicated and Clustered are claimed nowhere (`src/lib/db/compatibility.ts`).
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** each of Cloud (TSM), Serverless, Dedicated and Clustered passes the live evidence gate or is recorded as not served.
+
+### D203. Qdrant words a truncated answer as an unreachable server
+
+The shared transport marks an answer the server ended after accepting the request with `TransportError.truncated` beside kind `network` (`src/lib/db/http/node-transport.ts`), and the InfluxDB providers word it as a server failure; Qdrant's `src/lib/db/providers/vector/qdrant/errors.ts` reads only the kind, so the same cut reads as a server it could not reach.
+
+Found 2026-10-04 while designing the InfluxDB provider (ruling R3: no file under `src/lib/db/providers/` outside the InfluxDB directory changes in that work).
+
+**Done when:** Qdrant's `errors.ts` reads `TransportError.truncated` and says the server failed after accepting the request, with a test over a truncation.
+
+### D204. The plaintext consent survives a Host or Port change, for Db2 and both InfluxDB types
+
+`src/hooks/use-connection-form.ts:342,490,707` keeps `allowInsecureAuth` when Host or Port is edited and sends it whenever SSL mode is `disable`, so a consent given for one host carries the password or token to the next one typed, while the InfluxDB hint says the secret crosses the network to this host.
+This is existing Db2 behaviour (#786).
+
+Found 2026-10-04 by the security review of the InfluxDB provider design (finding SR1 F8), filed by the review-round rulings rather than fixed there, because the shared form change alters Db2's behaviour inside a provider PR.
+
+**Done when:** the connection form clears `allowInsecureAuth` when Host or Port changes, for every type that takes the field, with a hook test; decided as a shared change outside a provider PR.
+
+### D205. Oxia connections cannot write
+
+v1 reads only (`src/lib/db/providers/keyvalue/oxia/`, DECISIONS O1).
+Writes need a protected-prefix table for Pulsar's metadata (`/admin`, `/managed-ledgers`, `/loadbalance`, `/namespace`, `/schemas`, `/ledgers`) and an expected-version guard, because the server has no authorization and no undo.
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O1).
+
+**Done when:** `put`, `delete` and `delete-range` run behind typed confirmation, refuse a protected prefix and send `expected_version`, with `READ_ONLY_ENFORCED.oxia` still true for the mode, measured live on 0.16.x and 0.17.x.
+
+### D206. Oxia ephemeral records and sessions are shown, never made or listed
+
+The Source tab badges an ephemeral record (O11), but no session is created or listed (`getActiveSessions` answers the "Oxia does not list client sessions" state).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O11).
+
+**Done when:** a decision on whether sessions belong in Studio is taken; if yes, a session list from a read the server offers, with a test against 0.17.x.
+
+### D207. No bounded notifications watch on Oxia
+
+`notifications` is refused by name (O10).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O10).
+
+**Done when:** a watch with a time and count bound, the etcd `watch` shape, runs on a server started with `--notifications-enabled`, with a cancel test.
+
+### D208. Oxia namespaces and data servers cannot be listed
+
+The data-server API has no namespace list, so Namespace is typed (O5) and Data servers too (O6).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O5).
+
+**Done when:** a read-only list from the coordinator's admin port is designed with its own dial and authentication rules, or the entry is closed as declined because the admin port is a write surface.
+
+### D209. A port-forwarded Oxia cluster cannot be read
+
+A forward reaches one address while the cluster sends clients to the advertised leaders (O6); the provider doc gives the hosts-file workaround.
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O6).
+
+**Done when:** a rewrite map from advertised to reachable address is designed with `grpc.default_authority` handled and measured on a three-server cluster, without weakening SECURITY row 3.14.
+
+### D210. Pasting Pulsar's oxia://host:6648/ns does not split it
+
+The host-URI parser (`src/lib/connection-host-uri.ts`, `HostUriScheme`) takes `http` and `https` only and refuses a path, so the URL goes in three fields by hand (O5).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O5).
+
+**Done when:** the shared parser takes a scheme with a default port and a path-to-Database output, with tests for each existing scheme unchanged.
+
+### D211. An in-cluster Studio cannot read its Oxia token from a file
+
+A pasted OIDC token expires.
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O7).
+
+**Done when:** a security decision on reading a server-side path is taken, and if accepted a token-file field with rotation, refused outside a configured directory.
+
+### D212. gRPC providers are outside the HTTP egress guard
+
+grpc-js resolves names itself, so `DB_HTTP_BLOCK_PRIVATE_HOSTS` cannot cover etcd, Milvus or Oxia.
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O6).
+
+**Done when:** `src/lib/db/grpc/` resolves each target once, checks the address with `egress-policy.ts` and dials the checked address with the original name as TLS identity, with tests for etcd, Milvus and Oxia.
+
+### D213. No Oxia metrics panel
+
+The server exports Prometheus `/metrics` only, and v1 shows none (O14).
+The Grafana dashboards in `deploy/dashboards/` at Oxia v0.16.10 query metric names the server does not export (for example `oxia_server_db_puts_total` against the exported `oxia_server_db_puts_count_total`).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O14).
+
+**Done when:** a metrics URL panel reads named series with a test over a captured scrape, and the series it reads are the names the server exports.
+
+### D214. Key order is probed because no released Oxia reports it
+
+main carries `key_sorting` in the shard assignments (upstream PR #1388); v1 vendors v0.16.10 and probes (O3, O9).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O9).
+
+**Done when:** a release carries the field; the proto is re-vendored from that tag, the reported order wins over the probe where present, and the probe stays for older servers.
+
+### D215. The POSIX shell-word rules exist twice
+
+The POSIX-shell refusal rules exist twice: `etcd/lexer.ts` and `src/lib/db/console/shell-words.ts`.
+etcd's `lexer.ts` keeps its own word reader while Oxia reads through the engine-neutral shell-word reader (O10).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O10).
+
+**Done when:** etcd's command line reads through the shared module, with `tests/unit/db/etcd/lexer.test.ts` unchanged.
+
+### D216. The Oxia Keys panel discovers folders on its first page only
+
+Discovery runs on the first page of a walk with no pattern, within the bounds SB1-8.5 sets, and never under a folder, because under a folder its cost scales with the number of child nodes (O13; SPEC-RECONCILIATION cross-part ruling).
+A deeper or wider Pulsar tree is narrowed by prefix.
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O13).
+
+**Done when:** a lazy children tree is designed if real Pulsar trees show the discovery insufficient, measured on a production-shaped tree.
+
+### D217. Studio's Oxia doc recommends 0.17.1 because of a 0.16 standalone lock
+
+An Oxia 0.16 standalone server (measured on 0.16.10) stops sending shard assignments to every client after one request whose authority is not `host:port`, which Studio never sends, until restarted (upstream #1450, about standalone mode only). 0.17.1 is not affected; fixed on main by #1450, in no 0.16 release as of 2026-10-04.
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O2).
+
+**Done when:** a 0.16 release carries #1450; the doc's version note and the `oxia` service of `database-compose.yml` move to it, and the live check passes on it.
+
+### D218. The Oxia cluster dial policy is checked by hand only
+
+No CI job starts the `oxia-cluster` profile; `tests/unit/db/oxia/cluster-policy.test.ts` covers it with synthetic answers.
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O15).
+
+**Done when:** a CI job runs `tests/live/oxia-live-check.ts --cluster` against the profile, or the entry is closed because the synthetic test is judged enough.
+
+### D219. The Keys panel and tab titles print a key's control characters raw
+
+The shared Keys panel rows and the tab titles print a key as it is, so a key holding a control character is drawn with it.
+A key `a` followed by U+0000 shows as `a` and a box in its row and title, and its Source tab reads "Source: a", the same as a key `a`.
+Measured on Oxia, which reaches such a key from the Keys panel by design; the panel and the titles are shared, so every engine with such keys draws them the same way.
+
+Found 2026-10-04 by the browser pass of the Oxia provider (step 4).
+
+**Done when:** a key's control characters are shown escaped in the Keys panel rows and in tab titles, for every engine.
+
+### D220. An empty value read successfully is headed as a failed read
+
+The shared Source tab heads an `unavailable` part "This definition could not be read", with an error icon, even when the read succeeded and the value is empty.
+Oxia and etcd both show it above their own "The value is empty (0 bytes)" sentence.
+
+Found 2026-10-04 by the browser pass of the Oxia provider (step 6).
+
+**Done when:** an empty value reads as an empty value, with no failure heading or error icon.
+
+### D221. The Keys panel's empty state under a prefix says the database holds no keys
+
+With a prefix that matches nothing, the shared Keys panel says "This database holds no keys the walk has seen", though only the prefix matched none: measured on an Oxia namespace of 20,077 keys.
+The sentence is the shared panel's, not a provider's.
+
+Found 2026-10-04 by the browser pass of the Oxia provider (step 9).
+
+**Done when:** under a prefix the empty state says that no key under the prefix has been seen, for every engine.
+
+### D222. etcd and Milvus blame a pasted CA when none was pasted
+
+With SSL mode verify-full and the CA field empty, an untrusted server certificate is checked against the runtime's own roots, yet etcd says "The server's certificate is not signed by the CA under SSL / TLS: paste the etcd CA." and Milvus says the same of "the CA under SSL / TLS".
+Both read the panel through the shared `readGrpcTlsPanel`, which accepts verify-full with no CA; Oxia words this case on its own since ruling R35 of its PR.
+
+Found 2026-10-04 by the review of that change.
+
+**Done when:** etcd and Milvus name the trust store when no CA is pasted, as Oxia's `tlsSentence` does.
+
+### D223. A binary value's hex dump is captioned as rendered JSON
+
+The shared Source tab captions a part from its `origin` alone (`sourceCaption` in `src/components/object-source/source-caption.ts`), and a hex dump of a binary value has no origin of its own, so it is captioned "A structured definition, rendered here as JSON."
+Oxia's hex dump and etcd's base64 view of a binary value both carry that caption, though neither is JSON.
+
+Found 2026-10-04 by the review of the Oxia provider (ruling R37 of its PR).
+
+**Done when:** a binary dump part carries a caption that says what it is, for every engine.
+
+### D224. An Oxia key on several shards shows one record in a record walk
+
+Oxia stores a record on the shard its partition key names, so one key written under two partition keys is two records on two shards.
+Every Oxia key walk without `--index` answers such a key once, and `range-scan` (with or without `--prefix`) reads its record on the lowest shard id that listed it, so the other records are not shown.
+An `--index` walk lists the shards one after another, so it shows each copy.
+They are read in the editor with `get -p` and their partition key, and the Source tab of such a key names how many shards hold it.
+
+Found 2026-10-04 by the review of the Oxia provider (ruling R38 of its PR).
+
+**Done when:** a record walk shows every record of such a key, each with its shard, or the entry is closed because `get -p` is judged enough.
+
+### D225. db2-node writes nothing for a value bound to a large CLOB, DBCLOB or BLOB column
+
+A parameter whose target is a CLOB, DBCLOB or BLOB column declared 32768 bytes or longer answers 0 changed rows, with no error and no diagnostic, and the row keeps its old value (K24 in `docs/providers/db2.md`).
+Beside other parameters the whole statement writes nothing on 1.0.25, where 1.0.24 refused it with "parameter descriptor count 1 does not match parameter count 2".
+At 32767 bytes the value is written, and `CAST(? AS VARCHAR(n))` or `CAST(? AS VARBINARY(n))` is written at any declared length; the 1.0.25 README's own `CAST(? AS BLOB(1M))` example writes nothing.
+Measured 2026-10-04 on Db2 12.1.0.0 and 11.5.9.0 through `db2-node` 1.0.24 and 1.0.25 (`tests/live/db2-known-issues.ts`, row K24).
+The grid's inline editor binds every value, so an edit of such a cell would be reported saved and lost.
+Contained: the provider declares CLOB, DBCLOB and BLOB in `inlineEditRefusedColumns` (`src/lib/db/providers/sql/db2/capabilities.ts`), so `ResultsGrid` opens no editor on such a cell and shows the reason on it; a result declares these columns without their length, so every one is refused, a short one included.
+The table preview still leaves them out and a result holding one carries a warning (`src/lib/db/providers/sql/db2/values.ts`); an import writes literals and is not affected.
+Reported upstream as [gurungabit/db2-node#31](https://github.com/gurungabit/db2-node/issues/31).
+
+Found 2026-10-04 while moving the Db2 provider to `db2-node` 1.0.25.
+
+**Done when:** the pinned `db2-node` writes a bound value to a `CLOB(1M)`, a `DBCLOB(1M)` and a `BLOB(1M)` alone and beside other parameters, K24 probes `GONE` on 12.1 and 11.5, and the editor refusal, the preview rule and the warning are removed with it.
+
+### D226. Object search, inventory and agent grounding still list routines on Materialize and fail
+
+Materialize's `pg_proc` has no `prokind`, so `PostgresProvider.listObjects()` for `function` and `procedure` is refused with `column "p.prokind" does not exist` (`XX000`).
+The object tree is spared since #1351: the count marks both kinds unavailable and the tree does not open an unavailable folder.
+Three other callers list every declared kind without asking the count first, so one refused kind fails the whole read: the search route (`src/app/api/db/objects/search/route.ts`, the `listObjects(container, kind.id)` loop), the inventory route (`src/app/api/db/objects/inventory/route.ts`, the `listObjects(pair.container, pair.kind)` loop), and the agent's inventory grounding (`src/lib/agent/tools.ts`), which skips a kind whose count was refused only when the kind declares `countIsListing`, and the PostgreSQL routine kinds do not.
+
+Found 2026-10-04 by the review of the #1351 fix; pre-existing, not measured end to end through those three surfaces.
+
+**Done when:** on a Materialize connection, search, inventory and the agent's grounding answer for tables, views and materialized views, with the two routine kinds reported as unavailable rather than failing the read.
+
+### D227. A long SQLite statement blocks the whole Studio server, and no cancel or timeout reaches it
+
+`sqlite.ts` runs every statement through `bun:sqlite` or `node:sqlite`, both synchronous, on the server's one JavaScript thread, and neither exposes `sqlite3_interrupt` or a progress handler (Node 24.11's `DatabaseSync` has `setAuthorizer` and neither of those; Bun 1.4.2's `Database` has neither).
+So a running statement cannot be stopped from inside the process, and while it runs no other request is served: measured 2026-10-03 on node:sqlite (SQLite 3.50.4), a 300M-row recursive CTE from the editor made `/api/health` answer after 69.7 s instead of 6 ms, and the 60 s query timeout, checked only after the statement returns, did not end it.
+Since #1364 the editor no longer offers Cancel there (`supportsQueryCancel: false`, `docs/providers/sqlite.md` section 3.4); the block itself is unchanged.
+A1 is the same property on the agent and MCP path.
+
+Found 2026-10-04 while fixing #1364.
+
+**Done when:** SQLite statements run in a worker thread that the provider terminates on cancel and on the query timeout, the SQLite provider implements `cancelQuery`, and a test shows `/api/health` answering while a long statement runs.
+
+### D228. Platform discovery recognises only four engine families
+
+`detectEngine` in `src/lib/seed/discovery-fingerprint.ts` matches the PostgreSQL family, the MySQL family (MySQL, MariaDB, Percona), MongoDB and the Redis family (Redis, Valkey, KeyDB, Dragonfly), and `ENV_ALLOW_LIST` in `docker/discover.mjs` exports only the ten environment keys those need.
+A SQL Server, ClickHouse or Neo4j app installed from the CapRover catalog is therefore never listed, and the admin adds it by hand; the admin status does not claim it either.
+Each engine widens what the exporter copies to the shared volume, so each one is its own reviewed change.
+
+Deferred by the CapRover auto-connect work.
+
+**Done when:** each added engine has its keys in `ENV_ALLOW_LIST`, a detection row and a mapping row in `src/lib/seed/discovery-fingerprint.ts`, tests in `tests/unit/docker-discover.test.ts` and `tests/unit/seed/discovery-fingerprint.test.ts`, and rows in the detection and mapping tables of `docs/SEED_CONNECTIONS.md`.
+
+### D229. Platform discovery reads CapRover's Swarm services only
+
+The exporter, `docker/discover.mjs`, lists the Swarm services of one overlay network (`scanOnce`), and `DiscoveryExportSchema` in `src/lib/seed/discovery-export.ts` accepts `platform: "caprover"` only.
+Kubernetes, plain Docker Compose and other Docker Swarm platforms have no discovery source, so a database they run is a seed-file entry or a hand-made connection.
+
+Deferred by the CapRover auto-connect work.
+
+**Done when:** a second platform writes the same export contract under its own `platform` value, with its own exporter tests, or the decision not to support one is stated in `docs/SEED_CONNECTIONS.md` and this entry is deleted.
+
+### D230. `useAllConnections` loads the managed list once
+
+`useAllConnections` (`src/hooks/use-all-connections.ts`) fetches `/api/connections/managed` in its mount effect and never again, while `useConnectionManager` refreshes the same list on an interval and on focus.
+Its callers, the admin Overview and Operations tabs, Schema Diff and the Monitoring dashboard, keep showing a discovered database that was withdrawn, and miss one that appeared, until the page is reloaded.
+
+Deferred by the CapRover auto-connect work.
+
+**Done when:** `useAllConnections` refreshes on the schedule `useConnectionManager` uses (`MANAGED_REFRESH_DEFAULT_FLOOR_MS`, `MANAGED_REFRESH_MAX_MS`, visible tabs only), and a hook test shows a withdrawn connection disappearing without a reload.
+
+### D231. The auto-connect template cannot place its two apps on one manager node
+
+`deploy/caprover/libredb-studio-autoconnect.yml` deploys Studio and its `-discovery` companion as two Swarm services that share a named volume, and a one-click template cannot express placement.
+A named volume is local to a node, and only a swarm manager answers the exporter's service listing, so on a multi-node CapRover the companion can land on a worker (status `swarm_unavailable`) or on another node than Studio (Studio never sees the export and keeps waiting).
+Today the template's closing text tells the operator to pin both apps to the manager under App Configs.
+
+Deferred by the CapRover auto-connect work.
+
+**Done when:** both apps land on the same manager node without a manual pin, or the export reaches Studio across nodes, measured on a two-node CapRover cluster.
+
+### D232. A libSQL `connectionString` that does not parse is ignored, while the comment says it is reported
+
+`resolveConnection` in `src/lib/db/providers/sql/libsql/index.ts` returns the configuration, changed only by dropping `user`, when `new URL(config.connectionString)` throws, and the comment in its `catch` says the string is left to `validate()` and to the transport to report.
+Neither reports it: `validate()` refuses only a connection that has neither a host nor a `connectionString`, and `LibSQLHranaTransport` builds its origin from `host` and `port` alone, with `localhost` when no host is set.
+So the request goes to whatever the form fields hold, without TLS when they set none although a `libsql://` URL implies it, which is the outcome the comment says swallowing the error would cause.
+
+Found 2026-10-04 while planning libSQL HTTP Basic auth for the platform integration.
+Not fixed there: that change touches the transport's `Authorization` header, not connection resolution.
+
+**Done when:** a `connectionString` that does not parse is refused with a `DatabaseConfigError` that names the field before any request is sent, and a test pins it.
+
+### D233. Six test files leave their temporary directories in `TMPDIR`
+
+Six test files make directories under `os.tmpdir()` with `mkdtempSync` and leave them there.
+`tests/unit/lib/agent/model-tuning.test.ts` (line 83) and `tests/unit/lib/agent/model-profiles.test.ts` (line 52) make `libredb-tuning-*`, and `tests/api/agent/config.test.ts` (line 344) makes `libredb-tuning-route-*`.
+`tests/unit/lib/agent/ledger-compatibility.test.ts` (line 36) makes `agent-ledger-compat-*`, `tests/unit/build-azure-package.test.ts` (lines 243 and 353) makes `azure-package-*` and `azure-package-cli-*`, and `tests/unit/check-appimage-perms.test.ts` (line 28) makes `appdir-perms-*`.
+`ledger-compatibility.test.ts` registers a removal on the process's `exit` event (line 100), and its directories stay all the same when the file runs through `bun tests/run-tests.ts`; the other five remove nothing.
+Measured 2026-10-05 on `main` at `d994ad72f`, each file run alone through `bun tests/run-tests.ts` with `TMPDIR` pointed at an empty directory: they left 14, 1, 2, 7, 7 and 5 directories, in that order, 36 in all.
+One passing run of the whole suite on `main` at `6dcc67fd6`, measured 2026-10-04 the same way, left the same 36 and none from any other file.
+Nothing removes them, so every run on a developer machine or a self-hosted runner adds as many again.
+
+Found 2026-10-04 while planning the platform integration, whose local gates kept `TMPDIR` in a scratch directory.
+Not fixed there: none of the six files is part of that work.
+
+**Done when:** each of the six files removes the directories it makes, for example with `rmSync(path, { recursive: true, force: true })` in an `afterEach` or `afterAll`, and a run of `bun run test` with `TMPDIR` pointed at an empty directory leaves it empty.
+
+### D240. Two connection records naming one DuckDB file get two read-write handles in one process
+
+`getOrCreateProvider` in `src/lib/db/factory.ts` keys its cache per connection record and never borrows, so two different records that name the same DuckDB file each open a read-write `DuckDBInstance` on it: two users' own connections, say, or an admin-only seed and a user's connection naming its file.
+On Linux and macOS each handle keeps its own catalog, and whichever closes last checkpoints over the other's committed rows; on Windows the second open is refused (`docs/providers/duckdb.md` section 3.8).
+It predates the non-admin DuckDB file-access change: `main` before that change behaves the same for two records, and the change removed only the one-record case, a seed every role can use, by giving that record one posture.
+Test Connection and the agent's operations reads borrow the open handle instead, so the gap is the editor's own cache.
+
+Found while fixing the review findings on the non-admin DuckDB file-access change.
+
+**Done when:** a second record naming a file the cache already holds is served without a second read-write handle, or is refused with a sentence that names the open one, measured on Linux and on Windows.
 
 ## Value interpolation
 
@@ -1945,7 +2615,9 @@ Two constraints from #269 that do not go away:
   newline-joined payload cannot come back.
 - **Primary-key detection is heuristic.** The hook picks a result column named `id` or ending in
   `_id`. Acceptable for a control gated on an opt-in capability; per-dialect editing on real tables
-  should derive the key from the schema.
+  should derive the key from the schema. A table whose key is named otherwise is refused with
+  "No primary key column detected" (`src/hooks/use-inline-editing.ts:854-859`), which reads as if
+  the table had none (found by the end-to-end test pass of 2026-10-03 and 2026-10-04).
 
 Whether row editing should be universal at all is a product decision. The published
 `WorkspaceFeatures.inlineEditing` flag is deprecated against this entry (#288): it becomes real, or
@@ -2023,14 +2695,16 @@ writers. `csv.ts` and `result-export.ts` are pure and hold no browser reference 
 can reuse them; `download.ts` is the only browser-bound module there. Worth costing against the
 agent's own export gap (B33, B34), which wants the same route.
 
-### X5. `Studio.tsx` re-renders its whole tree on every keystroke
+### X5. The Studio shell's dialogs and modals still re-render on every keystroke
 
-14 `useState`, no `useMemo`/`useCallback`, no memoized children, React Compiler off. #422's
-code-splitting is not this fix and does not help it. It touches every prop in the shell, which is why
-it was not mixed into a correctness PR.
-
-`framer-motion` is also still in the first load: `Studio.tsx`, `ConnectionModal`, `SchemaExplorer`,
-`ConnectionItem` and `TableItem` all import it statically and all mount on arrival.
+#1127 memoized the shell's children and took `framer-motion` out of the first load.
+Measured with a commit counter in a real browser, 27 keystrokes in the editor: the sidebar, the agent rail, the toolbar, the connections list and the desktop header no longer re-render, and the shell's component renders fell from 11961 to 6588.
+#1190 hands `BottomPanel`, `StudioTabBar` and `StudioMobileHeader` only what they show, and makes the handlers they take stable.
+Measured with a render counter in each of the three, 27 keystrokes in a real browser: 27 renders each on `main`, 0 each after.
+`BottomPanel` is still handed the tab's statement while its explain view is open, which pairs it with the plan, so in that view alone it re-renders per keystroke.
+The dialogs moved into `StudioModals` and the standalone overlays into `StudioOverlays`.
+What still re-renders on every keystroke is the modal surface: `SaveQueryModal`, `QuerySafetyDialog`, `CreateTableModal`, `DataImportModal`, `DataProfiler`, `CodeGenerator`, `TestDataGenerator`, the two confirmation `AlertDialog`s, `CommandPalette`, `ShortcutsDialog` and `MobileNav`.
+Neither `StudioModals`, `StudioOverlays` nor the modals are memoized.
 
 ### X9. What `columnTypes` still cannot name, measured
 
@@ -2246,6 +2920,7 @@ MSSQL and MongoDB declare `check` as globally runnable and MySQL declares `optim
 `ProviderLabels` has only the `analyzeGlobal*` and `vacuumGlobal*` triads, so a global card can only be
 rendered where the provider's `vacuumActionOperation` happens to redirect the vacuum slot to it. MySQL
 gets an Optimize card that way; MSSQL's and MongoDB's `check` gets nothing.
+Amended 2026-09-30: the Operations tab now draws a declared card for an operation whose `MaintenanceOperationSpec` carries a `title` and a `description` (#1089), so a global operation gets a card by declaring them; DuckDB's optimize and the global check of SQL Server, SQLite, libSQL and MySQL stay withheld until each provider declares them after a live run, and MongoDB's check leaves this entry, because `src/lib/db/providers/document/mongodb.ts` declares it `global: false`.
 
 Deliberately not fixed with U9 (2026-08-25): inventing card copy for five providers without measuring
 what each statement actually does is the generic mapping #427 reverted. What is needed first is the
@@ -2292,13 +2967,85 @@ So one condition gets two wrong answers. The five existing object routes that go
 was neither empty nor malformed, and `POST /api/db/query` answers HTTP 500 with a JSON parser's sentence.
 Neither tells the caller their request was too large.
 
-The two routes added by #789 Phase 3 do NOT inherit this: `readBoundedJson` reads `content-length` and
+The two routes added by #789 Phase 3 do NOT inherit this: `readObjectRouteBody` reads `content-length` and
 answers 413 above `EDIT_BODY_BYTE_LIMIT` (8,388,608), which sits below the framework's wall, so an
 oversized edit body meets a sentence that names the size. They do not fix it anywhere else, and that is
 stated in `readDefaultBody`'s own docblock.
 
 **Done when:** a body above the framework's clone limit gets one answer that names the size, on every
 route, rather than an empty-body claim on five and a parser error on one.
+
+### X20. The query routes read the whole JSON body before any bound a connection type declares
+
+`POST /api/db/query` and `POST /api/db/multi-query` call `req.json()` before they know which connection type the request is for, because the type is inside the body.
+A console text bound a connection type declares (`maxTextBytes` on its row in `src/lib/db/destructive-commands.ts`) is therefore checked after the body is parsed: the 413 of `POST /api/db/query` and the 400 of `POST /api/db/multi-query` keep the text from the provider, never from the parse.
+For every engine the only bound on the body is the framework's clone limit of X19, and statements up to it run today: `tests/api/db/query.test.ts` runs a 9 MiB statement on a type that declares no bound.
+A streamed bound read before the parse, as `readBoundedJson` in `src/lib/api/bounded-json.ts` gives the passkey routes and `readObjectRouteBody`, would close this for every engine, but it changes every SQL tab, and a JSON-escaped text can be several times its own size, so the figure is a decision about every engine rather than a fix.
+X19 measured how `POST /api/db/query` answers a body above the framework's 10 MiB buffer; how `POST /api/db/multi-query` answers one is unverified.
+
+**Done when:** the owner has chosen a body bound for the query routes, and both routes answer a body above it with a 413 that names the size, read from the stream before any parse, with a test per route.
+
+### X21. One user can fill a shared connection's in-flight slots
+
+`src/lib/db/utils/bounded-limiter.ts` bounds the calls Studio has in flight per provider and per engine key, with one FIFO queue per engine key, and `ProviderLimiter.acquire(signal)` takes no user.
+A connection every user shares, a seed connection above all, is one provider, so one user's console runs and panel reads can hold every slot and fill the queue.
+Another user's request then waits behind them, or is refused with the full-queue sentence, although that user sent one request.
+No shipped provider uses the limiter yet; the Milvus and Qdrant providers are its first consumers.
+Measured 2026-10-03: `acquire` takes the one parameter `signal`, and `engineLimiter` has no caller outside its own module.
+
+**Done when:** the routes that reach a provider bound the calls each user has in flight on one connection, with a test that a second user's request is admitted while the first user's requests fill their own share.
+
+### X22. A request the browser drops does not cancel the query it started
+
+`POST /api/db/query` hands the run's `queryId` to a provider that implements `cancelQuery`, and the one way to stop that run is `POST /api/db/cancel` with the same id, which the editor's Stop sends.
+When the browser drops the request instead, because the tab is closed, the network fails or the page reloads, the route never reads the request's abort signal.
+The provider then keeps the query running until it ends or its deadline passes, holding its connection and, for a provider on the limiter of X21, its slot.
+No engine has that bridge today.
+Measured 2026-10-03: `src/app/api/db/query/route.ts` holds no reference to `signal`.
+
+**Done when:** a request aborted mid-run reaches the provider's `cancelQuery` for the run it started, with a route test that aborts the request and asserts exactly one cancel for its `queryId`.
+
+### X23. The multi-statement route drops a result's vector columns
+
+`POST /api/db/multi-query` builds each statement's result and the main result through `carriedChannels` in `src/app/api/db/multi-query/route.ts`, which carries `warnings` and `columnTypes` only, so a `vectorColumns` declaration a provider returns never reaches the grid on that route.
+Milvus and Qdrant, the two shipped engines that declare vector columns, also declare a console text bound, which the route refuses with 400 before it runs anything, so neither meets the gap.
+A later engine that declares vector columns and accepts multi-statement text would show its vectors there as plain JSON, and Copy Cell would copy the JSON text rather than the engine's encoding.
+Measured 2026-10-03: `vectorColumns` appears neither in `StatementResult` nor in `carriedChannels`.
+
+**Done when:** the route carries `vectorColumns` on each statement's result and on the main result, with a route test that a declared column reaches both, or a type that declares vector columns is refused on the route by name.
+
+### X24. The Operations and Tables tabs keep the previous connection's rows when the next connection's table read fails
+
+Selecting a connection whose table read fails leaves the Operations and Tables tabs showing the previous connection's rows, under the new connection's name, with the new engine's maintenance controls on them and no error.
+Measured 2026-10-03 in the browser pass of #1246, on the CI images of that branch and of `main` before it: with a DuckDB connection whose file another process had locked ("DuckDB file ... is locked by another process" in the server log), the Operations tab showed SQLite's 10 tables and the SQLite session under the DuckDB connection's name, each row with DuckDB's Analyze Table and Vacuum Table; a Db2 connection failing on a configuration error showed the same.
+A click on one of those controls would send the new engine's maintenance with another connection's table name.
+
+Found by the browser pass of the maintenance extensions (#1246).
+Not fixed there: the defect predates that PR, and its cause is in how the tabs keep their rows across a connection change, not in the maintenance controls.
+
+**Done when:** a failed table read clears the previous connection's rows and shows the error in both tabs, and a test switches from a connection with tables to one whose table read fails and asserts that no row and no maintenance control remain.
+
+### X25. A PostgreSQL or SQLite view's row menu offers Analyze Table and Vacuum Table
+
+The object tree's row menu offers "Analyze Table" and "Vacuum Table" on a PostgreSQL view and "Analyze Table" on a SQLite view, because neither provider's `maintenanceOperationSpecs` declares `kinds`, and an absent `kinds` means every relation kind (`MaintenanceOperationSpec.kinds` in `src/lib/db/types.ts`).
+On PostgreSQL the entry opens `/admin/operations?path=public&path=big_orders`, which says "this page has no row for "big_orders" to run it on", and nothing is sent.
+Measured 2026-10-03 in the acceptance pass of the vector-family work, on a PostgreSQL view `big_orders` and a SQLite view `open_loans`.
+Db2 declares `kinds` for the same reason: RUNSTATS and REORG are refused on a view.
+
+Found by the acceptance pass of the vector-family work; the menu entries predate it.
+
+**Done when:** PostgreSQL and SQLite declare `kinds` on the operations their row menus offer, naming the kinds each engine runs them on, measured on a PostgreSQL materialized view and on SQLite's `ANALYZE` of a view, and a test asserts that a view's row menu offers no maintenance entry its engine would not run.
+
+### X26. The /monitoring Tables and Sessions tabs offer maintenance and Terminate to a non-admin, and the server refuses them
+
+`MonitoringDashboard` (`src/components/monitoring/MonitoringDashboard.tsx:304-310`) renders `SessionsTab` and `TablesTab` without `isAdmin`, and both default it to `true`, so a signed-in user who is not an admin sees every per-row Analyze, Vacuum and Reindex control and every Terminate button on /monitoring.
+Each click is sent, and `POST /api/db/maintenance` answers `403 {"error":"Unauthorized. Admin access required."}`, shown as a toast, while the object tree's row menus already hide these entries from the same user.
+Measured 2026-10-03 in the acceptance pass of the vector-family work, signed in with the user role on a PostgreSQL connection: 6 maintenance buttons and 7 Terminate buttons, each click answered 403.
+`TablesTab`'s docblock already names that default as older behaviour and leaves it alone.
+
+Found by the acceptance pass of the vector-family work; the default predates it.
+
+**Done when:** `MonitoringDashboard` passes the signed-in role to both tabs, a non-admin sees no maintenance or Terminate control on /monitoring, and a component test renders the dashboard as a non-admin and finds none.
 
 ---
 
@@ -2483,8 +3230,8 @@ constant, and a bounded batch and a single read land in one cache shape rather t
 ### U32. A catalog change that lands during an in-flight read is dropped, and the pre-DDL answer stays
 
 `run` refuses a read whose key is already in flight
-(`src/components/object-tree/use-tree-nodes.ts:517`) and `refresh` issues its reads without waiting
-for anything (`:696`), so a `refreshToken` bump that arrives while a read is still open issues
+(`src/components/object-tree/use-tree-nodes.ts:519`) and `refresh` issues its reads without waiting
+for anything (`:698`), so a `refreshToken` bump that arrives while a read is still open issues
 nothing for that slot.
 The answer that lands is the one asked for before the DDL statement ran, `store` writes it as the
 row's current state, and nothing re-issues until the next bump.
@@ -2637,6 +3384,7 @@ Read from the bundle, not yet seen in a browser.
 
 Found 2026-09-23 while writing `registerPromqlLanguage` on the `redis-language.ts` template for #1085 (section 3.2); the template works for PromQL only because the bundle ships no `promql` id.
 Not fixed in #1085: registering Redis differently changes how every Redis tab is highlighted, which is not that PR's to change.
+Amended 2026-09-30: the etcd language registers an id the bundle does not ship, `etcd`, which `tests/isolated/monaco-language-ids.test.ts` pins, the shape this entry's fix takes.
 
 `grep -rn 'getLanguages().some' src/lib/editor/redis-language.ts` returns exactly one hit, that early return, and the bundle's own registration of the id is what `tests/isolated/monaco-language-ids.test.ts` asserts.
 
@@ -2750,6 +3498,10 @@ Three surfaces report whether a connection works, and none of them says it was r
 Seen 2026-09-23 in the #1085 browser pass on a Prometheus connection with a wrong password: `/api/v1/status/buildinfo` answered HTTP 401, and the desktop header read "Slow", the admin fleet "timeout" and the mobile header "Online", while the object panel showed the refusal itself.
 None of it is engine-specific: the three lines predate #1085 and none of them reads the connection's type, so every engine takes the same paths.
 
+Measured again 2026-10-02 in the etcd agent pass: a run over 19 key prefixes, 1 member and 2 leases recorded `tableCount` 22 and read "22 key prefixes read" on the answer card, and the prompt header says "22 key prefix(s)" (`t27/outcomes.md`).
+The count is `snapshot.objects.length` named with `noun.singular` near lines 1448 and 1528 of `src/lib/agent/context-snapshot.ts`, and `tableCount` named with `noun.plural` near line 429 of `src/components/agent/AnswerCard.tsx` and 948 and 1368 of `src/components/agent/timeline.ts`.
+`origin/main` has the same code, and its providers declare extra inventory kinds too (Druid lookups, Cassandra types, ClickHouse dictionaries, MSSQL synonyms), read from the code and not measured there.
+
 Found 2026-09-23 by the #1085 browser pass.
 Not fixed in #1085: the three components serve every engine, and that PR changes no shared surface's behaviour for the engines it does not add.
 
@@ -2766,15 +3518,15 @@ Not fixed in #1085: the spec and the rail predate it.
 
 **Done when:** the spec's locator names the editor's RUN button alone (`exact: true`, or a test id of its own), and the spec passes with an LLM configured.
 
-### U47. In the embedded `StudioWorkspace`, Cmd/Ctrl+Enter, "Run Query" and "Run Sel" run nothing, and the toolbar Run sends the whole buffer
+### U47. In the embedded `StudioWorkspace`, Cmd/Ctrl+Enter, "Run Query" and "Run Selected" run nothing, and the toolbar Run sends the whole buffer
 
-`handleExecute` in `src/components/QueryEditor.tsx` syncs the buffer, flashes the range it will run and dispatches a window `execute-query` event whose `detail.query` is the selection, or else the statement at the caret; the Cmd/Ctrl+Enter command, the "Run Query" context-menu entry and the editor's "Run Sel" button all end there.
+`handleExecute` in `src/components/QueryEditor.tsx` syncs the buffer, flashes the range it will run and dispatches a window `execute-query` event whose `detail.query` is the selection, or else the statement at the caret; the Cmd/Ctrl+Enter command, the "Run Query" context-menu entry and the editor's "Run Selected" button all end there.
 The only listener is in `src/hooks/use-query-execution.ts`, which only the standalone `src/components/Studio.tsx` uses.
 The embedded `StudioWorkspace` (`src/workspace/StudioWorkspace.tsx`, the npm package's shell) runs queries through `useQueryAdapter`, which registers none, so in the published shell those three controls never reach the host's `onQueryExecute`.
 The one control that runs there is the toolbar Run, and `executeQuery` in `src/workspace/hooks/use-query-adapter.ts` sends `overrideQuery || tabToExec.query`, the whole buffer: it never asks the editor for `getEffectiveQuery`, as `use-query-execution.ts` does, so neither a selection nor the statement at the caret can be run in that shell.
 On a PromQL tab that is a refusal: a buffer holding `up` and `rate(prometheus_http_requests_total[5m])` on two lines is sent whole, and the server answers `bad_data` with `2:1: parse error: unexpected identifier "rate"`, while `up` alone answers.
 The editor shows its Cmd/Ctrl+Enter hint in both shells, and the shortcut list in `docs/FEATURES.md`, generated from `src/lib/keyboard-shortcuts.ts`, offers it without naming a shell.
-Reproduced 2026-09-23 by mounting the real `StudioWorkspace` and the real `QueryEditor` with only Monaco doubled: on a PostgreSQL host with the buffer `SELECT 1;` and `SELECT 2` on two lines and `SELECT 2` selected, Cmd+Enter, "Run Query" and "Run Sel" each dispatched `execute-query` with `SELECT 2` and `onQueryExecute` received nothing, and the toolbar Run then sent both statements.
+Reproduced 2026-09-23 by mounting the real `StudioWorkspace` and the real `QueryEditor` with only Monaco doubled: on a PostgreSQL host with the buffer `SELECT 1;` and `SELECT 2` on two lines and `SELECT 2` selected, Cmd+Enter, "Run Query" and "Run Selected" each dispatched `execute-query` with `SELECT 2` and `onQueryExecute` received nothing, and the toolbar Run then sent both statements.
 `git log -S'execute-query' -- src/workspace` is empty, so the embedded shell never listened, and `tests/components/StudioWorkspace.test.tsx` mocks `QueryEditor`, so no test reaches the embedded run shortcut.
 
 Found 2026-09-23 by the #1085 review.
@@ -2856,6 +3608,389 @@ Found 2026-09-26 by the PR #1070 live check.
 Not fixed in #1070: the PR does not touch the agent rail.
 
 **Done when:** a connection switch either closes the consent step or keeps it with the rail header naming the step's connection, the rail stops showing the previous connection's run after the switch, and a component test pins both across a connection change.
+
+### U55. The editor path writes no audit event for a write statement on any engine
+
+`POST /api/db/query` runs a `put`, an `UPDATE` or a `DEL` and records no audit event, on every engine; only the object-edit apply route and the maintenance route audit (`src/app/api/db/objects/edit-apply/route.ts`, `src/app/api/db/maintenance/route.ts`).
+The etcd provider states it as a limit (`docs/providers/etcd.md`, section 13), and the maintainer decided on 2026-09-30 to file it as product-wide work rather than add it for one engine.
+
+Found 2026-09-30 while designing the etcd provider (#1089).
+
+**Done when:** a statement the confirmation gate classifies as a write writes one audit event with the connection, the actor and the classification, never the statement's values, on every engine, and a route test drives one write per engine family.
+
+### U56. A watch is bounded, and there is no live panel for streamed results
+
+The etcd `watch` runs for a window and answers its events as one result (`runBoundedWatch` in `src/lib/db/providers/keyvalue/etcd/watch.ts`), because the query route answers once; a Kafka tail and Redis `SUBSCRIBE` need the same streamed panel.
+
+Found 2026-09-30 while designing the etcd provider (#1089, spec 5.3).
+
+**Done when:** a result panel shows events as they arrive over a streamed route, with a stop control and a bound, and the etcd watch, a Kafka tail and a Redis `SUBSCRIBE` each drive it in a component test.
+
+### U57. The confirmation gate posts Redis and MongoDB write statements, values included, to the model provider
+
+`QuerySafetyDialog` posts every dangerous statement it shows to `/api/ai/query-safety` (`src/components/QuerySafetyDialog.tsx`), so a Redis `SET` or a MongoDB update leaves the deployment with its values when a model is configured.
+The etcd row of the destructive vocabulary declares `safetyAnalysis: false` and posts nothing (spec E10); the other engines were not changed by the etcd PR.
+Reproduce: open the dialog for a Redis `DEL user:1` with a model configured and watch the network tab for the POST.
+
+Found 2026-09-30 while designing the etcd provider (#1089, spec E10).
+
+**Done when:** a vocabulary row can decline the model analysis, the Redis and MongoDB rows decide whether they do, and a component test shows no request to the AI route for a declining row.
+
+### U58. TablesTab's Vacuum summary card reads 0 and "OK" on an engine that declares no vacuum
+
+`vacuumStateKnown` ignores `vacuumSupported` (`src/components/monitoring/tabs/TablesTab.tsx`, where the card reads it), so on an engine that supports maintenance and declares no `vacuum` the card counts the tables whose `bloatRatio` passes 10 as if the engine had a vacuum.
+The table's "Vacuum" column header (`TablesTab.tsx:443`) is drawn on those engines too.
+Ten engines declare `supportsMaintenance: true`, set or inherited from `BaseDatabaseProvider.getCapabilities()`, with no `vacuum` among their `maintenanceOperations`: MySQL, libSQL, Oracle, SQL Server, ClickHouse, Trino, Redis, Couchbase and etcd today, and Db2 LUW after the Db2 PR (#786), which reads no table statistics in its first version.
+All but MySQL publish no `bloatRatio`, so their card shows 0 with a green "OK" wherever the tab has table statistics to read; Redis answers none, so its card reads that only while its database is empty, and N/A once the database holds a key.
+MySQL's `bloatRatio` is `DATA_FREE` as a percentage of the table's data and index bytes, so its card counts the tables past 10 percent under the Vacuum title, a count the fix takes off the card too.
+Reproduce: render `TablesTab` with the capabilities `POST /api/db/provider-meta` serves for libSQL, Oracle or SQL Server and the statistics of one table, or open the Tables tab on one of them over a database that holds a table, and read the Vacuum card.
+
+Found 2026-09-30 while designing the etcd provider (R11 ARCH-3); its engine list was measured again on 2026-10-01 by the etcd review, from each provider's capabilities and table statistics.
+
+**Done when:** `vacuumStateKnown` requires `vacuumSupported`, the card is absent or says the engine has no vacuum, and a component test pins it for an engine without one.
+
+### U59. Redis's command unit borrows the default payload wording of the preview
+
+`ApplyPreviewDialog.tsx` writes "library code" for a command unit that sets no `payloadLabel`, which is Redis's word, while etcd's unit sets `payloadLabel: "value"`; Redis's own declaration in `src/lib/db/providers/keyvalue/redis.ts` was left alone by the etcd PR's isolation rule.
+
+Found 2026-09-30 while designing the etcd provider (R11 CF-3).
+
+**Done when:** Redis's unit declares `payloadLabel: "library code"`, the dialog's default is a neutral word, and the Redis preview pin in `tests/components/object-source/ApplyPreviewDialog.test.tsx` stays byte-identical.
+
+### U60. The connection form sends a client certificate the current SSL mode does not draw
+
+The TLS panel draws the client certificate only in `verify-ca` and `verify-full`, and a certificate typed there stays in the form state and is sent after a switch to `require` or `verify-system` (`src/hooks/use-connection-form.ts`), so an etcd connection signs in as a Common Name the user cannot see.
+Reproduce with a hook test: type a client certificate under `verify-full`, switch to `require`, build the connection, and read `ssl.clientCert`.
+
+Found 2026-09-30 while designing the etcd provider (R12 UX-8).
+
+**Done when:** a mode that draws no client certificate sends none, or draws what it sends, and a hook test pins the switch.
+
+### U62. The object-edit wire checks answer for an array with a hole in it
+
+The shape checks of `src/lib/api/object-edit-wire.ts` walk steps, segments, session pins, consequences and lost consequences with `Array.prototype.every`, which skips a hole.
+Measured 2026-09-30 with `isObjectEditUnitShape`: a statement unit whose one step's `segments` is `[{ from: "provider", text: "AB" }, <hole>]` throws a `TypeError` from `spansTheText` instead of answering false, and a unit whose `steps` is a valid step followed by a hole answers true.
+JSON never carries a hole, so a request body cannot reach it; an in-memory caller can.
+
+Found 2026-09-30 while extending the command unit for the etcd provider (#1089).
+Not fixed there: the checks belong to every engine's edit path.
+
+**Done when:** each of those checks walks its array the way `isBoundedTextList` in the same file does, a hole answers false, and a unit test holds a hole in each of the five arrays.
+
+### U63. The key browser carries three lint warnings
+
+`bunx eslint src/components/key-browser/KeyBrowser.tsx` reports three warnings.
+`react-hooks/exhaustive-deps`: `databaseRow` is a new object on every render, so the `useMemo` that reads it recomputes the panel's rows on every render.
+`jsx-a11y/role-has-required-aria-props`, twice: both `role="treeitem"` rows carry no `aria-selected`, so a screen reader cannot tell which key is open.
+
+Found 2026-09-30 while generalising the key browser for the etcd provider (#1089).
+Not fixed there: neither changes what the etcd work needed from the panel.
+
+**Done when:** `databaseRow` is memoised, both tree rows state `aria-selected`, the file lints clean, and a component test reads `aria-selected` on the open key's row.
+
+### U64. The tab manager's deferred preview runs are never cleared
+
+`handleTableClick` in `src/hooks/use-tab-manager.ts` schedules the preview query with `setTimeout(..., 100)` on two paths, the fresh tab and the rerun of a failed one, and keeps no handle to either.
+A shell that unmounts within those 100 ms still calls `executeQuery` for a tab that no longer exists.
+
+Found 2026-09-30 while reviewing the tree click for the etcd provider (#1089).
+Not fixed there: the hook serves every engine.
+
+**Done when:** the pending timers live in a ref that an unmount effect clears, and a hook test unmounts inside the window and sees no query run.
+
+### U65. Redis's Load more under a folder whose last segment is `*` walks its parent folder's pattern
+
+`pathPattern` in `src/components/key-browser/tree.ts` builds a folder's Load more pattern under `keyScan.pattern: "glob"` with `prefixPattern` over the joined name, which reads a last segment of `*` as the folder mark, so the folder `["a", "*"]` sends `MATCH a:*`, the pattern of its parent `["a"]`, where a pattern built from the path is `a:\*:*`.
+Rows are never wrong, because `isUnderPrefix` keeps only the folder's keys, but the walk is the parent's.
+Measured 2026-10-01: over the keys `a:*:x`, `a:b:1`, `a:c:2` and `a:d`, `MATCH a:*` covers all four and the folder holds `a:*:x` alone; Redis, Valkey and KeyDB spend `COUNT` on keys before the match filters them, so each press sends back up to 1,000 of the parent's keys and asks a `TYPE` for each, and DragonflyDB and Garnet spend it on matched keys, so the folder takes as many presses as its parent.
+The function's docblock states this, and `tests/unit/components/key-browser-tree.test.ts` pins `pathPattern(["a", "*"])` as `a:*`; the Keys panel sent the same pattern before the etcd work.
+
+Found while generalising the key browser for the etcd provider (#1089), and measured again by its review.
+Not fixed there: the etcd design keeps Redis's glob pattern unchanged.
+
+**Done when:** the glob arm builds its pattern from the path, `escapeGlob` of the joined name followed by the separator and `*`, so `["a", "*"]` sends `a:\*:*`, and the pin in the tree's unit test moves with it.
+
+### U66. No test clears the no-scan checkbox
+
+The connection dialog forwards its "Do not read the object list on connect" checkbox (#765) with `onChange={(e) => setSkipObjectScan(e.target.checked)}` in `src/components/ConnectionModal.tsx`, and `tests/components/ConnectionModal.test.tsx` only clicks it unticked and expects `true`, then checks that a saved choice draws it ticked.
+Measured 2026-10-01: with that handler rewritten in memory to forward `true` always, both dialog suites still pass, 121 of 121, while the real dialog's box then stays ticked after its first click where the committed one alternates, so a connection's no-scan choice could not be cleared and no test would say so.
+The Read-only toggle beside it has had its untick test since the etcd PR.
+
+Found while adding the Read-only toggle for the etcd provider (#1089), and measured again by its review.
+Not fixed there: the no-scan choice is not part of the etcd work.
+
+**Done when:** the dialog suite renders the box ticked, clicks it once, and expects `setSkipObjectScan` called with `false`, in the shape of the Read-only toggle's test.
+
+### U67. Every engine but etcd writes a line or paragraph separator raw into the text of the click and of Generate Select
+
+`generateTableQuery` and `generateSelectQuery` in `src/lib/query-generators.ts` write an object name that holds U+2028 or U+2029 with the character itself on every shipped engine but etcd, whose arm writes such a key through a txn's Go quoting instead (`holdsUnkeptCharacter`).
+Monaco 0.57 defaults `unusualLineTerminators` to `prompt` and `src/components/QueryEditor.tsx` sets no other value, so the moment such a text lands the editor offers to remove the separators, and accepting leaves lines that name another object.
+Runnable lines are among them: Redis's `DEL` line for the key `a`, U+2028, `b` reads `DEL "ab"` once the separator is removed, which deletes the key `ab` when run, and a SQL click becomes `SELECT * FROM public."ab";`.
+LibreDB's `get`, `put` and `delete` lines write the key bare, and `tokenize` in `src/lib/db/providers/embedded/libredb.ts` splits a line at any white space outside quotes, U+2028 and U+2029 included, so those lines name another key even when the offer is declined, as they do for a plain space (U68).
+Measured 2026-10-02 over each shipped engine's census declaration: the click and the Generate Select text of an object named `a`, U+2028, `b`, and of one with U+2029 in its place, hold the separator raw on all nineteen engines but etcd; `origin/main`'s generators handle neither character either.
+
+Found by the etcd review (#1089), after the etcd arm was made to keep both characters out of its text.
+Not fixed there: the other engines' arms are outside the etcd PR, and so is the editor's option, which applies to every engine.
+
+**Done when:** each arm keeps U+2028 and U+2029 out of both texts, with an escape its grammar reads back as the same character, quoting where its words split at white space, or a `#` note in place of a line it cannot spell, and a test over every shipped engine's declaration finds neither character raw in either text.
+
+### U68. LibreDB's click and Generate Select write a key bare, so a line for a key that holds white space or a quote mark does not reach that key
+
+The LibreDB arm of `generateTableQuery` and `libredbCheatsheet` in `src/lib/query-generators.ts` write the key or prefix bare into their `prefix`, `get`, `put` and `delete` lines.
+`tokenize` in `src/lib/db/providers/embedded/libredb.ts` splits a line at any white space outside quotes and reads `'` and `"` as quoting, which it removes, so those lines name another key or none, and a click on a tree row runs the line it writes.
+It needs neither U67's unusual character nor its dialog: a plain space is enough.
+Measured 2026-10-02 through the generators and the provider's `query` on a scratch store holding the keys `a b` and `a`: the click `get a b` shows the value of `a`, `put a b example` sets `a` to `b example`, and `delete a b` deletes `a` while `a b` stays.
+A tab, a no-break space or U+3000 in place of the space does the same.
+The lines for a key named `"a"`, its quotes part of the name, read, overwrite and delete `a` as well, and every line for a key named `it's` is refused as an unmatched quote.
+The click on the group `my users:*` runs `prefix my users:`, which lists the keys `my` and `myx` beside the group's own, and the group's `get`, `put` and `delete` lines name the key `my`.
+`origin/main` writes the same lines and splits them the same way.
+
+Found by the etcd review (#1089), while measuring the LibreDB lines of U67.
+Not fixed there: LibreDB's arms and its provider are outside the etcd PR.
+
+**Done when:** the generated `prefix`, `get`, `put` and `delete` lines quote a key or prefix that holds white space or a quote mark, or write a `#` note in place of a line they cannot spell, so `tokenize` reads each back as that one key, and a test runs each line against a store holding a key with a space and one with a quote mark, each beside the key its bare line names, and finds that the line reaches its own key and leaves the other as it was.
+
+### U69. The result export menu offers SQL INSERT and DDL for every engine, etcd included
+
+`RESULT_FORMATS` in `src/components/studio/BottomPanel.tsx` lists "SQL INSERT" (`sql-insert`) and "DDL (CREATE TABLE)" (`sql-ddl`) beside CSV and JSON, and both menus map over the whole list with no gate, so every engine's result offers them.
+Neither means anything for a result that is not a table of rows in a SQL database, and the file they write says so.
+Measured 2026-10-02 in the etcd browser pass: an etcd result of three keys exported as SQL INSERT writes `INSERT INTO table_name ("key", "value", "value_encoding", "create_revision", "mod_revision", "version", "lease") VALUES ('/app/a/b', 'nested', 'text', '13', '13', '1', NULL);` for each row, a statement for a table that does not exist (`t26/export-app.sql-insert`, `t26/shots/t26-18-export-menu.png`).
+`origin/main` has the same list and the same ungated menus, so every non-SQL engine there offers them too.
+
+Found by the etcd browser pass (#1089).
+Not fixed there: the menu serves every engine and the etcd PR adds no capability to it.
+
+**Done when:** the provider declares whether SQL INSERT and DDL apply to its results, the two entries show only when it does, and a test renders the menu for an engine that declares neither and for one that declares both.
+
+**Partly done:** a query dialect's record now says whether the two SQL formats apply (`offersSqlExport` on `DialectSpec` in `src/lib/db/query-dialects.ts`, absent meaning they do), and `BottomPanel` leaves both out of the Export and the Copy items where it says they do not.
+`tests/components/studio/bottom-panel-export-formats.test.tsx` renders the menu for a record that declines them and for PostgreSQL, MongoDB, Redis, LibreDB, Kafka, etcd and Prometheus, which keep them.
+No shipped dialect declines them yet; each vector dialect's record declines them when its provider lands.
+Still open: an engine with no dialect record, and every record that leaves the field absent, etcd's included, still offers both.
+
+### U70. Admin Overview's Fleet Status prints "timeout" for any endpoint that errored
+
+`OverviewTab` in `src/components/admin/tabs/OverviewTab.tsx` prints "timeout" for a fleet row whose `item.status === "error"` and the latency otherwise (near line 775), so a refused credential, an unreachable host and a real timeout all read "timeout".
+Measured 2026-10-02 in the etcd browser pass: an etcd connection whose user is refused by the server shows "timeout" in Fleet Status (`t26/outcomes.md`, the Fleet line).
+`origin/main` has the same line.
+
+Found by the etcd browser pass (#1089).
+Not fixed there: the row is shared by every engine and its health payload is not part of the etcd work.
+
+**Done when:** the row shows the error's own category or message, with a test that renders a refusal and a timeout and expects two different texts.
+
+### U71. Monitoring's Tables tab draws the SQL columns for etcd
+
+`src/components/monitoring/tabs/TablesTab.tsx` draws Size, Index, Bloat and Vacuum for every engine, and its header card reads "Vacuum 0" when nothing needs one, so an etcd connection, which has none of the four, gets all of them.
+Measured 2026-10-02 in the etcd browser pass: the tab for etcd shows Size N/A, an Index column, a Bloat column and the Vacuum card with 0 (`t26/shots/t26-26-tables.png`).
+The tab is shared by every engine, and etcd reaches it on this branch; the same columns are drawn on `origin/main` for every engine there.
+
+Found by the etcd browser pass (#1089).
+Not fixed there: the tab's columns are not declared per provider anywhere, and adding that is a change to every engine's tab.
+
+**Done when:** the provider declares which table-stat columns it fills, as other capability-driven surfaces do, the tab draws only those, and a test renders it for an engine that fills none of the four.
+
+### U73. The object tree hides the parenthesised part of every column type
+
+`TreeRow` in `src/components/object-tree/TreeRow.tsx` draws a column's type as `row.column.type.split("(")[0]` and keeps the whole type only in the row's `title` tooltip and a screen-reader span, so whatever an engine writes in parentheses after a type name never reaches the screen.
+For a SQL column that is a length, a precision or a scale: `NUMERIC(10,2)` shows `NUMERIC`, which `tests/components/object-tree/column-rows.test.tsx` pins as the drawing.
+For a vector field it is the dimension, the one fact a reader of a vector column needs most, so a field whose type text carries its dimension in parentheses shows the type name alone.
+`origin/main` draws every engine's types this way.
+
+Found while designing the vector results grid (#424).
+Not fixed there: the badge is shared by every engine, and changing what it draws changes every engine's tree.
+
+**Done when:** the tree shows a column type's parenthesised part, or a short form that keeps a vector's dimension, and a test renders `NUMERIC(10,2)` and a vector type with a dimension and asserts what each badge shows.
+
+### U74. The packaged `StudioWorkspace` reads `process` and fails to mount in a host that defines none
+
+The package's client code reads `process.env` with no guard in `getAppVersion` (`src/lib/app-version.ts`, called by `src/components/sidebar/Sidebar.tsx`), in `configureMonacoLoader` (`src/lib/editor/monaco-loader.ts`, called by `QueryEditor.tsx` and `ObjectSourceView.tsx`) and in the version labels of `StudioDesktopHeader.tsx` and `StudioMobileHeader.tsx`.
+`tsup.config.ts` replaces none of them, so the built `dist/workspace.mjs` and its chunks still read `process.env.NEXT_PUBLIC_APP_VERSION` and `process.env.NEXT_PUBLIC_MONACO_VS_PATH` when they run.
+Next.js gives browser code a `process` object, so the standalone app never meets this; a host built by a bundler that gives none does, and `package.json` names only `react` and `react-dom` as peer dependencies, so nothing tells that host to provide one.
+Measured 2026-10-03 in the browser pass of #1247: a host page built with `Bun.build`, defining `process.env.NODE_ENV` alone, threw `ReferenceError: process is not defined` when it mounted the packaged `StudioWorkspace`, and with a `window.process` object added to the page it mounted and ran queries.
+`main` before #1247 has the same reads; `src/lib/logger.ts` reads `LOG_LEVEL` behind a `typeof process` check and is not one of them.
+
+Found by the browser pass of the vector-family foundation (#1247).
+Not fixed there: the reads predate that PR.
+
+**Done when:** the package mounts in a host that defines no `process`, because the build replaces those reads or they go through a guarded accessor, and a check over the built package fails on an unguarded `process` read.
+
+### U75. The Graph tab cannot connect the result's nodes the statement returned unlinked
+
+`MATCH (n:Person) RETURN n` draws its nodes with no relationship between them, because the Graph tab (`src/components/results-graph/GraphView.tsx`, model `src/lib/db/graph/result-graph.ts`) draws only what the statement returned.
+Neo4j Browser's "Connect result nodes" fills those in with a second read of the relationships among the returned ids, and sends it without showing it.
+Studio runs no statement of its own from the tab, because every extra statement has to pass the engine's read policy and the audit trail as a user's does.
+
+Deferred when the Graph tab was added; `docs/providers/neo4j.md` section 5.6 states what the tab draws and why it runs no statement of its own.
+
+**Done when:** an opt-in control builds the read on the server from a typed request (the drawn node ids and a limit), never from client text, runs it through the same read policy and audit as an editor statement, shows the statement in the history, adds the relationships it finds to the drawn graph, and a test pins that the request carries no Cypher text and that a refused read draws nothing.
+
+### U76. The Graph tab cannot expand a node's neighbours
+
+A drawn node shows only the relationships the statement returned, and there is no way to ask for the rest from the tab: no double-click expand, no "show all relationships", and no count of the neighbours not drawn.
+Each needs a read per expansion, ordered and limited, with an engine-specific way to name the node (`elementId()` on Neo4j 5), so it meets the same read-only policy question as U75.
+
+Deferred when the Graph tab was added; `docs/providers/neo4j.md` section 5.6 states what the tab draws and why it runs no statement of its own.
+
+**Done when:** expanding a node runs one server-built read from a typed request (node id, direction, optional relationship type, limit) through the read policy and the audit trail, shows it in the history, adds its nodes and relationships within the tab's node cap with the cap notice when it bites, and a test pins the limit and a refused read.
+
+### U77. The Graph tab keeps no style a user chooses
+
+A label's colour is assigned from the chart palette by order of first appearance in each result (`buildResultGraph` in `src/lib/db/graph/result-graph.ts`), so one label can take a different colour in two results, and a user cannot pick a colour, a caption property or a node size for a label.
+Neo4j Browser keeps such choices in its GraSS style sheet; the cheap step the research names is a per-connection, per-label colour and caption override kept in the existing storage layer.
+
+Deferred when the Graph tab was added, as outside its first version's scope; the Known limitations section of `docs/providers/neo4j.md` lists it.
+
+**Done when:** a user can set a label's colour and caption property from the legend, the choice is stored through the storage layer per connection and survives a reload and a second result, a label with no choice keeps the palette rule, and a test pins both.
+
+### U78. The Graph tab offers one layout
+
+The tab runs fcose and only fcose (`fcoseLayout` in `src/components/results-graph/cytoscape-host.ts`), and Re-layout reruns the same layout, so a tree, a hierarchy or a radial picture of a result cannot be asked for.
+
+Deferred when the Graph tab was added, as outside its first version's scope; the Known limitations section of `docs/providers/neo4j.md` lists it.
+
+**Done when:** the toolbar offers at least a hierarchical (breadth-first or dagre-style) layout beside fcose, with an accessible name on the control, any new layout package pinned with its licence checked as cytoscape's were, and a test that switching layouts reruns the chosen one.
+
+### U79. The Charts tab draws a time series over its first tag, not its time column
+
+The default x axis is the first categorical field before any date field (`defaultX` in `src/components/DataCharts.tsx:534`), so a tagged time series, such as an InfluxDB result with a `room` tag beside `time`, is drawn over its tag values; this affects Prometheus today.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25); the InfluxDB provider docs say to pick `time` as the x axis.
+
+**Done when:** with a date field and a "line" suggestion the default x axis is the date field, with a unit test.
+
+### U80. Charts "Group by hour" reads a `Z` timestamp in local time
+
+`groupByDate` (`src/components/DataCharts.tsx:434`) reads a timestamp ending in `Z` through local-time getters, so on a machine outside UTC the grouped ticks disagree with the ungrouped ones; every InfluxDB and Prometheus timestamp is UTC with a `Z`.
+
+Found 2026-10-04 while designing the InfluxDB provider (design decision I25).
+
+**Done when:** `groupByDate` reads a `Z` value in UTC and the grouped tick agrees with the ungrouped one, with a test under a non-UTC `TZ`.
+
+### U81. An InfluxDB 3 connection reads one database, so a server with several needs one connection each
+
+An `influxdb3` connection lists and runs exactly one database, its session database: the connection's `database` field, else the only non-system database the token can list (`src/lib/db/providers/timeseries/influxdb/sql-provider.ts`).
+A server with several databases therefore needs a connection per database, because the query route, the tab model and the editor toolbar carry no database of their own.
+
+Found 2026-10-04 while designing the InfluxDB provider (rulings R1 and R16).
+
+**Done when:** a session-addressed multi-database feature lands: a database level in the tree, a run-body field for the database, a tab field set from the tree, and an editor-toolbar database selector, accepted by the query route only for a type declaring a capability that entry designs, with tests on the route, the tab model and the toolbar.
+
+### U82. The cleartext consent box says "password" on engines whose secret is a token
+
+The consent box the connection dialog draws while SSL Mode is disable is labelled "Send the password without TLS" for every type that takes `allowInsecureAuth` (`src/components/ConnectionModal.tsx`, the `allowInsecureAuth` block).
+On Oxia, `influxdb` and `influxdb3` the secret the box covers is a token: Oxia's field above the box is Token, and its declared hint under the box speaks of the token only.
+The refusals quote the label word for word, so they carry the same word: `CONSENT_CLAUSE` in `src/lib/db/providers/keyvalue/oxia/connection-options.ts` and the cleartext refusal in `src/lib/db/providers/timeseries/influxdb/connection-options.ts`.
+Seen 2026-10-04 in the final browser pass of the Oxia provider (#1310), in the New connection dialog for Oxia with SSL Mode disable.
+
+Found by the final browser pass of the Oxia provider (#1310).
+Not fixed there: the label is shared by every type that takes the field, and the refusals of two other providers quote it.
+
+**Done when:** the label names the secret the type takes, from a declared word in the type's UI config rather than a branch on the type id, every refusal that quotes the label quotes the new one, and a test renders the dialog for a password type and a token type and asserts each label.
+
+### U83. A read-only engine's Source tab calls a key's value a definition it cannot replace
+
+An Oxia key's Value and Metadata tabs in the Source view say "This database offers no way to replace this definition in place.", which is `NOT_OFFERED_SENTENCE` in `src/components/object-source/source-editable.ts`, the sentence `partEditability` gives any part whose provider offers no edit.
+A key's value is not a definition, and the sentence reads as a limit of the engine, when what blocks the edit is that the connection is read-only.
+Seen 2026-10-04 in the final browser pass of the Oxia provider (#1310), on `/pk/tenant-a/2` and on `/values/over-cap`.
+
+Found by the final browser pass of the Oxia provider (#1310).
+Not fixed there: the sentence is shared by every engine's Source tab.
+
+**Done when:** a part that is not offered says why in words that fit the object and the reason, either through a sentence the provider declares for the part or a shared sentence for a read-only connection, and a test pins the sentence for a read-only key-value part and for a definition an engine cannot replace.
+
+### U84. The Keys panel keeps "Scan all" enabled after a walk that answered complete
+
+After a scan that reached the end of the keyspace, "Scan more" is disabled and "Scan all" is not: the Scan more button's `disabled` reads `exhausted` and the Scan all button's does not (`src/components/key-browser/KeyBrowser.tsx`).
+An enabled "Scan all" suggests there is more to read when the walk has already answered that there is not.
+Seen 2026-10-04 in the final browser pass of the Oxia provider (#1310): the prefix `/pk/` read "Scanned 3", with Scan more disabled and Scan all enabled.
+
+Found by the final browser pass of the Oxia provider (#1310).
+Not fixed there: the panel is shared by every key-value engine.
+
+**Done when:** "Scan all" is disabled once the walk is exhausted, as "Scan more" is, and a component test asserts both buttons after a scan that answered complete.
+
+### U85. The agent rail says a conversation "ended when the page reloaded" after in-app navigation
+
+Going from Studio to Monitoring and back with the browser's Back button, without a reload, the rail says "The conversation this browser was in (1 question, ...) ended when the page reloaded. Your next question starts a new one."
+`interrupted` in `src/components/agent/use-agent-run.ts` is the stored thread whenever the mounted rail follows no run, and the rail's `runId` starts empty each time the rail mounts, so a remount after in-app navigation reads as a reload (`agent-thread-ended` in `src/components/agent/AgentRail.tsx`).
+Seen 2026-10-04 in the final browser pass of the Oxia provider (#1310); nothing in it is specific to Oxia.
+
+Found by the final browser pass of the Oxia provider (#1310).
+Not fixed there: the rail is shared by every engine, and the PR does not touch it.
+
+**Done when:** in-app navigation away from Studio and back either keeps following the conversation or says what actually ended it, the reload wording appears only after a reload, and a test remounts the rail without a reload and asserts the notice.
+
+### U86. A MongoDB view's row menu offers Validate, Compact and Check Collection
+
+X25's MongoDB sibling. MongoDB's `maintenanceOperationSpecs` (`src/lib/db/providers/document/mongodb.ts:821-825`) declares `vacuum` ("Compact Collection"), `analyze` ("Validate Collection") and `check` ("Check Collection") with no `kinds`, and an absent `kinds` means every kind, so the object tree's row menu offers all three on a row of kind `view` (`MONGODB_KIND_VIEW`, `:384`).
+The entry opens `/admin/operations?path=...&path=paid_orders`, which says "No tables found ... this page has no row for "paid_orders" to run it on", and nothing is sent.
+Measured on MongoDB 8.2.12 (`mongo:8.2`), view `paid_orders`.
+
+Found by the end-to-end test pass of 2026-10-03 and 2026-10-04.
+
+**Done when:** MongoDB declares `kinds: ["collection"]` on the three specs, and a test asserts that a MongoDB view's row menu offers no maintenance entry.
+
+### U87. Monitoring's Overview and Storage tiles name tables, indexes and a buffer pool on key-value and streaming engines
+
+The Overview and Storage tabs draw the same SQL-shaped tiles for every engine, so a Redis connection reads "Tables 23 · 0 indexes" (23 is `DBSIZE`), "Buffer Pool", "Deadlocks" and "Checkpoint" as "Not measured", and Storage "Tables 0 B / Indexes 0 B / WAL N/A"; Kafka and Redpanda put every byte of topic data under "Other (unattributed)" beside "Tables 0 B 0.0%".
+Measured on Redis 8.10.2, Kafka 4.3.1 and Redpanda v26.2.3.
+The labels are fixed strings in `src/components/monitoring/tabs/OverviewTab.tsx` (`{overview?.indexCount ?? 0} indexes` at line 210, "Buffer Pool" at 291) and `src/components/monitoring/tabs/StorageTab.tsx` ("Tables" 138, "Indexes" 161, "WAL" 176, "Other (unattributed)" 242).
+U71 is the same gap on the Tables tab.
+
+Found by the end-to-end test pass of 2026-10-03 and 2026-10-04.
+
+**Done when:** a provider declares the noun its objects take (keys, topics, collections) and which overview and storage tiles it fills, the two tabs draw only those under that noun, and a test renders each tab for an engine that fills none of the SQL tiles.
+
+### U88. The result tab strip scrolls with no visible sign, so the last tabs look clipped
+
+`src/components/studio/BottomPanel.tsx:445` makes the result mode tabs a horizontally scrolling strip with its scrollbar hidden, on purpose, so the Export group on the right is never pushed out (comment at `:439-444`).
+At 1440x900 with the Agent panel open, the strip is narrower than its tabs, and "Dashboard" shows as "Dashboar" / "Dashbc" against the Export button; on Neo4j, whose results add a Graph tab, Dashboard is not visible at all (Prometheus 3.15.0, Kafka 4.3.1, Neo4j 2026.09.0).
+Nothing tells the reader the strip scrolls.
+
+Found by the end-to-end test pass of 2026-10-03 and 2026-10-04.
+
+**Done when:** an overflowing strip shows that more tabs exist (an edge fade, scroll buttons, or an overflow menu for the hidden tabs), the Export group still never moves, and a component test pins the overflow indicator.
+
+### U89. A Prometheus rule group's Source tab is titled with its internal key
+
+A Source tab is titled `Source: ${objectPathLabel(object.path)}` (`src/hooks/use-tab-manager.ts:66`), the qualified path joined by dots, so two same-named objects in different containers stay distinguishable.
+A Prometheus rule group's path segment is the engine's `GroupKey`, `<file>;<group>` (`src/lib/db/providers/timeseries/prometheus/objects.ts:189-193`), so the tab reads `Source: /etc/prometheus/rules.yml;e2e_group`, and a rule's tab adds `.<position>:<name>` (Prometheus 3.15.0).
+The tree already shows the readable `name`.
+
+Found by the end-to-end test pass of 2026-10-03 and 2026-10-04.
+
+**Done when:** a Source tab title can use a provider-supplied display form of the path (for a rule group, `e2e_group (rules.yml)`), still unique per path, without a type-id branch in the tab manager, and a test pins the Prometheus rule group's title.
+
+### U90. The custom connections switch loads with a flash and an extra round trip
+
+`useConnectionManager` (`src/hooks/use-connection-manager.ts`) starts with the policy that allows custom connections until `GET /api/connections/policy` answers, so the editor draws New, Edit and Duplicate for that moment on a server that has custom connections off; the server still refuses them.
+The policy read is awaited before the managed list is fetched instead of beside it, one extra round trip on every editor load.
+`src/app/api/admin/fleet-health/route.ts` imports `logger` without using it, a lint warning left alone because a concurrent fix edits the same import block.
+
+Found 2026-10-05 by the final review of the platform integration branch.
+Not fixed there: the flash needs a "policy unknown" state, and the import block was kept unchanged to avoid a merge conflict.
+
+**Done when:** a policy-unknown state withholds the controls, the policy and managed reads run in parallel while no connection is made active before the policy is known, and the unused import is gone.
+
+### U91. A user typed for another engine rides along to libSQL
+
+The connection form keeps its `user` when the type changes (the type buttons in `src/components/ConnectionModal.tsx` call `setType` and reset only the port).
+libSQL now takes a user and sends HTTP Basic when one is set, so a name typed for another engine is saved on a libSQL connection, and a server that expects a bearer token answers `401`.
+
+Found 2026-10-05 by the final review of the platform integration branch.
+Not fixed there: it needs a form-state change outside that work.
+
+**Done when:** switching to a type that newly takes a user starts that field empty, or the form asks, with a test.
+
+### U92. The remembered active connection outlives its connection
+
+`useConnectionManager` writes `libredb_active_connection_id` only while a connection is active, so when the last connection is closed or withdrawn the key keeps the last id.
+The behaviour is on `main` from before the platform integration branch.
+
+Found 2026-10-05 by the final review of the platform integration branch.
+Not fixed there: it predates that work.
+
+**Done when:** the id is cleared when the last connection closes or is withdrawn, with a test.
 
 ## Dependencies
 
@@ -2978,6 +4113,24 @@ so in `CLAUDE.md`, which today says nothing about it, or sweep the orphans and t
 `calendar.tsx` went. Until then every Dependabot major on one of those packages costs a review for a
 component nothing renders. Reproduce the list with a per-file importer count over `src/components/ui/`.
 
+### P6. knip reports a configuration hint on every run
+
+`bun run knip` exits 0 and prints "Configuration hints (1)": `.css  knip.json  Compiled extension excluded by project (imports not followed)`.
+knip does not follow a `.css` import, so a stylesheet imported only for its side effect is neither a dependency nor an unused file to it, and the hint is printed on every run of the required check, where a new hint is easy to miss beside it.
+
+Found 2026-09-30 by the etcd PR's knip run (#1089), which removed the other hint, `gh` in `ignoreBinaries`, after measuring that no script needs it.
+
+**Done when:** `knip.json` either declares a compiler for `.css` or states that the project's stylesheets are out of scope in a form knip accepts, and `bun run knip` prints no configuration hint.
+
+### P9. Two dev dependencies resolve undici 7.28.0, inside a high advisory
+
+`bun.lock` resolves `undici@7.28.0` for `@workflow/world-local` 4.2.4 and `@workflow/world-vercel` 4.6.2 (`bun.lock:1233,1237,2665`), which arrive through the devDependencies `workflow` 4.8.1 and `@workflow/world-local`, and 7.28.0 is inside the range of GHSA-w293-vg96-wgc3 (high, from 7.24.1 below 7.29.1).
+Nothing under `src/` imports a `workflow` package, and the runtime image carries only the standalone output while the npm package installs no devDependencies, so the exposure is development, CI and the image's build stage; no Dependabot alert was open for it on 2026-10-03.
+
+Found while measuring the official Qdrant client, which pins undici 7.29.0.
+
+**Done when:** the lockfile resolves undici at 7.29.1 or later for both packages, by updating them or by an override with its `//overrides` note, and the regenerated `bun.lock` holds no undici copy inside the advisory's range.
+
 ## Documentation
 
 ### DOC3. Six channel listings carry corrected copy that nobody has resubmitted
@@ -3060,6 +4213,8 @@ It edits none of these files, and it leaves as they were these fleet counts in c
 - `src/lib/agent/schema-stats.ts`, the no-statistics docblock: "on the twelve type-ids whose inventory comes from their own provider", which are seventeen now.
 - `tests/unit/db/duckdb/seam-guard.test.ts`, the header: "the fourteen engines that are not DuckDB".
 - `e2e/login.spec.ts` and `tests/components/LoginPage.test.tsx`: "forty named products" and the "twenty-six" relatives, written for the gap each test closes and true of the registry then.
+Amended 2026-09-30: the Redis doc drift recorded by the etcd design (R01 9.6) belongs here too, because the etcd PR edits another provider's doc only where a surface it changed moves what that doc says, which are the `MaintenanceOperation` count of `cassandra.md`, the same count in `duckdb.md` and the three withheld rows its maintenance table gains for etcd's operations, and the citation of the paste handler in `elasticsearch.md` and `opensearch.md`, and no surface it changed moves `redis.md`.
+The drift, in `docs/providers/redis.md`: its Driver row says `ioredis` `^5.9.2` where `package.json` holds `^5.11.1`, it says key-prefix groups sort by descending key count where the provider sorts them by path, it names `maxScan = 1000` where the constant is `KEY_SCAN_LIMIT` in `src/lib/db/providers/keyvalue/redis.ts`, and it calls `listObjects` and `describeObjects` with a `table` kind Redis does not declare.
 
 Found 2026-09-23 by the #1085 review.
 Not fixed in #1085: that PR edits another provider's doc only where a shared surface it changed alters what the doc describes, and no count here is about such a surface; the four comments sit in other providers' directories, which it does not edit, so their mirrors stay with them to change together.
@@ -3122,6 +4277,111 @@ and the citations present at that commit all resolve. The test needs one case pe
 accept, a single line, a range and a comma pair, and one negative that fails when an anchor moves.
 
 ---
+
+### DOC9. Two tables of the README and the provider index count a fleet that has since grown
+
+`README.md`'s "Test Architecture" table (and its `README_zh.md` peer) counts 24 integration files where `tests/integration/` holds 36, and lists 13 of the providers; `docs/providers/README.md`'s in-network port table stops at Trino, with no Cassandra, Prometheus, Kafka or etcd.
+`find tests/integration -name '*.test.ts' | wc -l` gives the first count.
+
+Found 2026-09-30 while re-deriving the etcd PR's numerals (reconciliation N-76).
+Not fixed there: completing each table needs facts that PR did not measure, and neither gains an etcd row alone.
+
+**Done when:** both tables are re-derived from the tree, each with a test or a comment naming the command that derives it.
+
+### DOC10. Seven translated READMEs still describe the Db2 provider as of db2-node 1.0.22
+
+The Db2 row of `README_es.md`, `README_hi.md`, `README_ja.md`, `README_pt.md`, `README_ru.md`, `README_ur.md` and `README_zh.md` says the driver misreads non-ASCII text, BIGINT past 2^53, BOOLEAN, XML and LOBs, and that inline editing and import are off.
+1.0.24 turned inline editing and the import back on and fixed every one of those reads but the LOB one, and 1.0.25 fixed that too; `README.md` carries the current sentence.
+
+Found 2026-10-04 while moving the Db2 provider to `db2-node` 1.0.25.
+Not fixed there: the change was English-only, and seven translations of a provider row are a documentation change of their own.
+
+**Done when:** each translated Db2 row says what `README.md`'s does, and `bun run readme:check` passes.
+
+### DOC11. Two PostgreSQL-relative caveats no longer hold on the current images: CockroachDB sessions and OrioleDB index sizes
+
+`src/lib/db/compatibility.ts:429` (CockroachDB, probed on v26.2.6) says "Performance metrics, slow queries and active sessions do work: the pg_stat_* views CockroachDB provides are enough for them."
+On v26.3.2 (`cockroachdb/cockroach:latest`, single node, insecure) Monitoring > Sessions reads "No active sessions found", Overview reads "Connections 0" and Queries reads "pg_stat_statements required", while Studio held connections: `pg_stat_activity` returned 0 rows and `crdb_internal.cluster_sessions` returned 3.
+`src/lib/db/compatibility.ts:470` (OrioleDB, probed on beta 16) and the OrioleDB row of `docs/providers/README.md` say "every index reads 0 bytes".
+On beta 19 (`orioledb/orioledb:latest-pg18`, PostgreSQL 18.6) `pg_indexes_size()` is non-zero and Monitoring > Tables reads 48 kB for `orders` and 8192 bytes for `customers`.
+
+Found by the end-to-end test pass of 2026-10-03 and 2026-10-04.
+
+**Done when:** both caveats and their `probedVersion` are re-measured and rewritten in `src/lib/db/compatibility.ts` and `docs/providers/README.md` to match v26.3.2 and beta 19.
+Reading CockroachDB sessions from `crdb_internal.cluster_sessions` instead of an empty `pg_stat_activity` is a separate change and needs its own entry or issue if wanted.
+
+### DOC12. The FerretDB compatibility entry omits Check Collection, views and Compact, and a maintenance request has no deadline
+
+`src/lib/db/compatibility.ts:752-762` lists FerretDB as `tier: "full"` with three caveats, all about sign-in, version and deployment.
+Measured on FerretDB 2.7.0 (`ghcr.io/ferretdb/ferretdb:latest` over `postgres-documentdb`): Operations > Check Collection answers HTTP 500 `no such command: 'dbCheck'`; a view created in mongosh is listed and counted as an empty collection (count 0); and Run Compact never returns, a self-deadlock in FerretDB itself, so the button stays disabled because `/api/db/maintenance` (`src/app/api/db/maintenance/route.ts`, called from `src/hooks/use-monitoring-data.ts:222` and `:259`) sets no deadline on the operation.
+
+Found by the end-to-end test pass of 2026-10-03 and 2026-10-04.
+
+**Done when:** the FerretDB entry names the three gaps (or the tier is lowered with the reason), and either the maintenance request carries a bounded wait whose expiry the Operations page reports, or the entry's caveat says Compact can hang on FerretDB 2.7.0.
+
+### DOC13. The Elasticsearch and OpenSearch docs say aliases and data streams are not in the tree, and the tree lists them
+
+Section 13 of `docs/providers/elasticsearch.md:1656-1660` and `docs/providers/opensearch.md:1633-1637` still says "Aliases and data streams are not listed in the schema tree", citing `transport.ts:205-219`.
+The same docs' object-kind table (`elasticsearch.md:904`, `opensearch.md:869`) lists the `alias` kind read from `GET /_alias`, and the tree on Elasticsearch 9.5.3 shows Indices, Aliases, Data Streams, Ingest Pipelines and Index Templates.
+
+Found by the end-to-end test pass of 2026-10-03 and 2026-10-04.
+
+**Done when:** both section 13 bullets are removed or rewritten to what the tree shows, the cited `transport.ts` comment is checked for the same stale claim, and the provider-doc tests still pass.
+
+### DOC14. The seed reference calls `group` a sidebar label, and no UI reads it
+
+`docs/SEED_CONNECTIONS.md` annotates the example's `group: "Data Team"` with `# Group label in sidebar`, and its field table describes `connections[].group` as a group label.
+`src/lib/seed/connection-filter.ts` copies the value onto the connection and `DatabaseConnection` in `src/lib/types.ts` declares `group?: string`, but no component or hook reads `connection.group`: the sidebar's groups are the user's own, kept by `src/hooks/use-connection-groups.ts` under ids (#1170).
+A seeded `group` is therefore validated and carried, and never shown, and so is the group `CapRover` that the CapRover discovery source sets on every connection it discovers (`DISCOVERY_GROUP` in `src/lib/seed/discovery-fingerprint.ts`, #1502).
+
+Found 2026-10-04 while planning the platform integration, whose seed files set `group`.
+Not fixed there: whether Studio shows the label or the reference stops promising it is a product decision outside that work.
+
+**Done when:** a seeded `group` is shown where `docs/SEED_CONNECTIONS.md` says it is, or the reference says the field is validated and carried but not displayed.
+
+### DOC15. DOCKERHUB.md says `latest` and version tags are pushed from `main`
+
+The "Image tags" table of `DOCKERHUB.md`, which `.github/workflows/docker-build-push.yml` pushes to the Docker Hub listing, gives `latest` the source `main` and `X.Y.Z` the source "`main` / release", and it has no row for the `main` tag.
+The workflow publishes version tags and moves `latest` only on a published release or on the release chain's dispatch with `publish_latest`, and a push to `main` publishes the mutable `main` tag instead, as the comment at the top of the workflow says.
+A reader who pulls `latest` expecting what `main` holds gets the last release.
+
+Found 2026-10-04 while planning the platform integration, which pins a released image tag.
+Not fixed there: the listing text is outside that work.
+
+**Done when:** the table says that `latest` and `X.Y.Z` come from a release, lists the `main` tag, and matches the tags `docker-build-push.yml` publishes.
+
+### DOC16. The drive-token docblock counts the proxy's public paths as four
+
+The header of `src/lib/agent/drive-token.ts` says that `src/proxy.ts` exempts exactly four things: the auth paths, static assets, the health GET and the storage-config GET.
+The proxy's public list names eight paths beside its static-asset test, `/api/auth`, `/_next`, `/favicon.ico`, `/health`, `/api/health`, `/api/db/health`, `/api/storage/config` and `/launch`, and `tests/api/proxy.test.ts` pins them in `the public-path list is exactly the eight it names`.
+The docblock's point, that the drive path is not on that list, still holds; its count and its list do not.
+
+Found 2026-10-04 while adding `/launch` to that list for launch sign-in.
+Not fixed there: the agent module is outside that work.
+
+**Done when:** the docblock points at the proxy's list and the test that pins it instead of counting the list, or states the list as it is.
+
+### DOC17. SECURITY.md leaves passkey sign-in off its list of routes that need no session
+
+The API Security list of `SECURITY.md` names the routes that answer without a session: the password login, launch sign-in and logout, the two OIDC routes, the three liveness paths and `GET /api/storage/config`.
+`POST /api/auth/passkey/sign-in` creates a session without needing one as well, and `docs/API_DOCS.md` names it among the public auth routes, but `SECURITY.md` does not.
+
+Found 2026-10-04 while adding `POST /api/auth/launch` to that list for launch sign-in.
+Not fixed there: that change adds only its own route to the list.
+
+**Done when:** the `SECURITY.md` list names `POST /api/auth/passkey/sign-in`, as `docs/API_DOCS.md` does.
+
+### DOC18. The documented secret scan passes without scanning anything when it runs in a git worktree
+
+The local form of the required `Secret Scan` check in `CONTRIBUTING.md` (Security Scanning) mounts `"$PWD:/repo:ro"` and scans `origin/main..HEAD` with gitleaks.
+In a git worktree `.git` is a file that points into the main checkout's `.git/worktrees/`, a path the container does not have, so git inside the container cannot open the repository.
+gitleaks then reports `0 commits scanned.` and `no leaks found` and exits 0, which reads as a pass although nothing was scanned.
+Measured 2026-10-04 in a libredb-studio worktree; the same command scanned the branch's commits once the worktree and the main checkout's `.git` were mounted at their own absolute paths.
+
+Found 2026-10-04 while planning the platform integration, whose gates run in a git worktree.
+Not fixed there: that work runs the scan with those two mounts and counts `0 commits scanned.` as a failure, and `CONTRIBUTING.md` is outside it.
+
+**Done when:** `CONTRIBUTING.md` gives a command that scans the branch from a git worktree as well as from a clone, for example by mounting the worktree and the main checkout's `.git` at their own absolute paths, and says that a scan reporting `0 commits scanned.` checked nothing.
 
 ## Release pipeline
 
@@ -3232,10 +4492,67 @@ gitignored at `.gitignore:162`, written by the Rancher E2E run skill - holds the
 anywhere` and one in `hands no working password to a login example`, all from paths CI never checks
 out. Its floor assertion needs the same treatment as the citation scan's.
 
+Amended 2026-10-04: the citation scan has read the git index since #980 (`gitTrackedFiles` in `tests/unit/backlog-structure.test.ts`), so `tests/unit/published-credentials.test.ts` is the scan left, and it fails on the `docs/superpowers/` drafts as well.
+Measured in a maintainer's checkout on `main` at `fc28ef73e` and `6dcc67fd6` while planning the platform integration, with that work's planning documents in that directory: `assigns no admin or user password anywhere`, `hands no working password to a login example` and `assigns no secret the server would accept` fail on credential examples quoted in those drafts, while the same tree without them passes all ten tests, as a git worktree of `main` at `d994ad72f`, which holds no ignored file, does.
+That work therefore ran its gates in such a worktree, and each gate still ran the suite without this file and ran the file alone, keeping only its findings outside `docs/superpowers/`, so a draft copied into the worktree later could not fail it for a file CI never sees.
+
 **Done when:** both scans enumerate tracked files, for example by driving the glob through
 `git ls-files` and intersecting, so a working tree with local drafts under `docs/` or `deploy/`
 gives the same verdict as a clean checkout. Each scan's own floor assertion stays, so a broken
 enumeration still fails loudly rather than passing vacuously.
+
+### REL5. Fourteen scripts do nothing and exit 0 when run through a symlinked checkout
+
+Each of `scripts/*.mjs` that runs as a command compares `path.resolve(process.argv[1])` with `fileURLToPath(import.meta.url)`; through a symlinked checkout Node keeps the link in `argv[1]` and resolves `import.meta.url` to the real file, so the comparison fails and the script exits 0 without running.
+`sync-chart-version.mjs`, `generate-channel-showcase.mjs`, `readme-check.mjs` and `security-check.mjs` are the drift guards of the required check (`chart:check`, `channels:showcase:check`, `readme:check` and `security:check` in `.github/workflows/ci.yml`), and `distribution-check.mjs` is the guard of the separate Distribution Check workflow, so a guard run that way passes silently.
+Measured 2026-09-30 by the etcd PR's descriptor generator, which compares real paths on both sides instead (`scripts/generate-etcd-descriptor.mjs`); `grep -rl 'path.resolve(process.argv' scripts` returns exactly 14 hits.
+
+Not fixed there: the etcd PR touches no other script.
+
+**Done when:** every command script decides that it runs as the program by comparing real paths, as `generate-etcd-descriptor.mjs` does, and one test runs a drift guard through a symlinked checkout and sees it check.
+
+### REL6. Five dynamic file reads make Turbopack trace the whole repository into the server output
+
+`bun run build` prints "Turbopack build encountered 5 warnings", each "Dynamic filesystem access causes tracing of the whole project", at `resolveAgentLedgerDirectory` in `src/lib/agent/config.ts`, `getDatabasePath` in `src/lib/db/providers/sql/duckdb/index.ts` and in `src/lib/db/providers/sql/sqlite.ts`, `loadConfig` in `src/lib/seed/config-loader.ts` and `kubernetesLogin` in `src/lib/seed/vault-client.ts`.
+The trace of `/api/db/query` then lists 2,662 project files outside `node_modules` and `.next`, `src/`, `tests/`, `operator/`, `research/` and `docs/` among them, and `scripts/lib/prune-standalone-payload.sh` removes only what its deny-list names, so a payload built from the committed tree still carries `operator/`, `CONTRIBUTORS.md` and the seven translated READMEs into the release tarball the `npx` launcher downloads.
+Measured 2026-10-01 on a build of the committed tree: marking the five calls `/*turbopackIgnore: true*/` in a scratch copy removed all five warnings and cut that trace to one project file, `seed-assets/sqlite/employee.db`.
+The warnings are printed on every run of the required check, where a sixth is easy to miss; `main`'s CI prints the same five.
+
+Found while building the etcd provider (#1089), whose diff touches none of the five files, and measured again by its review.
+Not fixed there: none of the five is an etcd file.
+
+**Done when:** `bun run build` prints no tracing warning, because each of the five reads tells Turbopack what it reaches or is marked as outside the trace, and a payload built from the committed tree holds at its root only what the server runs, `LICENSE` and `README.md`.
+
+### REL7. A local E2E run spends the shared account's query budget
+
+`playwright.config.ts` signs nearly every spec in as `user@libredb.org` against one server process, whose "query" bucket in `src/lib/api/rate-limit.ts` (120 requests a minute by default, `RATE_LIMIT_QUERY_MAX`) every db-reaching route draws from.
+CI runs Playwright with one worker and two retries, while a local run takes half the cores as workers and retries nothing, so a fast machine spends the budget in the middle of the suite.
+Measured 2026-10-01 on main 4b6aae8e and on the etcd branch alike: `CI=1 bunx playwright test e2e/security-headers.spec.ts e2e/object-edit.spec.ts --project=chromium --repeat-each=5 --retries=0` failed 3 of its 40 runs on each side, `object-edit.spec.ts:621` reading "The source read failed. Too many requests. Try again in 41 seconds.", `:585` timing out after the same refusal, and `security-headers.spec.ts:41` drawing no PNG button on the ERD within 30 s; 4 more did not run, because a failure stops the rest of `object-edit.spec.ts`'s serial group.
+One pass of the suite in CI mode saw `security-headers.spec.ts:41` and `object-edit.spec.ts:621` fail once each and pass on a retry, and a pass with the local defaults failed 7 tests on "Too many requests" in the page.
+The comments in `playwright.config.ts` and `e2e/offline-editor.spec.ts` record the same cause, and three specs, `offline-editor.spec.ts`, `kafka-provider.spec.ts` and `etcd-provider.spec.ts`, were moved to a second server process for it.
+
+Found while running every local gate for the etcd provider (#1089).
+Not fixed there: the E2E harness is not part of the etcd work, and the fix is a choice about the limiter's test configuration.
+
+Amended 2026-10-05: a functional smoke run without retries on 2026-10-05 failed `object-edit.spec.ts:621` on the same budget, and the wait it failed in has a cause of its own.
+`waitForTheObjectTree` in `e2e/object-edit.spec.ts` (around line 258) clicks only `tree-retry`, while a rate-limited metadata read draws the sidebar's `sidebar-provider-retry` (`src/components/sidebar/Sidebar.tsx`) instead, so a rate-limited run presses no retry and waits out the helper's 120 s before the test fails.
+The same test passed on a retry with CI's `--retries=2`.
+
+**Done when:** the E2E servers get a query budget sized for the suite, through `RATE_LIMIT_QUERY_MAX` in their `webServer` env as the passkey server sets `RATE_LIMIT_LOGIN_MAX`, or each spec signs in as an account of its own, and the repeated command above passes all 40 of its runs locally.
+
+### REL8. Local drafts fail typecheck, lint and build, because two configs read every file on disk
+
+`tsconfig.json` includes `**/*.ts`, `**/*.tsx` and `**/*.mts` and excludes only `node_modules`, so `bun run typecheck` (`tsc --noEmit`) and the type check of `bun run build` read every TypeScript file in the working tree, git-ignored or not.
+The rules object of `eslint.config.mjs` that sets `react/no-unescaped-entities` and the `react-hooks/*` rules has no `files`, while `eslint-config-next` registers those plugins only for `**/*.{js,jsx,mjs,ts,tsx,mts,cts}`.
+So `eslint .` stops on any `.cjs` file, tracked or not, with `A configuration object specifies rule "react/no-unescaped-entities", but could not find plugin "react".`
+Measured 2026-10-04 with the research drafts of two provider studies under `docs/superpowers/` of a maintainer's checkout, 62 `.ts` files and 3 `.cjs` files, on a branch of `main` at `6dcc67fd6` that changes neither config: `bun run typecheck` and `bun run build` failed on the drafts' unresolved imports and implicit `any` types, `bun run lint` stopped at a `.cjs` draft, and the same tree without the drafts passed all three.
+`eslint` stopped the same way on one of those `.cjs` files in a checkout of `main` at `6dcc67fd6`.
+CI checks out only tracked files and the repository tracks no `.cjs` file, so CI is green while a maintainer's gate is red over files that are not in the repository.
+
+Found 2026-10-04 while planning the platform integration in a checkout that holds such drafts; that work then ran its gates in a separate git worktree, which holds none because git checks out no ignored file.
+Not fixed there: neither config is part of that work.
+
+**Done when:** `tsc --noEmit`, `next build` and `eslint .` leave the git-ignored draft directories alone, for example through an `exclude` in `tsconfig.json` and `files` on the rules object that names the React rules, and a working tree holding a `.ts` and a `.cjs` draft under `docs/superpowers/` passes all three as a clean checkout does.
 
 ## Chart configuration surface
 
@@ -3319,8 +4636,8 @@ bypass.
 The proxy refuses a request on three grounds and audits two of them. `src/proxy.ts` emits
 `origin_mismatch` at `:65` and `insufficient_role` at `:156`, both through `emitAuditEvent`. The third
 is the trailing `catch` at `:173-176`: a token that fails `jwtVerify` because it is forged, tampered,
-expired or truncated falls into `logger.warn("JWT verification failed, redirecting to login")` and
-redirects. Nothing reaches the audit channel.
+expired or truncated falls into `logger.warn("JWT verification failed, refusing the session")` and
+is refused: redirected to `/login` on a page, `401` on an API path. Nothing reaches the audit channel.
 
 An operator reading `GET /api/admin/audit` sees origin and role refusals and no forged-token attempts
 at all, which is the direction the blind spot matters: those are the probes a deployment most wants
@@ -3427,34 +4744,6 @@ a CC BY-SA database with no note connecting them.
 tarballs, names the sample database's separate terms explicitly, and is regenerated from the lockfile
 rather than hand-maintained.
 
-### C10. The last DOMPurify advisories are held open by Monaco's pin
-
-`dompurify` via `monaco-editor` is the only advisory chain that reaches a user. Everything else
-`bun audit` reports — `minimatch`, `brace-expansion`, `flatted`, `picomatch`, `esbuild`, `@babel/core`,
-`undici` — arrives through `eslint`, `typescript-eslint`, `knip`, `tsup`, `workflow` and `@ai-sdk/*`,
-and none of it is in the image. `undici` was checked specifically, because the agent runtime sits in
-`devDependencies` by design yet reaches the standalone build: building with `DOCKER_BUILD=true` shows
-no `undici` anywhere under `.next/standalone`, since `@ai-sdk/provider-utils` reaches it through a
-`createRequire` call that output tracing cannot follow.
-
-#374 moved the shipped copy from 3.2.7 to 3.4.8 by upgrading Monaco itself, clearing 14 of the 17.
-**Four remain** on GitHub Advanced Security's count, and none can be closed here: they need 3.4.9,
-3.4.11, 3.4.12 and 3.4.13. Monaco pins dompurify exactly, and 0.56.0 is its newest release.
-
-**Do not "fix" these with a `package.json` override.** Monaco ships DOMPurify inlined in its prebuilt
-`min/vs` bundle and nothing in `src/` imports the package. An override would change a lockfile entry no
-shipped code reads, leave the bundle byte-identical, and turn `bun audit` and Trivy green at once. The
-GHAS findings land on `bun.lock:<line>`, which is the tell: every one of those tools reads the
-manifest, not the artefact.
-
-Two related non-findings, so they are not re-derived. `dompurify` is dual-licensed (MPL-2.0 OR
-Apache-2.0), so the copyleft half can simply not be chosen. And the LGPL-3.0 `@img/sharp-libvips-*`
-binaries never reach the runtime image, because the runner stage copies `node_modules` selectively and
-nothing in `src/` uses `next/image`.
-
-**Done when:** Monaco ships a dompurify at or past 3.4.13. Re-check on each Monaco release, and verify
-by grepping the staged bundle for the version literal rather than trusting the lockfile.
-
 ### C11. The published SBOM carries no component for the bundled Node.js runtime
 
 #584 gave `SECURITY.md` a hand-maintained **Bundled Node.js runtime** table: the pinned version, the
@@ -3512,6 +4801,50 @@ user deliberately cleared. A worse bug than the one it fixes.
 
 **Done when:** a design distinguishes "the client never had this value" from "the client cleared this
 value" without adding a field to the stored shape.
+
+### K5. Stored accounts are keyed by the exact email, while sign-in matches it in any letter case
+
+The `accounts` table of both server stores declares `email TEXT PRIMARY KEY`, and the account lookups read `WHERE email = ?` in `src/lib/storage/providers/sqlite.ts` and `WHERE email = $1` in `src/lib/storage/providers/postgres.ts`, so a row is found only by its exact spelling.
+Password sign-in matches the submitted email in any letter case (`src/app/api/auth/login/route.ts`), and account creation refuses a case variant through `sameEmail` in `src/lib/local-accounts.ts`, but the schema does not: a writer that skips `sameEmail` can store `Alice@example.com` beside `alice@example.com`, and an exact lookup then reads one row while sign-in can match the other.
+Launch sign-in matches the email in any letter case as well, so of its writes only two launches that create case variants of one new email at the same moment could store both.
+
+Found 2026-10-04 by the review of the launch sign-in design, whose own account lookup matches emails in any letter case and binds a launched account to the token's issuer and subject.
+Not fixed there: the store schema is outside that work.
+
+**Done when:** both stores refuse a second account whose email differs from an existing one only in letter case, for example through a unique index on `lower(email)` with a migration that reports existing case-variant rows, and a test on each store pins the refusal.
+
+### K6. Launch sign-in leaves two outcomes out of the audit log
+
+`POST /api/auth/launch` (`src/app/api/auth/launch/route.ts`) audits and charges every refusal through its `refuse` helper, which records `login_failure` and spends the address's `login_client` budget.
+An error raised after the token verified does not go through it: an `AuthConfigError` from `getAuthUsers` or session signing is answered `503`, and a store error `500`, with a log line only, so the jti is spent while the admin audit log and the budget show nothing.
+The `launch_session_conflict` refusal records only the launch's email as its user; the account whose session the browser kept goes into the response body (`signedInAs`) but not into the audit record, so the target of a link-swap attempt is invisible to an admin.
+
+Found 2026-10-05 by the final review of the platform integration branch.
+Not fixed there: both are audit enrichments that need their own reasons and tests, and the refusals themselves are correct.
+
+**Done when:** an error after verification and a session conflict each emit an audit record with a reason and the account they protect, with tests on the route.
+
+### K7. Orphan per-user storage attaches to the first launch for its email
+
+In store mode, `user_storage` rows are keyed by the email (`user_id` in `src/lib/storage/providers/sqlite.ts` and `postgres.ts`), and an admin's deletion of an account removes its rows in the same transaction.
+Rows with no account row can still exist, for example left by an earlier deployment that signed in with OIDC, and `provisionLaunchAccount` in `src/lib/local-accounts.ts` creates an account for a new email without looking at them.
+So whoever a launch first provisions for that email inherits that storage, saved connections included.
+
+Found 2026-10-05 by the final review of the platform integration branch.
+Not fixed there: only a change of authentication mode leaves such rows, and the choice between refusing, clearing and documenting is a product decision.
+
+**Done when:** provisioning refuses or clears orphan storage for an email it creates, or `docs/LAUNCH.md` states the rule, with a test either way.
+
+### K8. A custom-connection refusal leaves no audit record
+
+With `ALLOW_CUSTOM_CONNECTIONS=false`, `resolveConnection` in `src/lib/seed/resolve-connection.ts` refuses a connection the request supplies with `403` and only logs it with `logger.warn`.
+A role refusal emits `permission_denied` through `auditRoleDenial` in `src/lib/api/require-session.ts`, rate limited per user, so it reaches the admin audit log.
+A user who probes hosts through custom connections therefore leaves nothing an admin can see in Studio.
+
+Found 2026-10-05 by the final review of the platform integration branch.
+Not fixed there: it needs a new audit reason, a security control count change and tests of its own.
+
+**Done when:** the refusal emits `permission_denied` with the reason `custom_connections_disabled`, rate limited like `auditRoleDenial`, with tests and the `security:check` count that follows.
 
 ---
 
@@ -3742,23 +5075,26 @@ not compile until it does.
 
 `mapDatabaseError` classifies on **substring** matching of the engine's message, so an identifier can
 decide the class, and the agent's repairable-versus-environment split inherits the misdiagnosis.
-Verified against the live mapper:
 
-- `no such table: pooled_items` matches `pool` → `PoolExhaustedError`. A plainly repairable missing
-  relation is treated as an environment fault and ends the run.
-- `Connection terminated unexpectedly` matches nothing → base `DatabaseError`. A dead socket is offered
-  to a model as a statement it could rewrite (bounded at three attempts).
+#1427 settled the half that driver codes can reach: a statement's own fault is now read from the
+driver's code fields (`isStatementFault` in `src/lib/db/errors.ts`: SQLSTATE classes `0A`, `21`, `22`,
+`23`, `42`, `44` from `pg`, `mysql2` and `db2-node`, SQL Server error numbers, Oracle `errorNum`,
+SQLite result codes) before the `timeout`, `cancel`, `pool` and `relation` substring branches, so
+`no such table: pooled_items` is a `QueryError` now, not a `PoolExhaustedError`. What is left runs
+BEFORE that check, on purpose, so that nothing it classified changed class in that PR:
+
 - `relation "user_passwords" does not exist` matches `password` → `AuthenticationError`. Harmless on the
   agent path today only because a query-phase `AuthenticationError` is repairable there, which is a
   coincidence rather than a design.
+- `Connection terminated unexpectedly` matches nothing → base `DatabaseError`. A dead socket is offered
+  to a model as a statement it could rewrite (bounded at three attempts).
+- An error with no code field at all (RisingWave answers its parser errors as `XX000`, HTTP drivers
+  carry none) still reaches the substring branches.
 
-Neither direction is a boundary failure: nothing runs that policy did not allow, and the statement and
-repair budgets still bound the waste. What is wrong is the diagnosis, and it is wrong before any
-consumer sees the error, so no consumer can correct it.
-
-**Done when:** classification no longer depends on a substring a table or column name can satisfy.
-Driver error codes (PostgreSQL `SQLSTATE`, SQLite `errcode`) are the signal that does not collide, and
-each provider already has access to its own.
+**Done when:** the connection and authentication branches read the driver's code first too (SQLSTATE
+class `28` and `08`, MySQL `1045`, SQL Server `18456`, Oracle `1017`), so an identifier can no longer
+decide any class a code could, and the `permission denied` reading (`42501`, now an
+`AuthenticationError` and answered 401) is decided on purpose rather than inherited.
 
 ### B5. The agent run ledger cannot fence two writers, so single ownership has to be asserted above it
 
@@ -4292,6 +5628,7 @@ A Redis-wire relative that refuses `FUNCTION LIST` (KeyDB, DragonflyDB, Garnet) 
 
 Found 2026-09-24 while checking the VictoriaMetrics relative after #1104.
 Not fixed there: both rules of the walk are documented decisions (the `walkObjectInventory` docblock), so changing either is a ruling rather than a fix.
+Amended 2026-09-30: the etcd provider's `lease`, `user` and `role` kinds are exempt by declaring `countIsListing` (#1089), so plan mode grounds a user who is not root; the general ruling stays open.
 
 **Done when:** a ruling chooses between recording a refused kind in the inventory, with the engine's sentence, while keeping the kinds that were read, and keeping the whole-capture refusal with a message that names the refused kind rather than an unreachable server; and a test drives the walk over a provider whose one kind's listing throws.
 
@@ -4307,6 +5644,139 @@ Found 2026-09-24 while designing the Kafka provider (#1088, section 11, KM1).
 Not fixed there: reordering the kinds would reorder the tree, and a per-kind share of the object budget changes every engine that grounds through its provider, the trade B84 already records, so a fix of the walk closes both.
 
 **Done when:** a plan run against a Kafka cluster past the topic cap holds its consumer groups and brokers, with a test that drives the grounding walk over a provider whose first kind's batch is truncated and asserts that the later kinds are still read.
+
+---
+
+### B90. The worked example a refused call could copy is off by default, and off is where the models that need it are
+
+`offersRefusalExamples` gates the worked call that `compose_report`, `recommend_change` and `present_answer` attach to a refusal, and `refusalExamples` defaults to false: 2 of the 40 shipped profiles turn it on (`granite4.1:8b`, `nemotron3:33b`).
+The refusal is not bare without it - it names the failing field paths, `readSerializedClaims` recovers a claims array the model serialized as text, `readMisfiledEvidence` resolves evidence filed under the wrong source, and `citableEvidence` offers what the run actually holds - so what the flag withholds is the one thing a model can copy rather than parse.
+A model earns the flag by being measured, and the models that reach these refusals most are the ones nobody has measured yet, so the default lands the wrong way round for them.
+Measured 2026-09-28 on the local harness with the flag off: `qwen2.5:3b-instruct` earned 155 `compose_report:INVALID_TOOL_INPUT` refusals in ONE data-analysis cell and 92 in one assessment cell, `lfm2.5:8b` 8 in one analysis cell, `mistral-small:24b` 3.
+Whether the example would have moved those runs is not established here and is the question a ruling needs: the same capture shows the evidence contract is already obeyed by most calls that reach it - of 2,713 citations in 1,004 refused reports, 874 name a real artifact and 587 the schema snapshot correctly, while 1,185 name an id the run never produced, which no example can fix.
+
+Found 2026-09-28 while measuring five models to 30/30 (#1192).
+Not fixed there: turning the example on by default lengthens every refusal on every model, which is a ruling about prompt cost rather than a correction, and the branch that found it changes no defaults.
+
+**Done when:** a ruling chooses between a default-on example, an example offered only on a repeated refusal of the same tool in one run, and the present per-model flag; and if the default moves, a measurement says what it cost the models that already pass without it.
+
+### B91. The MCP settings page hands OpenCode a snippet OpenCode cannot read
+`src/lib/mcp/client-config.ts` renders the OpenCode snippet under `mcp.servers.libredb`; OpenCode reads `mcp.libredb` and requires an `enabled` field, so a user copying the snippet from the settings UI gets a configuration error rather than a server.
+Measured 2026-09-28 on macOS against the four documented install channels: every other client's snippet on that page connected, and this one did not.
+The same page's request path has no body-size limit either - a 2 MB JSON-RPC body was accepted with HTTP 200 - so an unauthenticated reach at `POST /api/mcp` is bounded by the platform default rather than by the route.
+Found 2026-09-28 while testing MCP end to end on macOS.
+Not fixed in #1192: that branch is the agent's measurement path and touches nothing under `src/lib/mcp/`, and a size limit is a ruling about the route's contract rather than a snippet correction.
+**Done when:** the OpenCode snippet uses the key that client reads, with a test asserting each client's snippet against that client's documented shape, and the MCP route rejects a body past a stated bound with a refusal that names it.
+
+### B92. Plan mode on etcd drafts a read of a whole prefix group the connection can only partly read
+
+`captureContextSnapshot` in `src/lib/agent/context-snapshot.ts` marks a prefix group `partlyReadable` and writes a note and a "(partly readable)" mark into the prompt, and `src/lib/agent/investigation.ts` records `plan-statement-drafted` with no check of the draft against that mark.
+Spec E13 keeps the readable key's name out of the prompt, so the model has only the note to follow, and it does not.
+Measured 2026-10-02 in the etcd agent pass: with `/config/*` marked partly readable (the user may read `/app/` and `/config/a`), `gemini-3.5-flash-lite` drafted `etcdctl get /config/ --prefix` in 4 of 4 runs, and etcd refused it when run: "etcd refused the get on /config/ (prefix): this connection's etcd user is not granted all of it." (`t27/outcomes.md`, `t27/ledger-2.json`, `t27/prompt-2.txt`, `t27/shots/t27-11-run-2.png`).
+This is not on `origin/main`: the etcd provider is new.
+
+Found by the etcd agent pass (#1089).
+Not fixed there: a model's choice is not something the snapshot can force, and the check below is its own change.
+
+**Done when:** a server-side check flags a drafted read over a whole partly readable group, by the group's name only so E13 holds, and the answer card shows the flag, with a test that a draft over `/config/` is flagged while one over `/app/` is not.
+
+### B93. Neo4j has no agent execution and no MCP `run_read_query`
+
+The Neo4j provider implements no `queryReadOnly`, so `AGENT_EXECUTION_ENGINES` does not name it, agent auto mode refuses it, and MCP `run_read_query` answers that the engine is not served; plan mode and the MCP metadata tools work.
+Both execution paths guard a statement with SQL readers (`src/lib/db/operations/statement-guard.ts`), and a Cypher statement needs a contract of its own: its read policy, gate and READ session exist, but the agent's and MCP's bounds, audit and refusal shapes have not been measured on it, and the `LOAD CSV` and APOC reach the policy refuses has to be shown refused on that path too.
+
+Found 2026-10-03 while designing the Neo4j provider (spec 6.4).
+
+**Done when:** `Neo4jProvider` implements `queryReadOnly` through the same policy, gate and READ session as the editor, `AGENT_EXECUTION_ENGINES` and `RUN_READ_QUERY_ENGINES` name Neo4j, and an agent run and an MCP call each drive a `LOAD CSV` and a write to their refusal in a test.
+
+### B94. InfluxDB has no agent execution and no MCP `run_read_query`
+
+Neither the `influxdb` nor the `influxdb3` provider implements `queryReadOnly`, so `AGENT_EXECUTION_ENGINES` names neither, agent auto mode refuses both, and MCP `run_read_query` answers that the engine is not served; plan mode and the MCP metadata tools work (`MCP_EXPOSABLE` in `src/lib/db/compatibility.ts`).
+Both execution paths guard a statement with SQL readers (`src/lib/db/operations/statement-guard.ts`), and each type needs a statement contract of its own: the InfluxQL read policy for `influxdb`, the DataFusion policy for `influxdb3`.
+
+Found 2026-10-04 while designing the InfluxDB provider (ruling R10).
+
+**Done when:** each type implements `queryReadOnly` under a statement contract of its own (the InfluxQL policy for `influxdb`, the DataFusion policy for `influxdb3`), and agent execution and `run_read_query` serve it, with tests.
+
+### B100. Oxia has no agent execution and no MCP surface
+
+`MCP_EXPOSABLE.oxia` is false and the provider implements no `queryReadOnly` (O14; key paths name Pulsar tenants and topics).
+
+Found 2026-10-04 while designing the Oxia provider (DECISIONS O14).
+
+**Done when:** an MCP metadata surface that never returns a key value is designed and `run_read_query` serves a read command under the `oxia` grammar, with tests; cited in `docs/AGENT.md` beside B93.
+
+B100 rather than the next free id: InfluxDB, built at the same time, took B94, and the gap kept the two from racing for an id.
+
+## Passkey deferrals (#785)
+
+Each was decided when passkey sign-in was designed, not overlooked.
+The user guide is [`docs/PASSKEYS.md`](PASSKEYS.md).
+
+### PK1. Passkey autofill (conditional mediation) in the email field
+
+The login page offers passkeys through one explicit "Use a passkey" button (`src/app/login/login-form.tsx`), and nothing calls `navigator.credentials.get` with `mediation: "conditional"`.
+Autofill was left out because a pending conditional `get()` blocks every other WebAuthn call in the document until it is aborted, needs abort-on-unmount and restart-before-expiry handling, touches the email field every password manager reads, and had no verified end-to-end path under the CDP virtual authenticator.
+
+**Done when:** the email field offers passkeys through conditional mediation next to the button, the pending request is aborted on unmount and before the button starts its own ceremony, it restarts before the ceremony token expires, and `e2e/passkey.spec.ts` proves an autofill sign-in and a button sign-in on the same page.
+
+### PK2. The WebAuthn Signal API is not used
+
+A passkey removed from Studio stays in the user's password manager, which keeps offering it; the sign-in refusal and the removal dialog tell the user to delete it by hand.
+`signalAllAcceptedCredentials`, `signalUnknownCredential` and `signalCurrentUserDetails` could tidy that up, but an incomplete accepted list hides a valid passkey irreversibly, Firefox has no implementation, and none of them replaces server-side revocation.
+
+**Done when:** after a successful sign-in the page signals the account's complete accepted credential list (or, at minimum, `signalUnknownCredential` after a `passkey_unknown` refusal), feature-detected so browsers without the API are unaffected, with a test that an incomplete list can never be sent.
+
+### PK3. Passkey step-up and passkey-only accounts
+
+Adding or removing a passkey asks for the current password, and a current code when the account has TOTP (`confirmOwner` in `src/lib/local-accounts.ts`, called by `src/lib/passkey/management.ts`).
+For an account with a passkey but no TOTP, NIST SP 800-63B-4 section 4.1.2.1 would ask for an existing passkey (AAL2) before binding another; Studio accepts the password, a deviation stated in `docs/PASSKEYS.md` and `docs/SECURITY.md`.
+Every account also keeps its password, so there are no passkey-only accounts.
+Both need the same thing: a passkey ceremony accepted as the confirmation for a factor change, and for passkey-only accounts recovery codes as well.
+
+**Done when:** `register-options` and `remove` accept a fresh passkey assertion of the same account in place of the password, the account settings can remove the password once another factor and recovery codes exist, and the recovery path for a passkey-only account is documented and tested.
+
+### PK4. No in-session notice of a passkey added since the last visit
+
+Studio has no out-of-band channel, so the substitutes for a "new passkey" notification are the audit line, the dated list under Sign-in security and the admin's per-account count.
+An owner who never opens that page does not learn that someone added a passkey to their account.
+
+**Done when:** the account keeps a last-seen marker, the first page after sign-in names every passkey added since then with its date, and a test covers a passkey added from another session.
+
+### PK5. Owners cannot change their own password
+
+No route under `src/app/api/auth` changes the signed-in account's password; an admin sets it through `PATCH /api/admin/accounts/<email>`.
+Passkeys make that gap more visible, because adding or removing one asks for the current password, and the passkey dialogs tell the user that an admin sets a forgotten one.
+
+**Done when:** an owner changes their own password after confirming the current one (and a current code when TOTP is on), the change ends their other sessions and MCP tokens like an admin password set, it is charged to the login budgets like the other confirmations, and the passkey dialogs point at it.
+
+### PK6. Converge the older copies of the shared helpers
+
+The passkey work added one derivation, `derivedSigningKey(label)` in `src/lib/config/auth-env.ts`, one `isRecord` in `src/lib/is-record.ts`, and one reader of the store mode (`passkeyAvailability` in `src/lib/passkey/config.ts`), and did not migrate the copies that predate them, because a feature PR does not refactor unrequested code.
+The copies are:
+
+- Three HMAC(`JWT_SECRET`, label) derivations: `driveSigningKey` in `src/lib/agent/drive-token.ts`, `mcpSigningKey` in `src/lib/mcp/token.ts` and `planSigningKey` in `src/lib/api/object-edit-plan-token.ts`.
+- Twelve private `isRecord` functions (`src/lib/agent/history.ts`, `src/lib/agent/plan-summary.ts`, `src/lib/agent/run-store.ts`, `src/lib/local-accounts.ts`, `src/lib/api/object-edit-wire.ts`, `src/lib/explain/duckdb-json.ts`, `src/lib/explain/trino-json.ts`, `src/lib/explain/couchbase-json.ts`, `src/lib/explain/clickhouse-json.ts`, `src/lib/explain/druid-native.ts`, `src/components/object-source/source-reader.ts`, `src/components/object-tree/use-tree-nodes.ts`) and the exported one in `src/lib/explain/text-plan.ts`.
+- Four separate tests of OIDC mode and the storage provider inside `src/lib/local-accounts.ts` (`requireAccountStore`, the login user lookup, `storedAccountAllows` and `ownFactorStatus`).
+
+Each derived key must keep its label, so that a token of one purpose still never verifies as another, and each converged site must keep its current behaviour.
+
+**Done when:** the three derivations call `derivedSigningKey` with their existing labels and their tokens still verify across the change, every `isRecord` in `src/` is imported from `src/lib/is-record.ts`, the four store-mode tests read one exported reader, and no test changes its expectation.
+
+### PK7. One bounded request-body reader
+
+`src/lib/api/bounded-json.ts` `readBoundedJson` refuses a declared `Content-Length` over the limit and cancels the stream as soon as the count passes it; the passkey routes and, through `src/lib/api/object-route.ts`, the object edit routes use it.
+One older reader remains: `src/lib/mcp/preprocess.ts` reads `/api/mcp` bodies through the MCP SDK's `readRequestBody`.
+
+**Done when:** `/api/mcp` reads its body through `src/lib/api/bounded-json.ts` and keeps its current status codes and JSON-RPC error bodies.
+
+### PK9. `initialize()` still needs CREATE on the schema when every table exists
+
+`PostgresStorageProvider.initialize` in `src/lib/storage/providers/postgres.ts` runs `CREATE TABLE IF NOT EXISTS` for all five tables on every start.
+PostgreSQL checks CREATE on the schema even for a table that already exists (measured on PostgreSQL 17.11), and a default PostgreSQL 17 `public` schema grants other roles no CREATE, so a schema a DBA created in full still fails to start with an app user that holds only data grants; the start fails with the error that names the privileges and `docs/STORAGE.md` "Manual Table Creation".
+Which earlier PostgreSQL versions behave the same is not measured.
+
+**Done when:** `initialize()` checks which tables exist first and creates only the missing ones, a start against a complete DBA-created schema needs no CREATE, and a test against a real PostgreSQL proves it with a user that holds only `SELECT`, `INSERT`, `UPDATE` and `DELETE`.
 
 ---
 

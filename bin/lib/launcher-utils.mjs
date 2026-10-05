@@ -48,6 +48,7 @@ export function mcpUrlFor(hostname, port) {
  * Each entry was checked where it is read:
  *
  * - SEED_CONFIG_PATH: src/lib/seed/config-loader.ts
+ * - SEED_DISCOVERY_PATH: src/lib/seed/discovery-loader.ts
  * - STORAGE_SQLITE_PATH: src/lib/data-dir.ts and the sqlite storage provider
  * - SQLITE_EMBEDDED_SAMPLE_PATH, SQLITE_EMBEDDED_SAMPLE_TEMPLATE: src/lib/seed/sqlite-sample.ts
  * - LIBREDB_EMBEDDED_SAMPLE_PATH: src/lib/seed/libredb-sample.ts
@@ -61,6 +62,7 @@ export function mcpUrlFor(hostname, port) {
  */
 export const PATH_VARIABLES = Object.freeze([
   "SEED_CONFIG_PATH",
+  "SEED_DISCOVERY_PATH",
   "STORAGE_SQLITE_PATH",
   "SQLITE_EMBEDDED_SAMPLE_PATH",
   "SQLITE_EMBEDDED_SAMPLE_TEMPLATE",
@@ -79,6 +81,7 @@ export const PATH_VARIABLES = Object.freeze([
 export const URL_PATH_VARIABLES = Object.freeze({
   BASE_PATH: "the URL prefix the app is served under behind a reverse proxy",
   NEXT_PUBLIC_MONACO_VS_PATH: "the URL the browser loads the Monaco editor from",
+  VAULT_K8S_AUTH_PATH: "the mount of the Kubernetes auth method inside the Vault API URL",
 });
 
 /**

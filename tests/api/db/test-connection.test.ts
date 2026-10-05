@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 import { createMockProvider } from "../../helpers/mock-provider";
 import { DatabaseConfigError } from "@/lib/db/errors";
@@ -6,10 +6,13 @@ import { clearRateLimitState } from "@/lib/api/rate-limit";
 
 // ─── Create mock objects ────────────────────────────────────────────────────
 const mockProvider = createMockProvider();
-const mockCreateDatabaseProvider = mock(async (connection?: unknown) => {
-  // The parameter is declared so `mock.calls` carries the connection the route built the
-  // provider from - that argument is what proves the SSH tunnel endpoint was used (#457).
+const mockCreateDatabaseProvider = mock(async (connection?: unknown, options?: unknown, execution?: unknown) => {
+  // The parameters are declared so `mock.calls` carries what the route built the provider from:
+  // the connection proves the SSH tunnel endpoint was used (#457), and the execution context
+  // proves which file-access posture the handle opens under (non-admin DuckDB file access).
   void connection;
+  void options;
+  void execution;
   return mockProvider;
 });
 
@@ -18,7 +21,13 @@ const mockCreateDatabaseProvider = mock(async (connection?: unknown) => {
  * (#498). Null by default: every engine but LibreDB is in that state.
  */
 const borrowedProvider = createMockProvider();
-const mockFindOpenSingleWriterProvider = mock((): unknown => null);
+const mockFindOpenSingleWriterProvider = mock((connection?: unknown, allowExternalFileAccess?: boolean): unknown => {
+  void connection;
+  void allowExternalFileAccess;
+  return null;
+});
+/** Whether a handle of ANY file-access posture holds the file (non-admin DuckDB file access). False by default. */
+const mockIsSingleWriterFileOpen = mock((): boolean => false);
 
 const mockGetSession = mock(
   async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
@@ -74,6 +83,7 @@ const mockWithOneShotTunnel = mock(
 mock.module("@/lib/db/factory", () => ({
   createDatabaseProvider: mockCreateDatabaseProvider,
   findOpenSingleWriterProvider: mockFindOpenSingleWriterProvider,
+  isSingleWriterFileOpen: mockIsSingleWriterFileOpen,
   withOneShotTunnel: mockWithOneShotTunnel,
   getOrCreateProvider: mock(async () => mockProvider),
   removeProvider: mock(async () => {}),
@@ -106,6 +116,8 @@ describe("POST /api/db/test-connection", () => {
     (mockProvider.getHealth as ReturnType<typeof mock>).mockClear();
     mockFindOpenSingleWriterProvider.mockClear();
     mockFindOpenSingleWriterProvider.mockImplementation(() => null);
+    mockIsSingleWriterFileOpen.mockClear();
+    mockIsSingleWriterFileOpen.mockImplementation(() => false);
     for (const method of ["connect", "disconnect", "getHealth"] as const) {
       (borrowedProvider[method] as ReturnType<typeof mock>).mockClear();
     }
@@ -162,6 +174,51 @@ describe("POST /api/db/test-connection", () => {
     expect(data.success).toBe(true);
     expect(data.message).toBe("Connection successful");
     expect(typeof data.latency).toBe("number");
+    // A provider that reports no connect cautions adds no key to the answer.
+    expect("warnings" in data).toBe(false);
+  });
+
+  describe("what the server cautioned while the connection opened (#1401)", () => {
+    // Materialize v26.44.1's own startup NOTICE, measured 2026-10-04.
+    const caution = { message: 'session database "nosuchdb" does not exist', code: "MZ004", severity: "NOTICE" };
+    const withCautions = mockProvider as typeof mockProvider & { connectWarnings?: () => unknown[] };
+
+    afterEach(() => {
+      delete withCautions.connectWarnings;
+    });
+
+    test("rides along with a successful answer", async () => {
+      withCautions.connectWarnings = () => [caution];
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+      const data = await parseResponseJSON<{ success: boolean; warnings?: unknown[] }>(res);
+
+      expect(data.success).toBe(true);
+      expect(data.warnings).toEqual([caution]);
+    });
+
+    test("rides along with a degraded answer too", async () => {
+      withCautions.connectWarnings = () => [caution];
+      (mockProvider.getHealth as ReturnType<typeof mock>).mockImplementation(async () => {
+        throw new Error("no health here");
+      });
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+      const data = await parseResponseJSON<{ degraded?: boolean; warnings?: unknown[] }>(res);
+
+      expect(data.degraded).toBe(true);
+      expect(data.warnings).toEqual([caution]);
+    });
+
+    test("is left out when the provider has the channel and the server said nothing", async () => {
+      withCautions.connectWarnings = () => [];
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+      expect("warnings" in (await parseResponseJSON<Record<string, unknown>>(res))).toBe(false);
+    });
   });
 
   test("returns 400 when connection type is missing", async () => {
@@ -459,5 +516,47 @@ describe("POST /api/db/test-connection", () => {
     expect(mockCreateDatabaseProvider).toHaveBeenCalledTimes(1);
     expect(mockProvider.connect).toHaveBeenCalledTimes(1);
     expect(mockProvider.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  // Since the non-admin DuckDB file-access change, a DuckDB handle is borrowed only under the
+  // caller's own posture, so a file can be open under the OTHER posture with nothing to borrow. A
+  // second read-write handle there checkpoints its own view over the file when it closes; the test
+  // handle opens read-only.
+
+  test("opens its own handle read-only when a handle of the other posture holds the file", async () => {
+    mockIsSingleWriterFileOpen.mockImplementation(() => true);
+
+    const req = createMockRequest("/api/db/test-connection", {
+      method: "POST",
+      body: { ...validConnection, type: "duckdb", database: "/data/held.duckdb" },
+    });
+
+    const data = await parseResponseJSON<{ success: boolean }>(await POST(req as never));
+
+    expect(data.success).toBe(true);
+    expect(mockCreateDatabaseProvider).toHaveBeenCalledTimes(1);
+    expect(mockCreateDatabaseProvider.mock.calls[0]).toEqual([
+      expect.objectContaining({ type: "duckdb", database: "/data/held.duckdb" }),
+      { queryTimeout: 10000 },
+      { readOnly: true },
+    ]);
+    // Still this route's own handle, so it is still closed.
+    expect(mockProvider.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test("opens its own handle under the caller's posture when nothing holds the file", async () => {
+    const req = createMockRequest("/api/db/test-connection", {
+      method: "POST",
+      body: { ...validConnection, type: "duckdb", database: "/data/free.duckdb" },
+    });
+
+    await POST(req as never);
+
+    // The admin session of this file, on an inline connection: the requester decides.
+    expect(mockCreateDatabaseProvider.mock.calls[0]?.[2]).toEqual({ allowExternalFileAccess: true });
+    expect(mockFindOpenSingleWriterProvider.mock.calls[0]).toEqual([
+      expect.objectContaining({ database: "/data/free.duckdb" }),
+      true,
+    ]);
   });
 });

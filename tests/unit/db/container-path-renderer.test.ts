@@ -84,6 +84,7 @@ const ENGINES = [
   "src/lib/db/providers/keyvalue/redis.ts",
   "src/lib/db/providers/sql/cassandra/objects.ts",
   "src/lib/db/providers/sql/clickhouse/objects.ts",
+  "src/lib/db/providers/sql/db2/objects.ts",
   "src/lib/db/providers/sql/druid/objects.ts",
   "src/lib/db/providers/sql/duckdb/objects.ts",
   "src/lib/db/providers/sql/libsql/objects.ts",
@@ -93,6 +94,8 @@ const ENGINES = [
   "src/lib/db/providers/sql/postgres.ts",
   "src/lib/db/providers/sql/sqlite.ts",
   "src/lib/db/providers/sql/trino/objects.ts",
+  "src/lib/db/providers/timeseries/influxdb/influxql-provider.ts",
+  "src/lib/db/providers/vector/milvus/index.ts",
 ];
 
 describe("the container-path sentence has one producer under providers/", () => {

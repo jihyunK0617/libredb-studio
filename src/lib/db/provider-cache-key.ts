@@ -1,4 +1,5 @@
 import { connectionFingerprint } from "./connection-fingerprint";
+import { READS_FILE_ACCESS_POSTURE } from "./compatibility";
 import type { DatabaseConnection, WithTunnelFarEnd } from "@/lib/types";
 
 /**
@@ -15,7 +16,7 @@ import type { DatabaseConnection, WithTunnelFarEnd } from "@/lib/types";
  * Reproduced against the real sqlite driver before this existed, in
  * `tests/isolated/factory.test.ts` ("getOrCreateProvider cache isolation").
  *
- * So the key still carries the id, but the id is no longer the WHOLE of it. Three parts, framed
+ * So the key still carries the id, but the id is no longer the WHOLE of it. Four parts, framed
  * together so none can be forged on its own:
  *
  * - `connection.id`, which keeps the cache's existing per-record behaviour: two stored records
@@ -34,6 +35,24 @@ import type { DatabaseConnection, WithTunnelFarEnd } from "@/lib/types";
  *   a different identity, but not `password`, because rotating a secret does not change which
  *   server you reach. For a CACHE key it must: a caller who sends the wrong password may not be
  *   handed a pool someone opened with the right one.
+ * - The read-only mode (#1089), spelled `read-only` for `readOnly: true` and `read-write` for
+ *   everything else, so `false` and an absent value are one mode and share a pool. A provider opened
+ *   read-only refuses every write, so a read-write caller handed its entry would have its writes
+ *   refused, and a read-only caller handed a read-write entry would have them sent. It is not in
+ *   `credentialDigest` or the fingerprint, whose rules are as whom a connection authenticates and
+ *   which server it reaches, and the mode changes neither.
+ * - The file-access posture (the non-admin DuckDB file-access change), for an engine that opens its
+ *   editor handle under one: `READS_FILE_ACCESS_POSTURE` in `./compatibility.ts` answers which, so
+ *   this is not a `connection.type` branch (CLAUDE.md), and today only DuckDB answers true. A denied
+ *   editor handle opens with `enable_external_access: 'false'` and a full-reach one without it, so the
+ *   two must never share a cached handle: a caller of one posture would otherwise be handed the
+ *   other's handle. (A seed a non-admin role can use gets one posture for every role in
+ *   `editorExecutionContext`, so that record still keeps one key.) The deny posture appends a segment;
+ *   the allow/admin posture and an absent posture append NOTHING, so every other engine's key and the
+ *   profiled key (which passes no posture) stay byte-identical to before this change. The posture
+ *   lives on `ProviderExecutionContext`, server-derived from the session role and the resolved
+ *   connection's audience, never on the
+ *   connection, so a request body cannot move a handle between the two pools.
  *
  * WHY THE ID IS SAFE IN THE KEY. Reaching a cached entry now costs the victim's id AND their
  * server AND their credentials. The first is guessable and the second is often public; the third
@@ -57,11 +76,25 @@ import type { DatabaseConnection, WithTunnelFarEnd } from "@/lib/types";
  * WHAT IT DOES NOT CATCH, stated as a limit rather than left to be found: the same limit
  * `connectionFingerprint` states, a different server answering on the same host and port.
  */
-export async function providerCacheKey(connection: DatabaseConnection & WithTunnelFarEnd): Promise<string> {
+export async function providerCacheKey(
+  connection: DatabaseConnection & WithTunnelFarEnd,
+  allowExternalFileAccess?: boolean,
+): Promise<string> {
   const [server, credentials] = await Promise.all([connectionFingerprint(connection), credentialDigest(connection)]);
+  const mode = connection.readOnly === true ? "read-only" : "read-write";
+  const parts = [connection.id, server, credentials, mode];
+  // Only an engine that opens its editor handle under a file-access posture, and only its deny
+  // posture, adds bytes: the admin/allow and absent postures leave the key byte-identical to before
+  // this field existed, which keeps every other engine's key and the profiled key (passed no posture)
+  // unchanged. A denied editor handle must not be shared with a full-reach one on the same
+  // connection, so its key carries this extra segment (the non-admin DuckDB file-access change). The
+  // engine is read from `READS_FILE_ACCESS_POSTURE`, not a `connection.type` branch (CLAUDE.md).
+  if (READS_FILE_ACCESS_POSTURE[connection.type] && allowExternalFileAccess === false) {
+    parts.push("duckdb-deny-file-access");
+  }
   // Length-framed like the two digests it joins: an id ending in a digit must not be able to
   // answer the same key as a shorter id followed by a longer fingerprint.
-  return [connection.id, server, credentials].map((value) => `${value.length}:${value}`).join("");
+  return parts.map((value) => `${value.length}:${value}`).join("");
 }
 
 /**
@@ -75,8 +108,19 @@ export async function providerCacheKey(connection: DatabaseConnection & WithTunn
  * field ALONE, with the others held equal, makes the connection authenticate as someone else or
  * be trusted differently by the server.
  *
+ * Every field `src/lib/storage/connection-secrets.ts` classifies as `secret` has to move this digest
+ * or the fingerprint, and `tests/unit/lib/db/provider-cache-key.test.ts` walks those maps to hold it,
+ * because this list is hand-kept and the API key pair was once missing from it. The public fields
+ * below (the agent user, what TLS presents and trusts, the mechanism, the auth database, the consent,
+ * the data servers, the tunnel's auth method and host key) are outside that walk, so the same file
+ * holds them in a table of their own, one row per field.
+ *
  * - `password` is the connection's own secret. `connectionString` is NOT here because the
  *   fingerprint already frames it whole, credentials and all.
+ * - `apiKeyId` and `apiKeySecret` are who an Elasticsearch connection authenticates as: its
+ *   transport sends `Authorization: ApiKey` built from the pair in preference to `user` and
+ *   `password` (`src/lib/db/providers/sql/search/http-transport.ts`), so a connection differing
+ *   only in either half must not be handed a provider opened with the other.
  * - `agentUser` and `agentPassword` are the least-privilege identity the execution profiles open
  *   as (#328). They are an identity, so a connection differing only in them must not be handed a
  *   pool opened as the privileged user.
@@ -88,6 +132,15 @@ export async function providerCacheKey(connection: DatabaseConnection & WithTunn
  *   under another mechanism are another principal's secret. Nothing asks for it here: this list is
  *   hand-kept and no compiler walks `DatabaseConnection` for it, and without it two connections
  *   differing only in the mechanism would share one cached provider.
+ * - `authSource` names the database MongoDB looks the user up in (`buildConnectionString` in
+ *   `src/lib/db/providers/document/mongodb.ts`), so the same user and password under another auth
+ *   database are another principal's record. `connectionIdentity` in
+ *   `src/lib/agent/context-snapshot.ts` frames it for the same reason.
+ * - `allowInsecureAuth` decides whether a Db2 or InfluxDB provider sends its secret with no TLS (#786,
+ *   InfluxDB spec I7), and whether an Oxia provider sends its token without TLS, so a connection whose
+ *   consent was taken back must not be handed a provider opened under it.
+ * - `dataServers` decides which hosts receive the token (O6), so a connection whose list changed must
+ *   not be handed a provider whose policy admitted other hosts.
  * - The tunnel's SECRETS and `hostKeyFingerprint`. Its ROUTE is deliberately absent: `tunnelRoute`
  *   frames the four route values inside the fingerprint already, and this is the half that file
  *   explicitly leaves out as "a credential, not a route".
@@ -97,6 +150,8 @@ async function credentialDigest(connection: DatabaseConnection): Promise<string>
   const tunnel = connection.sshTunnel;
   const framed = [
     connection.password ?? "",
+    connection.apiKeyId ?? "",
+    connection.apiKeySecret ?? "",
     connection.agentUser ?? "",
     connection.agentPassword ?? "",
     ssl?.mode ?? "",
@@ -105,6 +160,9 @@ async function credentialDigest(connection: DatabaseConnection): Promise<string>
     ssl?.clientKey ?? "",
     ssl === undefined ? "" : String(ssl.rejectUnauthorized ?? ""),
     connection.saslMechanism ?? "",
+    connection.authSource ?? "",
+    connection.allowInsecureAuth === true ? "insecure-auth" : "",
+    connection.dataServers ?? "",
     tunnel?.authMethod ?? "",
     tunnel?.password ?? "",
     tunnel?.privateKey ?? "",

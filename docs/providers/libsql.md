@@ -19,7 +19,7 @@
 | **Default port** | `8080` (sqld's own). `443` when TLS is on, which is how Turso Cloud serves every database |
 | **Connection pooling** | None — each statement is one stateless HTTP request |
 | **Connection string** | Supported (`libsql://<database>-<org>.turso.io?authToken=<jwt>`) |
-| **Credential** | An auth TOKEN, not a password. libSQL has no user names, so the form labels the field "Auth Token" |
+| **Credential** | An auth TOKEN, sent as `Authorization: Bearer` and labelled "Auth Token" in the form. A connection that also names a `user` sends `Authorization: Basic` instead, for a self-hosted `sqld` started with `SQLD_HTTP_AUTH` ([§4.5](#45-http-basic-for-a-self-hosted-server)) |
 | **EXPLAIN** | `sqlite-queryplan` — the same `EXPLAIN QUERY PLAN` shape SQLite answers |
 | **Transactions** | Not exposed (the provider closes its Hrana stream with each statement, so it holds no session for one) |
 | **Maintenance** | `reindex` and `check` only — `VACUUM`, `ANALYZE`, `PRAGMA optimize` and `PRAGMA wal_checkpoint` are refused by the server on both deployments |
@@ -67,6 +67,7 @@ connecting to it, so it earns no row here or in the compatibility registry.
 | Table | Table | `sqlite_master` |
 | Index | Index | `pragma_index_list`, minus SQLite's own `sqlite_autoindex_*` |
 | Auth token (JWT) | The `password` field | Labelled "Auth Token" in the connection dialog |
+| The user and password of `SQLD_HTTP_AUTH` | The `user` and `password` fields | Sent together as HTTP Basic; the Username box's hint says when to fill it |
 | `dbstat` pages | Table and index bytes | Available on BOTH deployments, unlike `bun:sqlite` |
 
 ---
@@ -319,6 +320,7 @@ facts was re-measured over Hrana rather than assumed:
 | `q'…'` is a literal | **No** — syntax error |
 | `''` escapes a quote | **Yes** — `SELECT 'it''s'` answers `it's` |
 | `hex(X'0102deadbeef')` | `0102DEADBEEF`; `typeof(X'')` is `blob`, `length(X'')` is 0 |
+| A `CREATE TRIGGER … BEGIN … END` body holds its `;` (#1312) | **Yes**: cut at its inner `;` it is "SQL string could not be parsed: unexpected end of input", sent whole it is created and fires |
 
 ### 3.13 `endOpenQueryTransaction()` is not implemented, because the engine has no transaction to leave open
 
@@ -343,14 +345,14 @@ This is a declared boundary, not a default: `endOpenQueryTransaction` is optiona
 |---|---|---|
 | `host` | yes (or a URL) | `libredb-probe.turso.io`, or the host running `sqld` |
 | `port` | no | Defaults to `8080` plaintext, `443` under TLS |
-| `password` | when the server requires one | The auth TOKEN, sent as `Authorization: Bearer` |
+| `user` | no | Only for a self-hosted `sqld` started with `SQLD_HTTP_AUTH`. When it is non-empty the transport sends `Authorization: Basic base64(user:password)` instead of the bearer token ([§4.5](#45-http-basic-for-a-self-hosted-server)) |
+| `password` | when the server requires one | The auth TOKEN, sent as `Authorization: Bearer`, or the password that goes with `user` |
 | `ssl` | no | Any mode other than `disable` selects HTTPS |
 | `connectionString` | no | A `libsql://` URL, resolved into the fields above |
 
-There is no `user` (libSQL has no user names) and no `database` (the database is the host), and the
-connection form renders no input for either: it gates its Username and Database boxes on this same
-list, so a box appears exactly where a value is written. It used to draw both regardless, and the save
-discarded whatever was typed into them.
+There is no `database` (the database is the host).
+The connection form gates its Username and Database boxes on this same list, so a box appears exactly where a value is written: it draws a Username box, whose hint says it is only for a server started with `SQLD_HTTP_AUTH`, and no Database box.
+The list names `user` because the transport sends one: a provider that authenticates with a field the form does not write is the Redis ACL user of #502 again, and `tests/unit/lib/db-ui-config.test.ts` fails on it.
 
 ### 4.2 Connection strings
 
@@ -392,6 +394,27 @@ redirect would take the token and the statement to wherever the server pointed.
 `serverVersion()` answers `null` for every failure by contract ([§3.10](#310-the-version-panel-names-what-the-deployment-publishes)),
 so a redirect from `/version` is one more "no version to show". It is still not followed.
 
+### 4.5 HTTP Basic for a self-hosted server
+
+A self-hosted `sqld` started with `SQLD_HTTP_AUTH="basic:<base64(user:password)>"` checks a user name and a password rather than a token.
+sqld calls this legacy HTTP basic authentication and chooses it ahead of any JWT key the server was also given (`make_user_auth_strategy` in `libsql-server/src/main.rs`).
+A connection with a non-empty `user` therefore sends `Authorization: Basic base64(user:password)`, encoded as UTF-8, with an empty password when the connection has none.
+A connection without one keeps sending the password as `Authorization: Bearer <password>`, which is what Turso Cloud and a JWT-checking server read, and a connection with neither sends no header.
+
+A Basic-auth server would also accept a bearer token equal to `base64(user:password)`, but only through its own leniency.
+Its `HttpBasic` strategy splits the header at the first space, discards the scheme and accepts any value that contains the configured credential.
+Sending the scheme the server is configured for keeps that leniency out of the contract.
+This is read from the sqld source (`libsql-server/src/auth/user_auth_strategies/http_basic.rs`, byte-identical at `libsql-server-v0.24.32`, `libsql-server-v0.24.33` and `main`), not measured against a live server by these tests, which pin the header the transport builds.
+
+A rejected credential answers `401` with this body, read from the same source (`src/error.rs` and `src/auth/errors.rs` at `libsql-server-v0.24.32`), and the provider reports it as an `AuthenticationError` like every other credential failure ([§3.3](#33-an-auth-failure-uses-a-different-envelope-and-a-bad-token-is-a-400)):
+
+```json
+{"error":"Unauthorized: `The `Basic` HTTP authentication credentials were rejected`"}
+```
+
+A `libsql://` URL never sends Basic.
+Its credential is the token in `?authToken=` or the password in its authority, so a `user` beside the URL is dropped when the URL is resolved, and the URL's own user name is not read.
+
 ---
 
 ## 5. Query interface
@@ -408,6 +431,17 @@ columnTypes? }`.
   map is the common case rather than a failure.
 - **`executionTime`** is the engine's own measurement when it rounds to at least a millisecond, and
   the wall-clock one otherwise.
+- **A `BLOB` arrives as a `Buffer`.** Hrana carries a blob as base64 (`x'DEADBEEF00FF'` answers
+  `{"type":"blob","base64":"3q2+7wD/"}` on sqld 0.24.33, `x''` answers `"base64":""`), and
+  [`hrana-transport.ts`](../../src/lib/db/providers/sql/libsql/hrana-transport.ts) decodes it to a
+  `Buffer` rather than a plain `Uint8Array`. The rows reach the browser through `JSON.stringify`, which
+  writes a plain `Uint8Array` as an object keyed by index (`{"0":222,"1":173,...}`): the grid showed
+  that object and "Export as SQL INSERT" wrote it back as quoted text, so a replay stored a string
+  where the bytes had been. A `Buffer` serializes to `{"type":"Buffer","data":[...]}`, which
+  `asBytes` in [`binary.ts`](../../src/lib/export/binary.ts) reads, so the grid, the CSV and the JSON
+  export (#1381) show `\xdeadbeef00ff` and the SQL export writes `X'deadbeef00ff'` (and `X''` for an empty blob), the
+  same as the SQLite provider. Measured 2026-10-04 on sqld 0.24.33: the exported INSERTs, run into a
+  fresh `BLOB` table, read back with identical `hex()` and `length()`, `0x00` and `0xFF` included.
 
 ### EXPLAIN
 
@@ -461,7 +495,7 @@ answer). The floor that matters here is 3.37, and both builds are above it.
 `containerLevels` is `[]`, `containerDepth()` answers 0, and `listContainers()` answers `[]`. A connection
 addresses one database and every object in it is addressed by a bare name, so `DatabaseObject.path` for a
 table is `['orders']` and for a trigger `['orders', 'orders_stamp']`. No synthetic `main` container is
-invented to make the shape match the other sixteen engines.
+invented to make the shape match the other engines.
 
 #### The four kinds, and the one that is NOT declared
 
@@ -911,7 +945,7 @@ libSQL maps HTTP transport errors and Hrana execution errors to typed applicatio
 | Situation | Error Class | Details |
 |---|---|---|
 | Missing `host` and no `connectionString` | `DatabaseConfigError` | Thrown during `validate()` |
-| HTTP `400`, `401`, or `403` status | `AuthenticationError` | Indicates invalid, missing, or unauthorized auth token |
+| HTTP `400`, `401`, or `403` status | `AuthenticationError` | Indicates an invalid, missing or unauthorized auth token, or a Basic credential the server rejected |
 | HTTP Status `0` / Network unreachable / Connect timeout | `ConnectionError` | Carries `host` and `port` |
 | Statement execution error in Hrana pipeline (`results[].error`) | `QueryError` | Extracts message from error payload and associates original SQL |
 | Non-transport error | `QueryError` / `DatabaseError` | Passed through or wrapped |
@@ -969,6 +1003,19 @@ const localProvider = await createDatabaseProvider({
   type: "libsql",
   host: "127.0.0.1",
   port: 8080,
+  createdAt: new Date(),
+});
+
+// Or a self-hosted sqld started with SQLD_HTTP_AUTH="basic:<base64(user:password)>":
+// naming a user sends the pair as HTTP Basic
+const basicProvider = await createDatabaseProvider({
+  id: "libsql-basic",
+  name: "sqld with HTTP Basic",
+  type: "libsql",
+  host: "sqld.internal",
+  port: 8080,
+  user: "libsql",
+  password: "libsql-pass",
   createdAt: new Date(),
 });
 

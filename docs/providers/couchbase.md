@@ -423,7 +423,7 @@ cardinality can appear on CE plans.
 | `host` | Yes (or `connectionString`) | Cluster node hostname. `validate()` throws `DatabaseConfigError` when both are missing |
 | `port` | No | **Management** port only. Defaults to `8091` (`18091` when SSL is on). Query ports are discovered ([§3.3](#33-ports-are-discovered-not-configured)) |
 | `user` / `password` | No | Sent as HTTP Basic on every request |
-| `database` | **Yes** | Carries the **bucket** name. One bucket per connection; the ConnectionModal labels this field "Bucket" |
+| `database` | Yes, unless supplied in the URI path | Carries the **bucket** name and overrides the URI path. One bucket per connection; the ConnectionModal labels this field "Bucket" |
 | `connectionString` | No | `couchbase://` / `couchbases://`; see [§4.2](#42-connection-strings) |
 | `ssl` | No | See [§4.3](#43-tls) |
 
@@ -433,7 +433,7 @@ cardinality can appear on CE plans.
 connection without one ([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)):
 
 ```text
-Couchbase requires a bucket (use the "database" field)
+Couchbase requires a bucket (use the URL path or the "database" field)
 ```
 
 Multi-bucket browsing from a single connection is out of scope; create one connection per bucket.
@@ -470,8 +470,13 @@ The scheme also arrives as an SSL mode - `require` for `couchbases://`, `disable
 pasted string ([§4.3](#43-tls)); without it a `couchbases://` paste posted plain HTTP to 18091.
 `require` and not a verifying mode for the reason §4.3 gives: a self-hosted cluster's certificate is
 self-signed, so only the SSL panel turns verification on.
-A connection that carries *only* a connection string has its hostname lifted out for the transport
-and nothing else — the URL's port is deliberately not used, because a `couchbase://` URL from an
+A connection in **Connection String** mode has its hostname lifted out for the transport.
+When the separate Bucket (`database`) field is empty, the provider also reads and URL-decodes the
+first path segment as the bucket: `couchbase://localhost/travel%2Dsample` selects `travel-sample`.
+A `%` that does not start a valid escape is kept verbatim, as Paste URL keeps it, because a bucket name may contain one: `couchbase://localhost/100%` selects `100%`.
+An explicit Bucket field wins. The resolved bucket is used for management requests and the SQL++
+query context alike; a URL without a bucket path still requires the field to be filled in.
+The URL's port is deliberately not used, because a `couchbase://` URL from an
 application config carries the KV port, not the management port, and discovery handles the rest
 (`hostFromConnectionString()`,
 [`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)).
@@ -556,11 +561,25 @@ operator — and a statement ending in a `#` run is returned unbounded rather th
 
 | Source field | `QueryResult` field | Notes |
 |--------------|---------------------|-------|
-| result rows | `rows` | JSON objects exactly as the cluster returned them |
+| result rows | `rows` | JSON objects exactly as the cluster returned them, except that an integer past 2^53 arrives as its exact digits (see below) |
 | signature | `fields` | `null` for a wildcard signature, in which case columns are the union of the keys the rows carry, first seen first |
 | — | `rowCount` | `rows.length`, or the mutation count when a statement returned no rows |
 | metrics `executionTime` | `executionTime` | The cluster's own time (excludes network latency); falls back to the measured wall clock when the cluster reported none |
 | `warnings` | `warnings` | The notices the cluster attached to a statement it completed, each carrying its message and the cluster's own code **when it reported one** — an entry with no code arrives without one rather than with a substituted `0`, which is itself a legal code. **Absent** when the cluster reported no warnings at all — never an empty array, so the result UI decides from the field's presence alone (issue #273) |
+
+**An integer past 2^53 is handed over as its digits.** The query service sends a document's number
+as the **unquoted** literal it was stored as, and `JSON.parse` rounds one past 2^53 with no error:
+measured on 8.0.2 CE on 2026-10-04, a document `{"big":9007199254740993}` read through
+`SELECT d.big ... WHERE META(d).id = "h1"` was shown as `9007199254740992` in the grid, the API and
+every export. Every body the transport reads therefore goes through
+[`quoteUnsafeIntegers`](../../src/lib/db/utils/json-integers.ts) before it is parsed
+(`parseJsonBody` in
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)), so such a
+value reaches the grid as a string holding its exact digits, at any depth of the document, the way
+Druid's transport hands one over. An integer inside the safe range, and every float, stays a number,
+and the pass is string-aware, so digits inside a string value are never touched. The counts and
+sizes this provider reads from the REST API all sit far inside the safe range, so none of them
+changed type.
 
 ### 5.3 `USE KEYS` reads a document with no index at all
 
@@ -1296,8 +1315,8 @@ read with both of its refusal branches and both of its derivation pins ([§6b](#
 
 ```bash
 # Just this provider
-bun test tests/integration/db/couchbase-provider.test.ts
-bun test tests/unit/db/couchbase
+bun tests/run-tests.ts tests/integration/db/couchbase-provider.test.ts
+bun tests/run-tests.ts tests/unit/db/couchbase
 
 # Full isolated suite (CI-equivalent)
 bun run test

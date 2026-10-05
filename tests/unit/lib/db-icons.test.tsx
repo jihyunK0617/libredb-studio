@@ -19,6 +19,13 @@ import {
   CassandraIcon,
   PrometheusIcon,
   KafkaIcon,
+  EtcdIcon,
+  Db2Icon,
+  Neo4jIcon,
+  QdrantIcon,
+  MilvusIcon,
+  InfluxDBIcon,
+  OxiaIcon,
 } from "@/components/icons/db-icons";
 
 describe("db-icons", () => {
@@ -42,6 +49,13 @@ describe("db-icons", () => {
     { name: "CassandraIcon", Component: CassandraIcon },
     { name: "PrometheusIcon", Component: PrometheusIcon },
     { name: "KafkaIcon", Component: KafkaIcon },
+    { name: "EtcdIcon", Component: EtcdIcon },
+    { name: "Db2Icon", Component: Db2Icon },
+    { name: "Neo4jIcon", Component: Neo4jIcon },
+    { name: "QdrantIcon", Component: QdrantIcon },
+    { name: "MilvusIcon", Component: MilvusIcon },
+    { name: "InfluxDBIcon", Component: InfluxDBIcon },
+    { name: "OxiaIcon", Component: OxiaIcon },
   ];
 
   for (const { name, Component } of icons) {
@@ -68,4 +82,11 @@ describe("db-icons", () => {
       expect(html).not.toMatch(/\sheight="/);
     });
   }
+
+  test("InfluxDBIcon is a stroked mark on the house 24-unit grid (InfluxDB spec A.4)", () => {
+    // One generic time-series mark drawn for Studio, shared by both InfluxDB types, never the vendor's logo (E19).
+    const html = renderToStaticMarkup(React.createElement(InfluxDBIcon));
+    expect(html).toContain('viewBox="0 0 24 24"');
+    expect(html).toContain('fill="none"');
+  });
 });

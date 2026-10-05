@@ -30,6 +30,7 @@ import { SessionsTab } from "./tabs/SessionsTab";
 import { TablesTab } from "./tabs/TablesTab";
 import { StorageTab } from "./tabs/StorageTab";
 import { PoolTab } from "./tabs/PoolTab";
+import { withConnectedMaintenance } from "@/lib/db/types";
 
 interface MonitoringDashboardProps {
   isEmbedded?: boolean;
@@ -84,6 +85,7 @@ export function MonitoringDashboard({ isEmbedded = false }: MonitoringDashboardP
     refresh,
     killSession,
     runMaintenance,
+    previewMaintenance,
   } = useMonitoringData(selectedConnection, monitoringOptions);
 
   // Declared provider capabilities, so tabs can hide controls the provider cannot
@@ -307,7 +309,10 @@ export function MonitoringDashboard({ isEmbedded = false }: MonitoringDashboardP
                   data={data}
                   loading={loading}
                   onRunMaintenance={runMaintenance}
-                  capabilities={metadata?.capabilities}
+                  onPreviewMaintenance={previewMaintenance}
+                  // The connected provider's maintenance over the declared capabilities (#1387): see
+                  // `withConnectedMaintenance`.
+                  capabilities={withConnectedMaintenance(metadata?.capabilities, data?.maintenance)}
                   labels={metadata?.labels}
                 />
               </TabsContent>

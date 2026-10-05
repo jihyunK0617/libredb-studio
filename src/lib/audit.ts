@@ -106,6 +106,72 @@ export type AuditReason =
    * because the login page tells the user something different for each.
    */
   | "oidc_discovery"
+  // Passkey sign-in and management (#785). Each code has one meaning, so an operator can tell a
+  // cloned authenticator from a replay or a stale cookie without the export.
+  /**
+   * The ceremony cookie was missing, forged, expired, issued for the other ceremony, for another
+   * account or session version (including one that moved while the ceremony ran), or for another RP ID.
+   * A first registration that lost the race to another first registration of the same account lands
+   * here too: its ceremony carries a user handle the account no longer has, and no cookie is at fault.
+   */
+  | "passkey_ceremony_invalid"
+  /**
+   * A response made on another origin than PASSKEY_ORIGIN: a non-browser client, a modified client,
+   * or a page on a subdomain of Studio's host. Studio's own UI never produces it in a real browser,
+   * so it is not a configuration symptom; a wrong PASSKEY_ORIGIN shows as a missing passkey button.
+   */
+  | "passkey_origin_mismatch"
+  /** No credential with that ID for the configured RP ID, or the assertion carried no user handle. */
+  | "passkey_unknown"
+  /**
+   * WebAuthn verification refused the response: challenge, RP ID, flags, signature, attestation
+   * format, cross-origin use, a credential ID that is not the attested one, or a user handle or
+   * backup eligibility that does not match the stored credential.
+   */
+  | "passkey_rejected"
+  /**
+   * The signature counter did not increase, a possible cloned authenticator; the sign-in was refused
+   * and the account is not locked.
+   */
+  | "passkey_counter"
+  /** The challenge of an already successful ceremony was presented again. */
+  | "passkey_replayed"
+  /** A valid passkey of an account that is disabled or gone. */
+  | "passkey_account_unavailable"
+  /** A registration presented a credential ID already registered to an account. */
+  | "passkey_duplicate"
+  // Launch-token sign-in (docs/LAUNCH.md), each a `login_failure` reason on POST /api/auth/launch.
+  // One code per refusal, so an operator can tell a launch secret the platform and Studio no longer
+  // share from a slow click or a replay without the export. The token itself is never recorded.
+  /** Not a compact JWS, unparseable, or a claim missing or of the wrong shape. */
+  | "launch_token_malformed"
+  /** A header typ other than exactly libredb-launch+jwt, or none: another kind of JWT, such as a Studio session. */
+  | "launch_token_type"
+  /** Signed with an algorithm other than HS256, with none, or with a key other than LAUNCH_TOKEN_SECRET. */
+  | "launch_token_signature"
+  /** Issued by an issuer other than LAUNCH_TOKEN_ISSUER. */
+  | "launch_token_issuer"
+  /** Issued for an audience other than LAUNCH_TOKEN_AUDIENCE. */
+  | "launch_token_audience"
+  /** Past its expiry by more than the clock tolerance. */
+  | "launch_token_expired"
+  /** Issued, or valid from, further in the future than the clock tolerance allows: the two clocks disagree. */
+  | "launch_token_premature"
+  /** Issued for longer than the 60 seconds a launch token may live. */
+  | "launch_token_lifetime"
+  /** A token whose jti this process has already accepted. */
+  | "launch_token_replayed"
+  /** A valid token refused while this process remembers as many unexpired launch tokens as it holds. */
+  | "launch_capacity_exceeded"
+  /** A valid launch token for an account that is disabled in the server store. */
+  | "launch_account_disabled"
+  /**
+   * A valid launch token for an account a launch cannot sign in to: one with a password, an authenticator or
+   * a passkey, or one a launch created for another platform identity (issuer and subject).
+   */
+  | "launch_identity_mismatch"
+  /** A valid launch token for another account than the one this browser is signed in as; the session stays. */
+  | "launch_session_conflict"
   // Agent execution path (#328). The thirteen `agent_*` codes below mirror
   // `PolicyDenyCode` one-for-one, plus the two outcomes that are not policy
   // denials: an operation that may only ever require approval, and a provider
@@ -185,7 +251,12 @@ export type AuditReason =
   | "object_edit_refused"
   | "object_edit_guard_refused"
   | "object_edit_interrupted"
-  | "object_edit_plan_invalid";
+  | "object_edit_plan_invalid"
+  // `POST /api/db/maintenance` when the provider's `runMaintenance` THREW (#1091 review, R04 G8).
+  // Kept apart from the reasonless failure row an engine's own `success: false` writes: a thrown
+  // run may have reached the engine before it failed, so its disposition is not the engine's
+  // answer, and an operator reading the log needs to tell the two apart.
+  | "maintenance_execution_failed";
 
 export interface AuditEvent {
   id: string;
@@ -205,6 +276,12 @@ export interface AuditEvent {
    * and `bucket` are omitted, so the line's shape does not grow a null.
    */
   container?: string;
+  /**
+   * The engine principal a maintenance run acted as, when its provider names one through the optional
+   * `DatabaseProvider.engineUser()` (spec 3.11): a user name, never any part of a secret. Set by the maintenance route
+   * only, and omitted by `toAuditLine` when unset, as `container` is.
+   */
+  engineUser?: string;
   connectionName?: string;
   user: string;
   result: "success" | "failure";
@@ -235,6 +312,8 @@ export interface AuditEvent {
    * #246).
    */
   correlationId?: string;
+  /** The internal id of the passkey the event concerns, never the WebAuthn credential ID. */
+  passkey?: string;
 }
 
 const MAX_EVENTS = 1000;
@@ -251,6 +330,8 @@ interface AuditFilterOptions {
   result?: "success" | "failure";
   connectionName?: string;
   since?: string;
+  /** Keep at most this many of the newest matches. Absent, NaN or negative means all of them. */
+  limit?: number;
 }
 
 export class AuditRingBuffer {
@@ -278,18 +359,30 @@ export class AuditRingBuffer {
     return [...this.events];
   }
 
+  /**
+   * The newest `count` events, newest first. The buffer appends, so it is stored oldest
+   * first; the people reading it (Admin > Audit and its exports) want the event that just
+   * happened at the top, not below a page of sign-ins from when the server started.
+   */
   getRecent(count: number): AuditEvent[] {
-    return this.events.slice(-count);
+    return this.newestFirst(this.events, count);
   }
 
+  /** Every match, newest first, capped to `opts.limit` of the newest when one is given. */
   filter(opts: AuditFilterOptions): AuditEvent[] {
-    return this.events.filter((e) => {
+    const matches = this.events.filter((e) => {
       if (opts.type && e.type !== opts.type) return false;
       if (opts.result && e.result !== opts.result) return false;
       if (opts.connectionName && e.connectionName !== opts.connectionName) return false;
       if (opts.since && e.timestamp < opts.since) return false;
       return true;
     });
+    return this.newestFirst(matches, opts.limit);
+  }
+
+  private newestFirst(chronological: AuditEvent[], limit?: number): AuditEvent[] {
+    const reversed = [...chronological].reverse();
+    return limit !== undefined && limit >= 0 ? reversed.slice(0, limit) : reversed;
   }
 
   clear() {
@@ -532,9 +625,11 @@ interface AuditLogLine {
   ip?: string;
   connection?: string;
   container?: string;
+  engine_user?: string;
   duration_ms?: number;
   bucket?: string;
   correlation_id?: string;
+  passkey?: string;
 }
 
 function toAuditLine(event: AuditEvent): AuditLogLine {
@@ -553,6 +648,10 @@ function toAuditLine(event: AuditEvent): AuditLogLine {
     // The container beside the route, and omitted on the same terms: an event that named none
     // must not publish a `container: null` a parser would read as a value (#1091 review).
     ...(event.container ? { container: event.container } : {}),
+    // The engine principal beside the container, omitted on the same terms (spec 3.11).
+    ...(event.engineUser ? { engine_user: event.engineUser } : {}),
+    // Omitted when unset, like container: most events concern no passkey.
+    ...(event.passkey ? { passkey: event.passkey } : {}),
     ...(event.bucket ? { bucket: event.bucket } : {}),
     ...(event.correlationId ? { correlation_id: event.correlationId } : {}),
     // Number.isFinite excludes NaN and +/-Infinity: JSON.stringify(NaN) silently produces `null`,

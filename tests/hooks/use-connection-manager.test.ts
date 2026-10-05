@@ -6,13 +6,20 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { mockGlobalFetch, restoreGlobalFetch } from "../helpers/mock-fetch";
 
-import { useConnectionManager } from "@/hooks/use-connection-manager";
-import type { ManagedConnectionPayload } from "@/hooks/use-connection-payload";
+import {
+  MANAGED_REFRESH_DEFAULT_FLOOR_MS,
+  MANAGED_REFRESH_MAX_MS,
+  managedRefreshIntervalMs,
+  useConnectionManager,
+} from "@/hooks/use-connection-manager";
+import { SEED_CONFIG_UNREADABLE_REASON, type ManagedConnectionPayload } from "@/hooks/use-connection-payload";
+import { useTabManager } from "@/hooks/use-tab-manager";
 import { logger } from "@/lib/logger";
 import { storage } from "@/lib/storage";
 import type { DatabaseConnection } from "@/lib/types";
 import { rowWritableObjects } from "@/lib/db/detailed-object";
-import type { ProviderCapabilities } from "@/lib/db/types";
+import type { ObjectReadRange, ProviderCapabilities } from "@/lib/db/types";
+import { SAMPLED_MARKER } from "../fixtures/sampled-schema";
 
 // ── Test Data ───────────────────────────────────────────────────────────────
 
@@ -61,7 +68,13 @@ const providerMeta = (objectKinds: unknown = PG_OBJECT_KINDS) => ({
   json: { capabilities: { queryLanguage: "sql", containerLevels: [{ id: "schema" }], objectKinds }, labels: {} },
 });
 
-type InventoryObject = { name: string; kind: string; path: string[]; rowCount?: number };
+type InventoryObject = {
+  name: string;
+  kind: string;
+  path: string[];
+  rowCount?: number;
+  readRanges?: readonly ObjectReadRange[];
+};
 
 /** The two tables every schema test below reads, as the object surface answers them. */
 const OBJECTS: InventoryObject[] = [
@@ -266,6 +279,30 @@ describe("useConnectionManager", () => {
     expect(inventoryCall![1]?.method).toBe("POST");
   });
 
+  test("the session's default container is held with the schema and cleared with it (#1397)", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, [], { defaultContainer: ["public"] }),
+    });
+    const { result } = renderHook(() => useConnectionManager(true));
+    expect(result.current.defaultContainer).toBeUndefined();
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+    expect(result.current.defaultContainer).toEqual(["public"]);
+
+    // A failed read describes no connection's catalog, so the default goes with the objects.
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": async () => ({ ok: false, json: { error: "boom" } }),
+    });
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+    expect(result.current.defaultContainer).toBeUndefined();
+  });
+
   test("an object the read described nothing for keeps empty columns rather than vanishing", async () => {
     // A routine has no columns and a bounded read can stop before a folder: both reach the
     // hook as an object with no detail, and neither may cost the object its row.
@@ -444,6 +481,54 @@ describe("useConnectionManager", () => {
       await result.current.fetchSchema(makeConnection());
     });
 
+    expect(result.current.schemaContext).toBe(JSON.stringify(joined()));
+  });
+
+  /**
+   * etcd spec 3.4 and E13: a group's readable ranges are the connection's own grants, and a piece
+   * can be a single key. The schema keeps them, because the two generators read them off the
+   * schema entry, and `schemaContext` is what the AI panels post to the model, so it is the same
+   * JSON with the ranges left out.
+   */
+  test("schemaContext leaves out the readable ranges the schema itself keeps", async () => {
+    const ranges: readonly ObjectReadRange[] = [
+      { key: "grant-key-a" },
+      { prefix: "grant-prefix-b/" },
+      { start: "grant-start-c", end: "grant-end-d" },
+    ];
+    mockGlobalFetch(catalogRoutes([{ ...OBJECTS[0], readRanges: ranges }, OBJECTS[1]]));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schema[0]?.readRanges).toEqual(ranges);
+    expect(result.current.schemaContext).toBe(JSON.stringify(joined()));
+    expect(result.current.schemaContext).not.toContain("grant-");
+  });
+
+  /**
+   * A column the provider only inferred from sampled data stays in `schema`, which the human
+   * views read, and never reaches `schemaContext`, which the AI panels send to a model.
+   */
+  test("schemaContext leaves out a column the engine only inferred from sampled data", async () => {
+    const sampled = { name: SAMPLED_MARKER, type: "text", nullable: true, isPrimary: false, provenance: "sampled" };
+    const details = [{ ...DETAILS[0], columns: [...DETAILS[0].columns, sampled] }, DETAILS[1]];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, [], {}, PG_OBJECT_KINDS, details),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schema[0]?.columns.map((column) => column.name)).toContain(SAMPLED_MARKER);
+    expect(result.current.schemaContext).not.toContain(SAMPLED_MARKER);
     expect(result.current.schemaContext).toBe(JSON.stringify(joined()));
   });
 
@@ -1068,6 +1153,786 @@ describe("useConnectionManager", () => {
       warnSpy.mockRestore();
     }
   });
+  // ── Managed refresh interval (#1502) ──────────────────────────────────────
+
+  describe("managed refresh interval", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    test("follows the server's cacheHint above the floor", () => {
+      expect(managedRefreshIntervalMs(12000)).toBe(12000);
+    });
+
+    test("never refreshes faster than the floor, which defaults to five seconds", () => {
+      expect(MANAGED_REFRESH_DEFAULT_FLOOR_MS).toBe(5000);
+      expect(managedRefreshIntervalMs(null)).toBe(5000);
+      expect(managedRefreshIntervalMs(1000)).toBe(5000);
+      expect(managedRefreshIntervalMs(0)).toBe(5000);
+    });
+
+    test("never waits longer than the cap", () => {
+      expect(MANAGED_REFRESH_MAX_MS).toBe(60000);
+      expect(managedRefreshIntervalMs(600000)).toBe(60000);
+    });
+
+    test("NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS moves the floor, and the cap still holds", () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      expect(managedRefreshIntervalMs(null)).toBe(25);
+      expect(managedRefreshIntervalMs(40)).toBe(40);
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "90000";
+      expect(managedRefreshIntervalMs(null)).toBe(60000);
+    });
+
+    test("a floor that is not a number falls back to the default", () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "soon";
+      expect(managedRefreshIntervalMs(null)).toBe(5000);
+    });
+  });
+  // ── Managed connection refresh (#1502) ────────────────────────────────────
+
+  const firstManaged = () =>
+    makeManagedConnection({ id: "managed-1", managed: true, seedId: "seed-1", name: "First DB" });
+  const secondManaged = () =>
+    makeManagedConnection({ id: "managed-2", managed: true, seedId: "seed-2", name: "Second DB" });
+  const healthy = { ok: true, json: { status: "healthy" } };
+  const focusWindow = () => {
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+  };
+  const announceVisibility = () => {
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+  };
+  /** happy-dom always reports "visible"; an own accessor shadows its prototype getter until removed. */
+  const setVisibility = (state: DocumentVisibilityState) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  };
+
+  describe("managed connection refresh", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+      Reflect.deleteProperty(document, "visibilityState");
+    });
+
+    test("a new managed connection appears when the window regains focus", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "managed-2"]);
+      });
+      expect(managedCallCount(fetchMock)).toBe(2);
+    });
+
+    test("a new managed connection appears on the interval, with no event at all", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [] : [firstManaged()] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(
+        () => {
+          expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1"]);
+        },
+        { timeout: 3000 },
+      );
+      expect(result.current.activeConnection?.id).toBe("managed-1");
+    });
+
+    test("the interval follows the server's cacheHint when it is above the floor", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()], cacheHint: 60000 } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      await sleep(200);
+      expect(managedCallCount(fetchMock)).toBe(1);
+    });
+
+    test("the document becoming visible refreshes at once, and becoming hidden does not", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      setVisibility("hidden");
+      announceVisibility();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(1);
+
+      setVisibility("visible");
+      announceVisibility();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "managed-2"]);
+      });
+      expect(managedCallCount(fetchMock)).toBe(2);
+    });
+
+    test("nothing is fetched while the tab is hidden, and the interval resumes once it is visible", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      setVisibility("hidden");
+      await sleep(50);
+      const hiddenCount = managedCallCount(fetchMock);
+      await sleep(200);
+      expect(managedCallCount(fetchMock)).toBe(hiddenCount);
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(hiddenCount);
+
+      setVisibility("visible");
+      await waitFor(
+        () => {
+          expect(managedCallCount(fetchMock)).toBeGreaterThan(hiddenCount);
+        },
+        { timeout: 3000 },
+      );
+    });
+
+    test("a refresh in flight absorbs further triggers until it answers", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let release = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = () => resolve();
+      });
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": async () => {
+          managedCalls += 1;
+          const connections = managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()];
+          if (managedCalls === 2) await held;
+          return { ok: true, json: { connections } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      focusWindow();
+      focusWindow();
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(2);
+
+      release();
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(2);
+      });
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(3);
+      });
+    });
+
+    test("nothing is fetched before storage is ready", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()] } },
+        "/api/db/health": healthy,
+      });
+
+      renderHook(() => useConnectionManager(false));
+      focusWindow();
+      announceVisibility();
+      await sleep(150);
+      expect(managedCallCount(fetchMock)).toBe(0);
+    });
+
+    test("no refresh starts after an initial fetch that answered non-OK", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { status: 503, json: { error: "warming up" } },
+        "/api/db/health": healthy,
+      });
+
+      renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(1);
+      });
+      await sleep(150);
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(1);
+    });
+
+    test("no refresh starts after an initial fetch that threw", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          throw new Error("offline");
+        },
+        "/api/db/health": healthy,
+      });
+
+      renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(1);
+      });
+      await sleep(150);
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(1);
+    });
+
+    test("a failed refresh changes nothing, served seeds included", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      const debugSpy = spyOn(logger, "debug").mockImplementation(() => {});
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          if (managedCalls === 1) return { ok: true, json: { connections: [firstManaged()] } };
+          if (managedCalls === 2) {
+            return {
+              status: 500,
+              json: { error: "Failed to load managed connections", reason: SEED_CONFIG_UNREADABLE_REASON },
+            };
+          }
+          throw new Error("network down");
+        },
+        "/api/db/health": healthy,
+      });
+
+      try {
+        const { result } = renderHook(() => useConnectionManager(true));
+        await waitFor(() => {
+          expect(result.current.connections).toHaveLength(1);
+        });
+        const before = result.current.connections;
+
+        // A non-OK answer, attributed to the seed configuration: a quiet refresh never records that
+        // (only the initial load and the pending-seed poll may), so the served seeds stay loaded and the
+        // list stays the same object.
+        focusWindow();
+        await waitFor(() => {
+          expect(managedCallCount(fetchMock)).toBe(2);
+        });
+        await sleep(50);
+        expect(result.current.connections).toBe(before);
+        expect(result.current.servedSeeds).toEqual({ loaded: true, seeds: [firstManaged()] });
+
+        // A rejected request: logged, nothing else.
+        focusWindow();
+        await waitFor(() => {
+          expect(debugSpy).toHaveBeenCalledWith("Managed connection refresh failed", {
+            route: "use-connection-manager",
+            error: "network down",
+          });
+        });
+        expect(result.current.connections).toBe(before);
+        expect(result.current.servedSeeds).toEqual({ loaded: true, seeds: [firstManaged()] });
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+
+    test("unmount removes the focus and visibility listeners and the timer", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result, unmount } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+      unmount();
+
+      const atUnmount = managedCallCount(fetchMock);
+      await sleep(150);
+      focusWindow();
+      announceVisibility();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(atUnmount);
+    });
+  });
+  describe("managed connection withdrawal", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    test("an empty managed list withdraws the managed entries and leaves only the user's own", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [firstManaged()] : [] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "plain-1"]);
+      });
+      expect(result.current.activeConnection?.id).toBe("managed-1");
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["plain-1"]);
+      });
+      expect(result.current.activeConnection?.id).toBe("plain-1");
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "First DB is no longer available.",
+      });
+    });
+
+    test("the active connection keeps its object identity while it is still listed", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-1");
+      });
+      const activeBefore = result.current.activeConnection;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(2);
+      });
+      // A new object for the same id would reset the transaction, discard edits and re-read
+      // the schema in Studio's connection-change effect.
+      expect(result.current.activeConnection).toBe(activeBefore);
+      // The list carries that same object: every way of picking a connection passes the list's entry to
+      // setActiveConnection, so a fresh copy there would re-run Studio's effect on a click on the open one.
+      expect(result.current.connections.find((c) => c.id === "managed-1")).toBe(
+        result.current.activeConnection ?? undefined,
+      );
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+
+    test("the user's own active connection stays the list's entry after a refresh with no managed connection", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("plain-1");
+      });
+      const activeBefore = result.current.activeConnection;
+      const listBefore = result.current.connections;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections).not.toBe(listBefore);
+      });
+      expect(managedCallCount(fetchMock)).toBe(2);
+      expect(result.current.activeConnection).toBe(activeBefore);
+      expect(result.current.connections.find((c) => c.id === "plain-1")).toBe(
+        result.current.activeConnection ?? undefined,
+      );
+    });
+
+    test("a withdrawn active connection falls back to the first remaining one with exactly one notice", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.setActiveConnectionId("managed-2");
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged(), secondManaged()] : [firstManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-2");
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-1");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1"]);
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "Second DB is no longer available.",
+      });
+
+      // The next refresh finds the new active connection listed and says nothing more.
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(3);
+      });
+      await sleep(50);
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+    });
+
+    test("withdrawing the last connection leaves none active, with exactly one notice", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [firstManaged()] : [] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-1");
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections).toEqual([]);
+      });
+      expect(result.current.activeConnection).toBeNull();
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "First DB is no longer available.",
+      });
+
+      // Two more refreshes find nothing to withdraw and say nothing more.
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(3);
+      });
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(4);
+      });
+      await sleep(50);
+      expect(result.current.activeConnection).toBeNull();
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+    });
+
+    test("withdrawing another connection keeps the active one, wherever it sits in the list, with no notice", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      storage.setActiveConnectionId("plain-1");
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged(), secondManaged()] : [firstManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("plain-1");
+      });
+      const activeBefore = result.current.activeConnection;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "plain-1"]);
+      });
+      expect(result.current.activeConnection).toBe(activeBefore);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+  });
+
+  // ALLOW_CUSTOM_CONNECTIONS off (contract A3.4): the refresh keeps, falls back to and makes active
+  // only a connection the policy view lists, so it never opens one the server refuses.
+  describe("managed connection refresh under the custom connections policy", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    // Seeds as the route lists them, in the `seed:` namespace the policy keeps.
+    const ordersSeed = () =>
+      makeManagedConnection({ id: "seed:orders", managed: true, seedId: "orders", name: "Orders" });
+    const billingSeed = () =>
+      makeManagedConnection({ id: "seed:billing", managed: true, seedId: "billing", name: "Billing" });
+    const refusingPolicy = { ok: true, json: { customConnections: false } };
+    const sandboxCopy = () =>
+      makeConnection({ id: "seed:sandbox", seedId: "sandbox", name: "Sandbox copy", managed: false });
+
+    test("a refresh lists the seeds it finds and keeps the user's own connections stored but hidden", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [ordersSeed()] : [ordersSeed(), billingSeed()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders"]);
+      const active = result.current.activeConnection;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:billing"]);
+      });
+      expect(result.current.activeConnection).toBe(active);
+      expect(storage.getConnections().map((c) => c.id)).toEqual(["plain-1"]);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+
+    test("a withdrawn active seed falls back to the first remaining connection the policy shows, never to a hidden one", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      // Stored first, so it heads the user's own list that the empty answer leaves.
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      storage.saveConnection(sandboxCopy());
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [ordersSeed()] : [] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:sandbox");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:sandbox"]);
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "Orders is no longer available.",
+      });
+      expect(storage.getConnections().map((c) => c.id)).toEqual(["plain-1", "seed:sandbox"]);
+    });
+
+    test("a hidden connection made active counts as none, so a refresh makes the first connection the policy shows active", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      const own = makeConnection({ id: "plain-1", name: "Plain" });
+      storage.saveConnection(own);
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": { ok: true, json: { connections: [ordersSeed()] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+
+      // The shell can still hand over a connection the policy hides, from a dialog opened before
+      // the policy answered; the raw state then holds it while the view reports none.
+      act(() => {
+        result.current.setActiveConnection(own);
+      });
+      expect(result.current.activeConnection).toBeNull();
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders"]);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+
+    test("with nothing active, a refresh makes the first connection the policy shows active, never a hidden one", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": { ok: true, json: { connections: [] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      // The first load answered, so the refresh is listening, and it found nothing the policy shows.
+      await waitFor(() => {
+        expect(result.current.servedSeeds).toEqual({ loaded: true, seeds: [] });
+      });
+      expect(result.current.connections).toEqual([]);
+      expect(result.current.activeConnection).toBeNull();
+
+      // An unmanaged seed's copy reaches storage behind the hidden connection, so the user's own
+      // list the next empty answer leaves is [plain-1, seed:sandbox].
+      storage.saveConnection(sandboxCopy());
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:sandbox");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:sandbox"]);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("managed connection refresh and the open editor", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    // Studio's connection-change effect resets the transaction, discards pending edits and reads
+    // the schema again whenever the active connection's object changes (src/components/Studio.tsx),
+    // and the tab manager reloads its tabs whenever that connection's id changes
+    // (src/hooks/use-tab-manager.ts), so a refresh that changes nothing, or fails, has to hand back
+    // the same active object.
+    test("a refresh that changes nothing, or fails, leaves the open connection, its tabs and the user's own connections as they were, and says nothing", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      const debugSpy = spyOn(logger, "debug").mockImplementation(() => {});
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      // The route stamps createdAt afresh on every request, so an unchanged list still differs there.
+      const unchanged = { ...firstManaged(), createdAt: "2026-01-02T00:00:05.000Z" };
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          if (managedCalls === 1) return { ok: true, json: { connections: [firstManaged()] } };
+          if (managedCalls === 2) return { ok: true, json: { connections: [unchanged] } };
+          if (managedCalls === 3) return { status: 503, json: { error: "warming up" } };
+          if (managedCalls === 4) {
+            return {
+              status: 500,
+              json: { error: "Failed to load managed connections", reason: SEED_CONFIG_UNREADABLE_REASON },
+            };
+          }
+          throw new Error("network down");
+        },
+        "/api/db/health": healthy,
+      });
+
+      try {
+        const { result } = renderHook(() => {
+          const conn = useConnectionManager(true);
+          const tabs = useTabManager({
+            activeConnection: conn.activeConnection,
+            metadata: null,
+            schema: conn.schema,
+            persistWorkspace: true,
+          });
+          return { conn, tabs };
+        });
+        await waitFor(() => {
+          expect(result.current.conn.activeConnection?.id).toBe("managed-1");
+        });
+        act(() => result.current.tabs.addTab());
+        act(() => result.current.tabs.updateCurrentTab({ query: "SELECT 1" }));
+        const { tabs, activeTabId } = result.current.tabs;
+        const active = result.current.conn.activeConnection;
+        const stored = storage.getConnections();
+        expect(tabs).toHaveLength(2);
+
+        const refreshAndSettle = async (calls: number) => {
+          focusWindow();
+          await waitFor(() => {
+            expect(managedCallCount(fetchMock)).toBe(calls);
+          });
+          await sleep(50);
+        };
+        // One unchanged answer, then three failures in a row: a non-OK answer, one the server
+        // blames on its seed configuration, and a request that fails outright.
+        await refreshAndSettle(2);
+        await refreshAndSettle(3);
+        await refreshAndSettle(4);
+        await refreshAndSettle(5);
+
+        expect(result.current.conn.activeConnection).toBe(active);
+        // The list hands the same object to whatever picks the connection again.
+        expect(active).toBe(result.current.conn.connections[0]);
+        expect(result.current.conn.connections.map((c) => c.id)).toEqual(["managed-1", "plain-1"]);
+        expect(result.current.conn.servedSeeds).toEqual({ loaded: true, seeds: [unchanged] });
+        expect(storage.getConnections()).toEqual(stored);
+        expect(storage.getActiveConnectionId()).toBe("managed-1");
+        expect(result.current.tabs.tabs).toBe(tabs);
+        expect(result.current.tabs.activeTabId).toBe(activeTabId);
+        expect(result.current.tabs.currentTab.query).toBe("SELECT 1");
+        expect(mockToastSuccess).not.toHaveBeenCalled();
+        expect(mockToastError).not.toHaveBeenCalled();
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+  });
 });
 
 // =============================================================================
@@ -1295,8 +2160,8 @@ describe("deferring the object scan", () => {
 // mutation that removes the tagging turns them red.
 //
 // The inventory fake below answers the way the ROUTE answers, kinds filter included, rather
-// than replaying one fixed list. `resolveKinds` (`src/lib/api/object-route.ts:227`) returns
-// EVERY declared kind when the body names none, so a fake that ignored the field would be
+// than replaying one fixed list. `resolveKinds` in `src/lib/api/object-route.ts` returns
+// EVERY enumerable kind when the body names none, so a fake that ignored the field would be
 // green for a request that asks for all seven kinds and for one that asks for three, which
 // is exactly the difference the fix round exists to make.
 describe("the object inventory the explorer reads", () => {
@@ -1605,5 +2470,206 @@ describe("the object inventory the explorer reads", () => {
     expect(result.current.schema.map((object) => object.name)).toEqual(["users", "orders"]);
     expect(result.current.schemaError).toBeNull();
     expect(mockToastError).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// ALLOW_CUSTOM_CONNECTIONS: what the editor lists and makes active
+// =============================================================================
+//
+// The server refuses a connection of the user's own while custom connections are off, so the
+// hook lists only what the server opens and never makes anything else active. Seeds stay,
+// the editable copy of an unmanaged seed included, because its id is still `seed:<id>`.
+describe("the custom connections policy", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  const managedSeed = {
+    id: "seed:orders",
+    seedId: "orders",
+    name: "Orders",
+    type: "postgres",
+    host: "orders-db",
+    createdAt: "2026-10-01T00:00:00.000Z",
+    managed: true,
+  };
+  const editableSeed = {
+    id: "seed:sandbox",
+    seedId: "sandbox",
+    name: "Sandbox",
+    type: "postgres",
+    host: "sandbox-db",
+    createdAt: "2026-10-01T00:00:00.000Z",
+    managed: false,
+  };
+  const own = makeConnection({ id: "own-1", name: "My own", host: "anywhere.example" });
+
+  const routes = (policy: { status?: number; json: unknown }) => ({
+    "/api/connections/policy": policy,
+    "/api/connections/managed": { json: { connections: [managedSeed, editableSeed] } },
+    "/api/db/health": { json: { status: "healthy" } },
+  });
+
+  test("a server that refuses custom connections lists the seeds only, the editable one included", async () => {
+    storage.saveConnection(own);
+    mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:sandbox"]);
+    });
+    expect(result.current.customConnections).toBe(false);
+    expect(storage.getConnections().some((c) => c.id === "own-1")).toBe(true);
+  });
+
+  test("the first active connection is one the server will open, whatever was saved", async () => {
+    storage.saveConnection(own);
+    storage.setActiveConnectionId("own-1");
+    mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:orders");
+    });
+  });
+
+  test("without the managed list, the stored connections obey the policy too", async () => {
+    storage.saveConnection(own);
+    storage.saveConnection(
+      makeConnection({ id: "seed:sandbox", seedId: "sandbox", name: "Sandbox copy", managed: false }),
+    );
+    mockGlobalFetch({
+      "/api/connections/policy": { json: { customConnections: false } },
+      "/api/connections/managed": { status: 404, json: { error: "Not found" } },
+      "/api/db/health": { json: { status: "healthy" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:sandbox");
+    });
+    expect(result.current.connections.map((c) => c.id)).toEqual(["seed:sandbox"]);
+  });
+
+  test("a refused connection made active later is reported as none and is never health-checked", async () => {
+    storage.saveConnection(own);
+    const fetchMock = mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:orders");
+    });
+
+    act(() => {
+      result.current.setActiveConnection(own);
+    });
+
+    expect(result.current.activeConnection).toBeNull();
+    expect(result.current.connectionPulse).toBeNull();
+    expect(result.current.objectScanDeferred).toBe(false);
+    const healthBodies = fetchMock.mock.calls
+      .filter((call) => String(call[0]).includes("/api/db/health"))
+      .map((call) => String((call[1] as RequestInit | undefined)?.body));
+    expect(healthBodies.length).toBeGreaterThan(0);
+    expect(healthBodies.some((body) => body.includes("own-1"))).toBe(false);
+  });
+
+  test("a server that allows them lists every connection, as before", async () => {
+    storage.saveConnection(own);
+    mockGlobalFetch(routes({ json: { customConnections: true } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:sandbox", "own-1"]);
+    });
+    expect(result.current.customConnections).toBe(true);
+  });
+
+  // An operator who switches custom connections off on a Studio whose users already saved
+  // connections of their own hides those connections and refuses them, and deletes nothing: their
+  // records, and the favorite, order and group entries that name them, are still in storage after
+  // a load under the refusal, and the first load after the switch is back on lists them again and
+  // opens one when it is chosen. The load may add the unmanaged seed's editable copy and move the
+  // saved active id to a seed, as it does with the switch on; nothing that belongs to the user's
+  // own connections changes.
+  test("switched off, the user's stored connections are hidden and refused but never deleted, and switched back on they are listed again", async () => {
+    const second = makeConnection({ id: "own-2", name: "My second", host: "elsewhere.example" });
+    storage.saveConnection(own);
+    storage.saveConnection(second);
+    storage.setActiveConnectionId("own-1");
+    storage.toggleFavoriteConnection("own-1");
+    storage.setConnectionOrder(["own-2", "own-1"]);
+    storage.setConnectionGroups([{ id: "group-1", name: "Mine", collapsed: false, connectionIds: ["own-2"] }]);
+    const storedOwn = storage.getConnections();
+    const expectOwnStateKept = () => {
+      expect(storage.getConnections().filter((c) => !c.id.startsWith("seed:"))).toEqual(storedOwn);
+      expect(storage.getFavoriteConnectionIds()).toEqual(["own-1"]);
+      expect(storage.getConnectionOrder()).toEqual(["own-2", "own-1"]);
+      expect(storage.getConnectionGroups()).toEqual([
+        { id: "group-1", name: "Mine", collapsed: false, connectionIds: ["own-2"] },
+      ]);
+    };
+    const healthCheckedFor = (fetchMock: ReturnType<typeof mockGlobalFetch>, id: string) =>
+      fetchMock.mock.calls.some(
+        (call) =>
+          String(call[0]).includes("/api/db/health") &&
+          String((call[1] as RequestInit | undefined)?.body).includes(`"id":"${id}"`),
+      );
+
+    const whileOff = mockGlobalFetch(routes({ json: { customConnections: false } }));
+    const switchedOff = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(switchedOff.result.current.activeConnection?.id).toBe("seed:orders");
+    });
+    expect(switchedOff.result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:sandbox"]);
+    await act(async () => {
+      switchedOff.result.current.setActiveConnection(second);
+    });
+    expect(switchedOff.result.current.activeConnection).toBeNull();
+    expect(healthCheckedFor(whileOff, "own-2")).toBe(false);
+    expectOwnStateKept();
+    switchedOff.unmount();
+    restoreGlobalFetch();
+
+    const whileOn = mockGlobalFetch(routes({ json: { customConnections: true } }));
+    const switchedOn = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(switchedOn.result.current.connections.map((c) => c.id)).toEqual([
+        "seed:orders",
+        "seed:sandbox",
+        "own-1",
+        "own-2",
+      ]);
+    });
+    await act(async () => {
+      switchedOn.result.current.setActiveConnection(second);
+    });
+    expect(switchedOn.result.current.activeConnection?.id).toBe("own-2");
+    expect(healthCheckedFor(whileOn, "own-2")).toBe(true);
+    expect(switchedOn.result.current.customConnections).toBe(true);
+    expectOwnStateKept();
+  });
+
+  test("the policy is read once per mount", async () => {
+    const fetchMock = mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.customConnections).toBe(false);
+    });
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:orders");
+    });
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]).includes("/api/connections/policy"))).toHaveLength(1);
   });
 });

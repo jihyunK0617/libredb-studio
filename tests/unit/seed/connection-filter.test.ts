@@ -167,6 +167,24 @@ describe("filterByRoles: engine-specific fields", () => {
     expect(managed.saslMechanism).toBe("SCRAM-SHA-512");
   });
 
+  it("carries a Db2 connection's consent to a cleartext password through (#786)", () => {
+    // Dropped here, the provider would refuse a seed whose file did set the consent.
+    const [managed] = filterByRoles([{ ...baseConn, type: "db2", port: 50000, allowInsecureAuth: true }], ["user"]);
+    const [none] = filterByRoles([{ ...baseConn, type: "db2", port: 50000 }], ["user"]);
+
+    expect(managed.allowInsecureAuth).toBe(true);
+    expect(none.allowInsecureAuth).toBeUndefined();
+  });
+
+  it("a seed's dataServers is copied onto the managed connection", () => {
+    const result = filterByRoles([{ ...baseConn, dataServers: "a.internal:6648 b.internal:6648" }], ["user"]);
+    const [none] = filterByRoles([{ ...baseConn }], ["user"]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].dataServers).toBe("a.internal:6648 b.internal:6648");
+    expect(none.dataServers).toBeUndefined();
+  });
+
   it("leaves the mechanism absent on a seeded connection that names none", () => {
     const [managed] = filterByRoles([{ ...baseConn, type: "kafka", port: 9092 }], ["user"]);
 
@@ -230,5 +248,31 @@ describe("filterByRoles", () => {
       ["user"],
     );
     expect(result).toHaveLength(0);
+  });
+});
+
+describe("filterByRoles: the read-only mode (#1089)", () => {
+  it("carries a seeded connection's mode through, because the mapper is a hand-written field list", () => {
+    // The load refuses the mode on an engine that does not enforce it; this pins the copy alone.
+    const [managed] = filterByRoles([{ ...baseConn, readOnly: true }], ["admin"]);
+    expect(managed.readOnly).toBe(true);
+  });
+
+  it("leaves it absent for a seed that does not set it", () => {
+    const [managed] = filterByRoles([{ ...baseConn }], ["admin"]);
+    expect(managed.readOnly).toBeUndefined();
+  });
+
+  it("refuses a read-only seed built in memory as unmanaged, naming the seed and both fields", () => {
+    expect(() => filterByRoles([{ ...baseConn, readOnly: true, managed: false }], ["admin"])).toThrow(
+      'Seed connection "test" sets readOnly: true with managed: false.',
+    );
+  });
+
+  it("refuses the pair once defaults.managed: false has been merged, the order the loader runs them in", () => {
+    const merged = mergeDefaults({ ...baseConn, readOnly: true }, { managed: false });
+    expect(() => filterByRoles([merged], ["admin"])).toThrow(
+      'Seed connection "test" sets readOnly: true with managed: false.',
+    );
   });
 });

@@ -14,6 +14,9 @@ import {
   compatibleEnginesFor,
   connectableProductCount,
   EXTERNAL_DATABASE_TYPES,
+  isExternalDatabaseType,
+  MCP_EXPOSABLE,
+  READ_ONLY_ENFORCED,
   SHIPPED_DATABASE_TYPES,
 } from "@/lib/db/compatibility";
 import type { DatabaseType } from "@/lib/types";
@@ -271,25 +274,25 @@ describe("wire-compatibility registry", () => {
     expect(parade?.caveats.some((caveat) => caveat.includes("pg_indexes_size"))).toBe(false);
   });
 
-  test("Databend is query-editor-only because our own reads cannot run there", () => {
-    // Probed 2026-08-27 against `datafuselabs/databend:v1.2.925-patch-11`. SQL runs: a
-    // 2000-row `count(*)` and a plain `EXPLAIN` both answer, and the catalogs THEMSELVES
-    // answer when asked with literal SQL - `information_schema.tables` reported the true
-    // 3 and 2000 rows with sizes.
+  test("Databend is partial: the object browser answers and the monitoring panels have no source", () => {
+    // Probed 2026-08-27 against `datafuselabs/databend:v1.2.925-patch-11` and registered
+    // query-only, for a reason that was ours: Databend implements no prepared statement
+    // (`Prepare is not support in Databend.`), and every parameterised read went through
+    // mysql2's prepared protocol, so the table list, the schema and the statistics failed
+    // over catalogs that answered literal SQL in full.
     //
-    // The object browser still gets nothing, and the reason is ours: every parameterised
-    // read goes through mysql2's prepared protocol and Databend replies
-    // `Prepare is not support in Databend`. D8 moved the PARAMETERLESS statements to the
-    // text protocol; the ones carrying placeholders - the table list, the schema, sessions,
-    // table/index/storage stats - still prepare. So this row is `query-only` for what a
-    // user gets today, with the cause recorded as a backlog item rather than as the
-    // engine's fault.
+    // Re-measured 2026-10-04 on that image, on v1.2.925-patch-13 and on 1.2.881, through the
+    // provider and in a browser: the provider binds client-side on a server that refuses to
+    // prepare, and the tree, columns, table and storage stats and inline edit work. What is
+    // left is Databend's own - no SHOW STATUS, no process list, no ROUTINES/TRIGGERS/EVENTS
+    // views - which is `partial` by this registry's definition.
     const databend = compatibleEnginesFor("mysql").find((engine) => engine.name === "Databend");
-    expect(databend?.tier).toBe("query-only");
+    expect(databend?.tier).toBe("partial");
     expect(databend?.probedVersion).toBe("Databend v1.2.925-patch-11 (advertises MySQL 8.0.90)");
     const caveats = databend?.caveats.join(" ") ?? "";
     expect(caveats).toContain("Prepare is not support in Databend");
-    expect(caveats).toContain("information_schema.tables");
+    expect(caveats).toContain("SHOW STATUS");
+    expect(caveats).not.toContain("Nothing else does");
   });
 
   test("VictoriaMetrics is a Prometheus relative, recorded at the tier its gate-4 probe measured", () => {
@@ -397,6 +400,78 @@ describe("wire-compatibility registry", () => {
     expect(compatibleEnginesFor("not-a-database" as DatabaseType)).toEqual([]);
   });
 
+  test("db2 ships as an external driver, with the posture Oracle has (#786)", () => {
+    // IBM Db2 LUW over DRDA. No relative is recorded: z/OS and IBM i speak the same protocol and
+    // are out of scope until a live probe has measured one.
+    expect(SHIPPED_DATABASE_TYPES).toContain("db2");
+    expect(EXTERNAL_DATABASE_TYPES).toContain("db2");
+    expect(compatibleEnginesFor("db2")).toEqual([]);
+    // The provider enforces no read-only mode, so `readOnly: true` is refused, and MCP is offered,
+    // both as on Oracle.
+    expect(READ_ONLY_ENFORCED.db2).toBe(false);
+    expect(MCP_EXPOSABLE.db2).toBe(true);
+  });
+
+  test("qdrant ships as an external engine that keeps the read-only mode and is offered to MCP (vector-family spec 6.7, 10.2)", () => {
+    // A server the user already runs, reached over its REST API. No relative is recorded: Qdrant Cloud speaks the
+    // same API and is claimed nowhere until a test cluster passes gate 4 (vector-family spec 6.2).
+    expect(SHIPPED_DATABASE_TYPES).toContain("qdrant");
+    expect(isExternalDatabaseType("qdrant")).toBe(true);
+    expect(compatibleEnginesFor("qdrant")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.qdrant).toBe(true);
+    expect(MCP_EXPOSABLE.qdrant).toBe(true);
+    // The counts of vector-family spec 10.2, from the sets they count, with Milvus, both InfluxDB types and Oxia
+    // shipped too: each adds one external engine and no relative.
+    expect([SHIPPED_DATABASE_TYPES.length, EXTERNAL_DATABASE_TYPES.length, WIRE_COMPATIBLE_ENGINES.length]).toEqual([
+      27, 26, 28,
+    ]);
+    expect(connectableProductCount()).toBe(54);
+  });
+
+  test("milvus ships as an external engine that keeps the read-only mode and is offered to MCP (vector-family spec 5.7, 10.2)", () => {
+    // A server or cluster the user already runs, reached over its gRPC API. No relative is recorded: Zilliz Cloud
+    // speaks the same API and is claimed nowhere until a test cluster passes gate 4 (vector-family spec 5.2).
+    expect(SHIPPED_DATABASE_TYPES).toContain("milvus");
+    expect(isExternalDatabaseType("milvus")).toBe(true);
+    expect(compatibleEnginesFor("milvus")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.milvus).toBe(true);
+    expect(MCP_EXPOSABLE.milvus).toBe(true);
+    expect([SHIPPED_DATABASE_TYPES.length, EXTERNAL_DATABASE_TYPES.length, WIRE_COMPATIBLE_ENGINES.length]).toEqual([
+      27, 26, 28,
+    ]);
+    expect(connectableProductCount()).toBe(54);
+  });
+
+  test("influxdb and influxdb3 ship as external engines that keep the read-only mode and are offered to MCP (InfluxDB spec I2, I8, I13)", () => {
+    // Two servers the user already runs, one per query language, served from one provider directory. No relative is
+    // recorded: InfluxDB Cloud, Clustered and Enterprise 1.x are claimed nowhere until a gate-4 probe measures one.
+    for (const type of ["influxdb", "influxdb3"] as const) {
+      expect(SHIPPED_DATABASE_TYPES).toContain(type);
+      expect(isExternalDatabaseType(type)).toBe(true);
+      expect(compatibleEnginesFor(type)).toEqual([]);
+      expect(READ_ONLY_ENFORCED[type]).toBe(true);
+      expect(MCP_EXPOSABLE[type]).toBe(true);
+    }
+    // The union's 24 members plus the two and Oxia, less libredb; the relatives are unchanged.
+    expect([SHIPPED_DATABASE_TYPES.length, EXTERNAL_DATABASE_TYPES.length, WIRE_COMPATIBLE_ENGINES.length]).toEqual([
+      27, 26, 28,
+    ]);
+    expect(connectableProductCount()).toBe(54);
+  });
+
+  test("oxia ships as an external engine that keeps the read-only mode and is not offered to MCP (SB3-1.2)", () => {
+    // A server or cluster the user already runs, reached over Oxia's gRPC client API; no relative is recorded.
+    expect(SHIPPED_DATABASE_TYPES).toContain("oxia");
+    expect(isExternalDatabaseType("oxia")).toBe(true);
+    expect(compatibleEnginesFor("oxia")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.oxia).toBe(true);
+    expect(MCP_EXPOSABLE.oxia).toBe(false);
+    expect([SHIPPED_DATABASE_TYPES.length, EXTERNAL_DATABASE_TYPES.length, WIRE_COMPATIBLE_ENGINES.length]).toEqual([
+      27, 26, 28,
+    ]);
+    expect(connectableProductCount()).toBe(54);
+  });
+
   test("duckdb ships as a driver and is a relative of nothing", () => {
     // The negative half is the load-bearing one. DuckDB speaks no wire protocol at all -
     // it is an in-process library reading a file - so no engine can be compatible with
@@ -490,5 +565,26 @@ describe("wire-compatibility registry", () => {
         expect(caveat.trim().length).toBeGreaterThan(0);
       }
     }
+  });
+});
+
+/**
+ * `MCP_EXPOSABLE` (#1089): which engines a seed connection may expose to MCP clients. The seed schema
+ * reads it before it accepts `mcp: true`, so it answers for every shipped type-id and nothing else,
+ * and no reader can change an answer at run time. The refusal it drives is pinned in
+ * `tests/unit/seed/types.test.ts`.
+ */
+describe("MCP_EXPOSABLE (#1089)", () => {
+  test("answers for every shipped type-id and for nothing else", () => {
+    expect(Object.keys(MCP_EXPOSABLE).sort()).toEqual([...SHIPPED_DATABASE_TYPES].sort());
+  });
+
+  test("is frozen, so no reader can offer or withdraw MCP for an engine at run time", () => {
+    expect(Object.isFrozen(MCP_EXPOSABLE)).toBe(true);
+  });
+
+  test("offers MCP for every shipped engine but etcd and oxia (#1089 E12, SB3-1.2 R10)", () => {
+    // An engine MCP is not offered for answers false with its registration, and is named here then.
+    expect(SHIPPED_DATABASE_TYPES.filter((type) => MCP_EXPOSABLE[type] !== true)).toEqual(["etcd", "oxia"]);
   });
 });

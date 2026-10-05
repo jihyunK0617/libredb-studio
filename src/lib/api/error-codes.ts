@@ -38,6 +38,20 @@ export const ApiErrorCode = {
   LLM_STREAM: "LLM_STREAM",
   LLM_ERROR: "LLM_ERROR",
 
+  /**
+   * The request carries no session, or one that no longer verifies (#1420). Distinct from
+   * AUTH_ERROR, which is a database refusing its credentials while the Studio session is fine: the
+   * browser sends the user to sign in again for this code and only for this code.
+   */
+  AUTH_REQUIRED: "AUTH_REQUIRED",
+
+  /**
+   * The operator switched custom connections off (ALLOW_CUSTOM_CONNECTIONS) and the request supplied a
+   * connection of its own (403). Distinct from AUTH_ERROR, which the same 403 carries when the role
+   * filter refuses a seed: this refusal is the server's policy and no role or credential changes it.
+   */
+  CUSTOM_CONNECTIONS_DISABLED: "CUSTOM_CONNECTIONS_DISABLED",
+
   // Application rate limiting (distinct from LLM_RATE_LIMIT, which is the provider's limit)
   RATE_LIMITED: "RATE_LIMITED",
 

@@ -139,7 +139,7 @@ describe("guardRoute", () => {
     expect("response" in guard).toBe(true);
     const response = (guard as { response: Response }).response;
     expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "Authentication required" });
+    expect(await response.json()).toEqual({ error: "Authentication required", code: "AUTH_REQUIRED" });
   });
 
   test("still returns 401 when the permission_denied audit emit throws", async () => {
@@ -237,6 +237,8 @@ const ROUTES_WITHOUT_A_PROVIDER: Record<string, string> = {
   "admin/accounts/[email]":
     "same account registry as admin/accounts, one account at a time (PATCH and DELETE, no POST export)",
   "admin/audit": "reads/writes the in-process audit ring buffer only; no database or LLM provider",
+  "admin/discovery":
+    "reads the CapRover discovery status for the admin Overview card: an export file on disk, plus a bare TCP reachability probe for built-image candidates, and never a database or LLM provider (GET, no POST export). It still calls guardRoute with the query bucket and answers 403 to a non-admin (tests/api/admin/discovery.test.ts)",
   "agent/config":
     "answers whether the agent runtime is enabled, from process.env alone; no database or LLM provider (GET, no POST export). It still requires a session — a bare getSession() like connections/managed, because metering a visibility probe out of the ai bucket would spend a run's budget on rendering a panel — and tests/api/agent/config.test.ts proves an unauthenticated caller learns nothing about the flag",
   "agent/drive":
@@ -247,14 +249,21 @@ const ROUTES_WITHOUT_A_PROVIDER: Record<string, string> = {
     "hands back rows one run already stored, from process memory; no database or LLM provider is reached to answer it (GET, no POST export). Same guardRoute path as above, through src/lib/api/agent-run-access.ts, and tests/api/agent/artifacts.test.ts proves an unauthenticated caller gets 401 and reads nothing",
   "agent/runs/[runId]/stream":
     "follows one run's own durable ledger; no database or LLM provider (GET, no POST export). Same guardRoute path as above",
+  "auth/launch": "exchanges a platform launch token for a session; a session cannot be required before one exists",
   "auth/login": "authenticates the credential itself; a session cannot be required before one exists",
   "auth/totp":
     "enrols a TOTP secret on the caller's own stored account; the storage backend is not a user database or LLM provider",
+  "auth/passkey":
+    "manages passkeys on the caller's own stored account (list, register, rename, remove); the storage backend is not a user database or LLM provider",
+  "auth/passkey/sign-in": "authenticates a passkey assertion itself; a session cannot be required before one exists",
   "auth/logout": "clears the session cookie unconditionally; touches no provider either way",
   "auth/me": "reads the caller's own session claims only (GET, no POST export)",
   "auth/oidc/callback": "completes the OIDC exchange that CREATES the session (GET, no POST export)",
   "auth/oidc/login": "starts the OIDC redirect before a session exists (GET, no POST export)",
-  "connections/managed": "reads seed config metadata only; never opens a database connection (GET, no POST export)",
+  "connections/managed":
+    "reads seed config metadata and the CapRover discovery export; never opens a database connection, and its only network use is a bare node:net reachability probe for built-image candidates when SEED_DISCOVERY_PATH is set (GET, no POST export)",
+  "connections/policy":
+    "answers whether custom connections are allowed, from process.env alone (ALLOW_CUSTOM_CONNECTIONS); no database or LLM provider (GET, no POST export). It requires a session, a bare getSession() answering the session-required 401 like connections/managed, and tests/api/seed/policy-route.test.ts proves an unauthenticated caller learns nothing about the policy",
   health:
     "liveness only: returns a fixed body and touches nothing, so there is no provider to require a session for (GET, no POST export). The connection-scoped check is POST /api/db/health, which is not on this list",
   mcp: "reaches a provider, but is called by an MCP client of the user's own and verifies a scoped bearer token instead of a session (src/lib/mcp/bearer.ts): its 401 body differs from guardRoute's on purpose, and tests/security/mcp-auth.test.ts proves that no refused identity constructs a provider",
@@ -429,22 +438,44 @@ describe("routes that reach a provider require a session", () => {
     "@/lib/agent/run-service": `the run lifecycle service (pause/unpause/cancel/status), and it ${PROVIDER_NAMING_HELPER} (@/lib/db/operations/execution) - but only for releaseExecutionRun, which releases the run's in-process budget and artifacts, never a database or model`,
     "@/lib/api/account-response": "maps account-registry failures to HTTP responses; opens nothing",
     "@/lib/api/agent-run-access": "resolves a run id to its ledger behind guardRoute; reads no provider",
+    "@/lib/api/bounded-json": "reads a request body up to a byte limit; opens nothing",
     "@/lib/api/client-address": "parses the forwarded-for chain for the audit record",
     "@/lib/api/liveness": "builds the fixed liveness body; imports nothing and touches nothing",
     "@/lib/api/errors": `maps a thrown error to a response and ${PROVIDER_NAMING_HELPER} (@/lib/db/errors, @/lib/llm/types) for the error CLASSES alone - nearly every route imports it, and treating it as an entry point would fire on all fifteen`,
+    "@/lib/api/login-budget":
+      "the login failure budgets shared by every route that checks a password, a code or a passkey",
     "@/lib/api/rate-limit": "the in-process token buckets",
+    "@/lib/api/request-scheme":
+      "reads the request's scheme and host for a display-only plain-HTTP warning; opens nothing",
+    "@/lib/api/session-ended":
+      "the session-required 401 body and the return-path check for sign-in; data and string checks only",
     "@/lib/api/require-session": "guardRoute itself",
     "@/lib/audit": "the in-process audit ring buffer",
     "@/lib/auth": "session cookie minting and reading",
     "@/lib/auth-compare": "constant-time credential comparison",
     "@/lib/auth-errors": "the auth failure taxonomy",
     "@/lib/config/base-path": "prefixes redirect URLs and cookie paths; these routes use no fetch or provider",
+    "@/lib/config/custom-connections":
+      "reads ALLOW_CUSTOM_CONNECTIONS from process.env and logs an unrecognised value once; opens nothing",
+    "@/lib/is-record": "a plain-object type guard; data only",
+    "@/lib/launch/config": "reads the three LAUNCH_TOKEN_* variables; opens nothing",
+    "@/lib/launch/verify":
+      "verifies a launch token with jose and spends its jti in an in-process map; computation only",
     "@/lib/local-accounts":
       "the local account registry on the app's storage backend; opens no user database or LLM provider",
+    "@/lib/passkey/management":
+      "passkey registration and management on the caller's own stored account in the app's storage backend; no user database or LLM provider",
+    "@/lib/passkey/policy": "passkey limits and constants; data only",
+    "@/lib/passkey/sign-in": "passkey sign-in against the app's own account store; no user database or LLM provider",
+    "@/lib/passkey/webauthn": "WebAuthn verification through @simplewebauthn/server; computation only",
     "@/lib/password-hash": "scrypt for stored account passwords; no provider",
     "@/lib/logger": "structured logging",
+    "@/lib/non-finite": "writes NaN and the infinities in held rows as words; pure, imports nothing",
     "@/lib/oidc": "the OIDC discovery and PKCE exchange",
-    "@/lib/seed": "reads seed connection metadata from config; never connects",
+    "@/lib/seed":
+      "reads seed connection metadata from config and the CapRover discovery export; its only network use is a bare node:net reachability probe for built-image candidates, through ./discovery-loader, never a database or LLM provider",
+    "@/lib/seed/discovery-loader":
+      "reads the CapRover discovery export file and builds its status; its only network use is a bare node:net reachability probe for built-image candidates, never a database or LLM provider",
     "@/lib/storage/connection-secrets":
       "the credential field classification; withoutSecretFields copies a connection record without its secrets and opens nothing",
     "@/lib/storage/factory": "the app's own storage backend (STORAGE_PROVIDER), not a user database",
@@ -578,7 +609,7 @@ describe("routes that reach a provider require a session", () => {
       const res = await POST(req as never);
 
       expect(res.status).toBe(401);
-      expect(await res.json()).toEqual({ error: "Authentication required" });
+      expect(await res.json()).toEqual({ error: "Authentication required", code: "AUTH_REQUIRED" });
     });
   }
 });

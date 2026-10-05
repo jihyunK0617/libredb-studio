@@ -173,6 +173,17 @@ describe("CommandPalette", () => {
     expect(queryByText("products")).not.toBeNull();
   });
 
+  test("offers no New Connection action when the shell offers none", () => {
+    const { queryByText, rerender } = render(<CommandPalette {...createDefaultProps()} />);
+    fireEvent.keyDown(document, { key: "k", code: "KeyK", metaKey: true });
+    expect(queryByText("New Connection")).not.toBeNull();
+
+    rerender(<CommandPalette {...createDefaultProps({ onAddConnection: undefined })} />);
+
+    expect(queryByText("New Connection")).toBeNull();
+    expect(queryByText("Run Query")).not.toBeNull();
+  });
+
   test('active connection gets "Active" badge', () => {
     const props = createDefaultProps({
       activeConnection: mockPostgresConnection,
@@ -286,6 +297,16 @@ describe("CommandPalette", () => {
     fireEvent.keyDown(document, { key: "k", code: "KeyK", metaKey: true });
 
     // Schema Diagram (ERD) should not be rendered
+    expect(queryByText("Schema Diagram (ERD)")).toBeNull();
+  });
+
+  test("Schema Diagram is hidden on a connection declaring Cypher (SR20)", () => {
+    const capabilities = { queryLanguage: "cypher", objectKinds: [] } as unknown as ProviderCapabilities;
+    const props = createDefaultProps({ activeConnection: mockPostgresConnection, capabilities });
+    const { queryByText } = render(<CommandPalette {...props} />);
+
+    fireEvent.keyDown(document, { key: "k", code: "KeyK", metaKey: true });
+
     expect(queryByText("Schema Diagram (ERD)")).toBeNull();
   });
 

@@ -36,7 +36,7 @@
  * the runner is what enforces it: one bun process per test file, no directory and no
  * registration, and `bun test tests/unit` is clean again.
  */
-import { describe, test, expect, mock, beforeEach, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, mock, beforeEach, beforeAll, afterAll, spyOn } from "bun:test";
 import { open as libreOpen, kv as libreKv } from "@libredb/libredb";
 import { captureContextSnapshot } from "@/lib/agent/context-snapshot";
 import { AgentRunDeadline } from "@/lib/agent/deadline";
@@ -52,9 +52,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, relative as relativePath } from "node:path";
 import type { DatabaseConnection, ReadOnlyStatementBudget } from "@/lib/db/types";
-import { ExecutionProfileError } from "@/lib/db/errors";
-import { SHIPPED_DATABASE_TYPES } from "@/lib/db/compatibility";
+import { DatabaseConfigError, ExecutionProfileError } from "@/lib/db/errors";
+import { READ_ONLY_ENFORCED, SHIPPED_DATABASE_TYPES } from "@/lib/db/compatibility";
 import { connectionFingerprint } from "@/lib/db/connection-fingerprint";
+import { supportsQueryCancel } from "@/lib/db/query-cancel";
 import type { SSHTunnelConfig } from "@/lib/types";
 
 /** Enforcement caps for the sqlite agent-profile assertions below. */
@@ -125,7 +126,9 @@ const mockPgPool = {
 
 // The provider imports `types` from pg for its per-pool parsers, so the mock has to export
 // it. These rows never reach a parser, and the real registry is passed rather than a stub.
-const { types: realPgTypes } = await import("pg");
+// `Client` likewise: the provider subclasses it to keep server notices (#1401), and the
+// mocked pool never builds one.
+const { types: realPgTypes, Client: realPgClient } = await import("pg");
 
 mock.module("pg", () => ({
   default: {
@@ -140,6 +143,7 @@ mock.module("pg", () => ({
       return mockPgPool;
     }
   },
+  Client: realPgClient,
   types: realPgTypes,
 }));
 
@@ -357,8 +361,10 @@ const {
   registerShutdownHandlers,
   acquireExecutionProfileProvider,
   findOpenSingleWriterProvider,
+  isSingleWriterFileOpen,
   getExecutionProfileCacheStats,
   withOneShotTunnel,
+  assertReadOnlyHonoured,
 } = await import("@/lib/db/factory");
 if (nodeEnvBefore === undefined) {
   delete (process.env as Record<string, string>).NODE_ENV;
@@ -468,6 +474,13 @@ describe("createDatabaseProvider", () => {
     expect(provider.type).toBe("oracle");
   });
 
+  test('creates provider for type "db2"', async () => {
+    const conn = makeConnection("db2");
+    const provider = await createDatabaseProvider(conn);
+    expect(provider).toBeDefined();
+    expect(provider.type).toBe("db2");
+  });
+
   test('creates provider for type "mssql"', async () => {
     const conn = makeConnection("mssql");
     const provider = await createDatabaseProvider(conn);
@@ -546,6 +559,58 @@ describe("createDatabaseProvider", () => {
     expect(provider.getCapabilities().queryLanguage).toBe("promql");
   });
 
+  test('creates provider for type "influxdb"', async () => {
+    // No `database`: an empty one lists every database the credential reads, resolved in connect(). The
+    // constructor validates nothing and opens nothing, so the provider is built, and declares its language with no
+    // dialect, its read-only enforcement and no maintenance, with no server running.
+    const conn = makeConnection("influxdb", { port: 8086, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("influxdb");
+    const capabilities = provider.getCapabilities();
+    expect(capabilities.queryLanguage).toBe("influxql");
+    expect(capabilities.queryDialect).toBeUndefined();
+    expect(capabilities.enforcesReadOnly).toBe(true);
+    expect(capabilities.supportsMaintenance).toBe(false);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("an influxdb connection with readOnly: true is built, since its provider keeps the mode (InfluxDB spec I8)", async () => {
+    const conn = { ...makeConnection("influxdb", { port: 8086, database: undefined }), readOnly: true };
+    expect(() => assertReadOnlyHonoured(conn)).not.toThrow();
+    expect((await createDatabaseProvider(conn)).type).toBe("influxdb");
+  });
+
+  test('creates provider for type "influxdb3"', async () => {
+    // No user: InfluxDB 3 has none, and the token rides in `password`. The constructor validates nothing and opens
+    // nothing, so the provider is built, and declares SQL, its read-only enforcement and no maintenance, with no
+    // server running.
+    const conn = makeConnection("influxdb3", { port: 8181, user: undefined, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("influxdb3");
+    const capabilities = provider.getCapabilities();
+    expect(capabilities.queryLanguage).toBe("sql");
+    expect(capabilities.queryDialect).toBeUndefined();
+    expect(capabilities.enforcesReadOnly).toBe(true);
+    expect(capabilities.supportsMaintenance).toBe(false);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("an influxdb3 connection with readOnly: true is built, since its provider keeps the mode (InfluxDB spec I8)", async () => {
+    const conn = {
+      ...makeConnection("influxdb3", { port: 8181, user: undefined, database: undefined }),
+      readOnly: true,
+    };
+    expect(() => assertReadOnlyHonoured(conn)).not.toThrow();
+    expect((await createDatabaseProvider(conn)).type).toBe("influxdb3");
+  });
+
+  test("the factory error lists both InfluxDB types after prometheus, in their family block", async () => {
+    const conn = makeConnection("not-an-engine");
+    await expect(createDatabaseProvider(conn)).rejects.toThrow(
+      /Supported types: .*\bprometheus, influxdb, influxdb3, kafka\b/,
+    );
+  });
+
   test('creates provider for type "kafka"', async () => {
     // No `database`: one connection is one cluster. The constructor validates nothing and opens
     // nothing, since the connection's rules run in connect() before any client exists, so the
@@ -557,6 +622,130 @@ describe("createDatabaseProvider", () => {
     expect(provider.getCapabilities().queryLanguage).toBe("json");
     expect(provider.getCapabilities().queryDialect).toBe("kafka");
     expect(provider.isConnected()).toBe(false);
+  });
+
+  test('creates provider for type "etcd"', async () => {
+    // No `database`: one connection is one cluster. The constructor validates nothing and opens nothing, the
+    // connection's rules running in connect() before any client exists (#1089 3.1), so the provider is built,
+    // and declares its language, its dialect and its read-only enforcement, with no etcd running.
+    const conn = makeConnection("etcd", { port: 2379, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider).toBeDefined();
+    expect(provider.type).toBe("etcd");
+    expect(provider.getCapabilities().queryLanguage).toBe("json");
+    expect(provider.getCapabilities().queryDialect).toBe("etcd");
+    expect(provider.getCapabilities().enforcesReadOnly).toBe(true);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("an etcd connection with readOnly: true is built, since its provider keeps the mode (#1089 E6)", async () => {
+    const conn = { ...makeConnection("etcd", { port: 2379, database: undefined }), readOnly: true };
+    expect(() => assertReadOnlyHonoured(conn)).not.toThrow();
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("etcd");
+  });
+
+  test('an etcd connection with readOnly: "true" is refused before anything is built (#1089 E6)', async () => {
+    const conn = {
+      ...makeConnection("etcd", { port: 2379, database: undefined }),
+      readOnly: "true" as unknown as boolean,
+    };
+    expect(() => assertReadOnlyHonoured(conn)).toThrow("readOnly must be true or false.");
+    await expect(createDatabaseProvider(conn)).rejects.toThrow("readOnly must be true or false.");
+  });
+
+  test('creates provider for type "neo4j"', async () => {
+    // No `database`: an empty one means the server's home database, resolved in connect(). The constructor
+    // validates nothing and opens nothing (Neo4j spec 6.1), so the provider is built, and declares its
+    // language and its read-only enforcement, with no server running.
+    const conn = makeConnection("neo4j", { port: 7687, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider).toBeDefined();
+    expect(provider.type).toBe("neo4j");
+    expect(provider.getCapabilities().queryLanguage).toBe("cypher");
+    expect(provider.getCapabilities().enforcesReadOnly).toBe(true);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("a neo4j connection with readOnly: true is built, since its provider keeps the mode", async () => {
+    const conn = { ...makeConnection("neo4j", { port: 7687, database: undefined }), readOnly: true };
+    expect(() => assertReadOnlyHonoured(conn)).not.toThrow();
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("neo4j");
+  });
+
+  test('creates provider for type "qdrant"', async () => {
+    // No user and no database: Qdrant has neither. The constructor validates nothing and opens nothing, as
+    // etcd's, so the provider is built, and declares its language, its dialect and its read-only enforcement,
+    // with no Qdrant running.
+    const conn = makeConnection("qdrant", { port: 6333, user: undefined, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("qdrant");
+    expect(provider.getCapabilities().queryLanguage).toBe("json");
+    expect(provider.getCapabilities().queryDialect).toBe("qdrant");
+    expect(provider.getCapabilities().enforcesReadOnly).toBe(true);
+    expect(provider.getCapabilities().supportsMaintenance).toBe(false);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("a qdrant connection with readOnly: true is built, since its provider keeps the mode (vector-family spec 4.4)", async () => {
+    const conn = { ...makeConnection("qdrant", { port: 6333, user: undefined, database: undefined }), readOnly: true };
+    expect(() => assertReadOnlyHonoured(conn)).not.toThrow();
+    expect((await createDatabaseProvider(conn)).type).toBe("qdrant");
+  });
+
+  test('creates provider for type "oxia"', async () => {
+    // No user and no namespace: Oxia has no user name, and an empty namespace means default. The constructor
+    // validates nothing and opens nothing, so the provider is built, and declares its language, its dialect and
+    // its read-only enforcement, with no Oxia running (SB3-1.2).
+    const conn = makeConnection("oxia", { port: 6648, user: undefined, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("oxia");
+    expect(provider.getCapabilities().queryLanguage).toBe("json");
+    expect(provider.getCapabilities().queryDialect).toBe("oxia");
+    expect(provider.getCapabilities().enforcesReadOnly).toBe(true);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("an oxia connection with readOnly: true is built, since its provider keeps the mode (DECISIONS O1)", async () => {
+    const conn = { ...makeConnection("oxia", { port: 6648, user: undefined, database: undefined }), readOnly: true };
+    expect(() => assertReadOnlyHonoured(conn)).not.toThrow();
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("oxia");
+    expect(provider.getCapabilities().enforcesReadOnly).toBe(true);
+  });
+
+  test("the factory error lists oxia among the supported types, after etcd and before prometheus", async () => {
+    const conn = makeConnection("not-an-engine");
+    await expect(createDatabaseProvider(conn)).rejects.toThrow(/Supported types: .*\betcd, oxia, prometheus\b/);
+  });
+
+  test('creates provider for type "milvus"', async () => {
+    // The constructor validates nothing and opens nothing, as etcd's, so the provider is built, and declares its
+    // language, its dialect and its read-only enforcement, with no Milvus running (vector-family spec 5.7).
+    const conn = makeConnection("milvus", { port: 19530, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("milvus");
+    expect(provider.getCapabilities().queryLanguage).toBe("json");
+    expect(provider.getCapabilities().queryDialect).toBe("milvus");
+    expect(provider.getCapabilities().enforcesReadOnly).toBe(true);
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("a milvus connection with readOnly: true is built, since its provider keeps the mode (vector-family E8)", async () => {
+    const conn = { ...makeConnection("milvus", { port: 19530, database: undefined }), readOnly: true };
+    expect(() => assertReadOnlyHonoured(conn)).not.toThrow();
+    expect((await createDatabaseProvider(conn)).type).toBe("milvus");
+  });
+
+  test("the factory error lists milvus among the supported types, before qdrant and the embedded store", async () => {
+    const conn = makeConnection("not-an-engine");
+    await expect(createDatabaseProvider(conn)).rejects.toThrow(/Supported types: .*\bneo4j, milvus, qdrant, libredb$/);
+  });
+
+  test("the factory error lists qdrant among the supported types, before the embedded store", async () => {
+    const conn = makeConnection("not-an-engine");
+    await expect(createDatabaseProvider(conn)).rejects.toThrow(/Supported types: .*\bqdrant\b.*, libredb$/);
   });
 
   test('creates provider for type "libredb"', async () => {
@@ -595,6 +784,7 @@ describe("createDatabaseProvider", () => {
     };
 
     const declaringTypes: string[] = [];
+    const implicitCommitTypes: string[] = [];
     for (const type of SHIPPED_DATABASE_TYPES) {
       const provider = (await createDatabaseProvider(makeConnection(type, overrides[type] ?? {}))) as unknown as Record<
         string,
@@ -608,11 +798,68 @@ describe("createDatabaseProvider", () => {
 
       expect(declared).toBe(implementsTrio);
       if (declared === true) declaringTypes.push(type);
+
+      // A list of statements that commit a transaction is a claim about a transaction, so a
+      // provider with none must not declare one: SANDBOX is never offered there to read it.
+      const implicit = (provider.getCapabilities as () => { implicitCommitStatements?: readonly string[] })()
+        .implicitCommitStatements;
+      if (implicit !== undefined) {
+        expect(declared).toBe(true);
+        implicitCommitTypes.push(type);
+        for (const keyword of implicit) expect(keyword).toBe(keyword.toUpperCase());
+      }
     }
+
+    // MySQL and Oracle commit around DDL; PostgreSQL declares its own COMMIT synonyms; SQL
+    // Server rolls DDL back and has none.
+    expect(implicitCommitTypes.sort()).toEqual(["mysql", "oracle", "postgres"]);
 
     // The positive half, pinned by name: exactly four providers hold a transaction
     // session, so a fifth (or a lost one) fails here and not only in the loop above.
     expect(declaringTypes.sort()).toEqual(["mssql", "mysql", "oracle", "postgres"]);
+  });
+
+  // ─── supportsQueryCancel, by name (#1364) ───
+  //
+  // The capability is read off the provider by the one check the cancel route makes, so it
+  // cannot drift from the route; what CAN change unnoticed is which providers have a
+  // `cancelQuery` at all, and the editor disables Cancel on every one that does not. Pinned
+  // by name so a provider gaining or losing it is a reviewed change.
+  test("the providers that cannot cancel a running statement, by name", async () => {
+    const overrides: Record<string, Partial<DatabaseConnection>> = {
+      sqlite: { database: ":memory:" },
+      mongodb: { connectionString: "mongodb://localhost/test" },
+      oracle: { serviceName: "ORCL" } as Partial<DatabaseConnection>,
+      couchbase: { port: 8091, database: "travel" },
+      elasticsearch: { port: 9200 },
+      opensearch: { port: 9200 },
+      clickhouse: { port: 8123, database: "demo" },
+      druid: { port: 8888 },
+      trino: { port: 8080, database: "tpch" },
+      cassandra: { port: 9042, database: "probe", localDataCenter: "datacenter1" } as Partial<DatabaseConnection>,
+      libredb: { database: CENSUS_LIBREDB_FILE },
+    };
+
+    const cannotCancel: string[] = [];
+    for (const type of SHIPPED_DATABASE_TYPES) {
+      const provider = await createDatabaseProvider(makeConnection(type, overrides[type] ?? {}));
+      if (!supportsQueryCancel(provider)) cannotCancel.push(type);
+    }
+
+    expect(cannotCancel.sort()).toEqual([
+      "cassandra",
+      "couchbase",
+      "db2",
+      "druid",
+      "elasticsearch",
+      "kafka",
+      "libredb",
+      "libsql",
+      "mongodb",
+      "opensearch",
+      "redis",
+      "sqlite",
+    ]);
   });
 });
 
@@ -906,6 +1153,63 @@ describe("getOrCreateProvider cache isolation", () => {
     // The control that the cache is still a cache: the same record asked for twice is one provider.
     expect(await getOrCreateProvider(record("SCRAM-SHA-512"))).toBe(sha512);
     expect(await getOrCreateProvider(record(undefined))).toBe(none);
+  });
+
+  test("two connections that differ only in their API key pair are never handed one provider", async () => {
+    // An Elasticsearch connection sends `Authorization: ApiKey` built from the pair in preference to
+    // its user and password, so the pair decides who it authenticates as, and `credentialDigest`
+    // frames both halves. The fields are inert on sqlite, as the mechanism is above: only the cache
+    // key can tell these records apart.
+    const database = join(dir, "api-key-pair.db");
+    const record = (pair: Pick<DatabaseConnection, "apiKeyId" | "apiKeySecret"> = {}) =>
+      makeConnection("sqlite", { id: "seed:search", database, user: "reader", password: "same", ...pair });
+
+    const none = await getOrCreateProvider(record());
+    const paired = await getOrCreateProvider(record({ apiKeyId: "key-one", apiKeySecret: "secret-one" }));
+    const otherId = await getOrCreateProvider(record({ apiKeyId: "key-two", apiKeySecret: "secret-one" }));
+    const otherSecret = await getOrCreateProvider(record({ apiKeyId: "key-one", apiKeySecret: "secret-two" }));
+
+    expect(new Set([none, paired, otherId, otherSecret]).size).toBe(4);
+    // The control that the cache is still a cache: the same record asked for twice is one provider.
+    expect(await getOrCreateProvider(record({ apiKeyId: "key-one", apiKeySecret: "secret-one" }))).toBe(paired);
+    expect(await getOrCreateProvider(record())).toBe(none);
+  });
+
+  test("two connections that differ only in their MongoDB auth database are never handed one provider", async () => {
+    // MongoDB looks the user up in `authSource`, so the same user and password under another auth
+    // database are another principal's record, and `credentialDigest` frames it. Inert on sqlite,
+    // like the two fields above: only the cache key can tell these records apart.
+    const database = join(dir, "auth-source.db");
+    const record = (authSource?: string) =>
+      makeConnection("sqlite", {
+        id: "seed:documents",
+        database,
+        user: "reader",
+        password: "same",
+        ...(authSource === undefined ? {} : { authSource }),
+      });
+
+    const none = await getOrCreateProvider(record());
+    const admin = await getOrCreateProvider(record("admin"));
+    const app = await getOrCreateProvider(record("app"));
+
+    expect(new Set([none, admin, app]).size).toBe(3);
+    // The control that the cache is still a cache: the same record asked for twice is one provider.
+    expect(await getOrCreateProvider(record("app"))).toBe(app);
+    expect(await getOrCreateProvider(record())).toBe(none);
+  });
+
+  test("readOnly: false and an absent readOnly are one mode, so they are handed one provider (#1089)", async () => {
+    // The fourth part of the cache key is spelled `read-only` for `true` alone, so a record saved before
+    // the mode existed and one that says `false` share a pool. The other half, `true` sharing none, is
+    // held at the key in tests/unit/lib/db/provider-cache-key.test.ts, because on this engine the factory
+    // refuses `readOnly: true` before the cache is consulted at all.
+    const database = join(dir, "read-write-mode.db");
+    const record = (overrides: Partial<DatabaseConnection> = {}) =>
+      makeConnection("sqlite", { id: "seed:mode", database, ...overrides });
+
+    const absent = await getOrCreateProvider(record());
+    expect(await getOrCreateProvider(record({ readOnly: false }))).toBe(absent);
   });
 });
 
@@ -1661,6 +1965,26 @@ describe("acquireExecutionProfileProvider", () => {
       expect(getExecutionProfileCacheStats().size).toBe(0);
     });
 
+    test("nor can an execution context: a readOnly in it is refused, so no read-only handle enters the writable cache", async () => {
+      // The execution context is server-injected, and getOrCreateProvider takes the file-access
+      // posture on it (non-admin DuckDB file access). A readOnly riding along used to reach the provider while the key
+      // ignored it: the read-only provider was then served to every later editor request, or a
+      // read-only caller was handed the writable one. Refused before the cache is touched.
+      const conn = await seedFileConnection();
+
+      for (const readOnly of [true, false]) {
+        // oxlint-disable-next-line no-await-in-loop -- each refusal is read before the next call, and neither may reach the cache.
+        const refusal: unknown = await getOrCreateProvider(conn, {}, { readOnly } as never).catch((e: unknown) => e);
+        expect(refusal).toBeInstanceOf(DatabaseConfigError);
+        expect((refusal as Error).message).toContain("takes no readOnly");
+      }
+      expect(getProviderCacheStats().size).toBe(0);
+
+      // The editor is still served a writable provider.
+      const shared = await getOrCreateProvider(conn);
+      expect((await shared.query("INSERT INTO t (id, v) VALUES (2, 'editor')")).rowCount).toBe(1);
+    });
+
     test("refuses an in-memory sqlite target for the agent profile (fail closed)", async () => {
       const conn = makeConnection("sqlite", { id: "sqlite-memory-agent", database: ":memory:" });
 
@@ -1803,7 +2127,7 @@ describe("single-writer file reuse", () => {
       database: join(dir, "..", basename(dir), "borrowed.duckdb"),
     });
     // Relative TO THE CWD, deliberately, and not to the file's own directory. `fileIdentity`
-    // normalises with `path.resolve` (src/lib/db/factory.ts:385), which resolves against
+    // normalises with `path.resolve` (src/lib/db/factory.ts), which resolves against
     // `process.cwd()`, so a spelling relative to anything else would name a different file and
     // this assertion would fail on every platform rather than exercise the borrow.
     //
@@ -1827,6 +2151,202 @@ describe("single-writer file reuse", () => {
     // The shape the test-connection route hands this on every request that is not a
     // file engine at all (a connection-string connection carries no `database`).
     expect(findOpenSingleWriterProvider(makeConnection("mongodb", { database: undefined }))).toBeNull();
+  });
+
+  // DuckDB file-access posture in the cache and the borrow (non-admin DuckDB file access). This is the
+  // critical ruling: an admin's full handle must never be shared with, nor borrowed
+  // by, a non-admin, and the reverse. Run against the real @duckdb/node-api driver.
+
+  test("an admin and a non-admin resolving the same DuckDB connection get two distinct handles", async () => {
+    // Same connection id and :memory: target; only the server-derived posture differs, so the
+    // cache key's posture segment is what keeps them apart. Reaching the admin handle would hand
+    // a non-admin full filesystem access, which is the whole of the fix.
+    const conn = makeConnection("duckdb", { id: "duck-posture-split", database: ":memory:" });
+    const admin = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: true });
+    const nonAdmin = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: false });
+
+    expect(nonAdmin).not.toBe(admin);
+    // Each asked again under its own posture is served from the cache, so the split is stable.
+    expect(await getOrCreateProvider(conn, {}, { allowExternalFileAccess: true })).toBe(admin);
+    expect(await getOrCreateProvider(conn, {}, { allowExternalFileAccess: false })).toBe(nonAdmin);
+    // And the handles really do differ in reach: the engine reports it.
+    const setting = "SELECT current_setting('enable_external_access') AS v";
+    expect((await admin.query!(setting)).rows).toEqual([{ v: true }]);
+    expect((await nonAdmin.query!(setting)).rows).toEqual([{ v: false }]);
+    await removeProvider(conn.id);
+  });
+
+  test("a file-backed DuckDB record reopened under a flipped posture closes the stale handle first", async () => {
+    // Two :memory: postures are two independent databases and may both stay open, but one FILE
+    // under two postures would be two read-write handles on one file (the operator-edits-roles case
+    // the api test reproduces end to end). The second open must close the first, leaving one writer.
+    const file = join(dir, "posture-flip-close.duckdb");
+    const conn = makeConnection("duckdb", { id: "duck-flip-close", database: file });
+    const admin = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: true });
+    // The stale handle's disconnect rejects, so the warn-and-continue path runs; it still closes the
+    // real handle first, so the file lock is released for the reopen below.
+    // The order of the stale close and the new open is recorded, since the close has to come first:
+    // a stale handle merely dropped from the cache, or closed after the reopen, is still a second
+    // writer on the file while the new one opens.
+    const order: string[] = [];
+    const realDisconnect = admin.disconnect.bind(admin);
+    admin.disconnect = async () => {
+      await realDisconnect();
+      order.push("close");
+      throw new Error("disconnect failed");
+    };
+    const { DuckDBProvider } = await import("@/lib/db/providers/sql/duckdb");
+    const realConnect = DuckDBProvider.prototype.connect;
+    const connectSpy = spyOn(DuckDBProvider.prototype, "connect").mockImplementation(async function (
+      this: InstanceType<typeof DuckDBProvider>,
+    ) {
+      order.push("open");
+      return realConnect.call(this);
+    });
+
+    const nonAdmin = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: false }).finally(() =>
+      connectSpy.mockRestore(),
+    );
+
+    expect(nonAdmin).not.toBe(admin);
+    expect(admin.isConnected()).toBe(false);
+    expect(order).toEqual(["close", "open"]);
+    // One record, one entry: the stale full-reach handle was closed rather than left beside the new
+    // one. On the base before the fix this was two entries on one file.
+    expect(getProviderCacheStats()).toEqual({ size: 1, connections: ["duck-flip-close"] });
+    await removeProvider(conn.id);
+  });
+
+  test("a reopen under a new key closes only the stale handle of its own record, not another record on the file", async () => {
+    // The stale close is bounded to one connection id. A different record naming the same file is
+    // the separate, pre-existing D240 case, and opening it must not tear down the first record's
+    // handle: otherwise anyone naming the path would close every handle on it.
+    const file = join(dir, "posture-flip-other-id.duckdb");
+    const first = makeConnection("duckdb", { id: "duck-flip-first", database: file });
+    const second = makeConnection("duckdb", { id: "duck-flip-second", database: file });
+    const held = await getOrCreateProvider(first, {}, { allowExternalFileAccess: true });
+
+    const opened = await getOrCreateProvider(second, {}, { allowExternalFileAccess: false }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    // Windows refuses a second read-write handle on a file this process holds; Linux and macOS open it.
+    if (process.platform === "win32") {
+      expect(opened).toBeInstanceOf(Error);
+    } else {
+      expect(opened).toBeNull();
+    }
+    expect(held.isConnected()).toBe(true);
+    expect(getProviderCacheStats().connections).toContain("duck-flip-first");
+    await removeProvider(second.id);
+    await removeProvider(first.id);
+  });
+
+  test("a LibreDB record reopened under a new key on the same file closes its stale handle first", async () => {
+    // LibreDB is the other engine that declares `singleWriterFile`. An edit that moves the key and keeps
+    // the file (here a credential) used to leave the old handle open, and the reopen was refused by the
+    // file lock; the stale handle is now closed first, so the reopen succeeds as the file's only handle.
+    const conn = libredbConn();
+    const before = await getOrCreateProvider(conn);
+
+    const after = await getOrCreateProvider({ ...conn, password: "edited" });
+
+    expect(after).not.toBe(before);
+    expect(before.isConnected()).toBe(false);
+    expect(after.isConnected()).toBe(true);
+    expect(getProviderCacheStats()).toEqual({ size: 1, connections: [conn.id] });
+    await removeProvider(conn.id);
+  });
+
+  test("findOpenSingleWriterProvider does not hand an admin DuckDB handle to a non-admin caller, nor the reverse", async () => {
+    const file = join(dir, "posture-borrow.duckdb");
+    const conn = makeConnection("duckdb", { id: "duck-borrow-admin", database: file });
+    const admin = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: true });
+
+    // A non-admin borrow is refused the admin's full handle (it would open its own instead);
+    // the admin posture borrows its own handle back.
+    expect(findOpenSingleWriterProvider(conn, false)).toBeNull();
+    expect(findOpenSingleWriterProvider(conn, true)).toBe(admin);
+    // And a bare lookup (no posture) reads as deny, so it does not reach the admin handle either.
+    expect(findOpenSingleWriterProvider(conn)).toBeNull();
+    await removeProvider(conn.id);
+
+    // The reverse: a non-admin handle open, an admin borrow does not reach it.
+    const nonAdmin = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: false });
+    expect(findOpenSingleWriterProvider(conn, true)).toBeNull();
+    expect(findOpenSingleWriterProvider(conn, false)).toBe(nonAdmin);
+    await removeProvider(conn.id);
+  });
+
+  test("an operations acquisition borrows the open DuckDB handle of its requester's editor posture (B49)", async () => {
+    // An admin running an Operate agent on a connection only admins use, while the editor holds
+    // the file under the admin's posture. The agent profile itself carries no posture, so before
+    // the requester's was passed the borrow read as deny, skipped the admin's handle, and the run
+    // opened a second, read-only handle: a frozen snapshot on Linux and macOS, a refusal on Windows.
+    const file = join(dir, "operations-admin.duckdb");
+    const conn = makeConnection("duckdb", { id: "duck-ops-admin", database: file });
+    const editor = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: true });
+
+    const agent = await acquireExecutionProfileProvider(
+      conn,
+      "agent-operations",
+      {},
+      { allowExternalFileAccess: true },
+    );
+
+    expect(agent).toBe(editor);
+    // Borrowed, never owned, exactly as the posture-free borrow is.
+    expect(getExecutionProfileCacheStats()).toEqual({ size: 0, connections: [] });
+    await removeProvider(conn.id);
+  });
+
+  test("an operations acquisition never borrows a handle wider than its requester's posture", async () => {
+    // The fail-closed default: no requester posture reads as deny, so an admin's full handle is
+    // not lent to it. It opens its own read-only handle beside the writer instead, which Windows
+    // refuses for a file this process already holds (docs/providers/duckdb.md section 3.8).
+    const file = join(dir, "operations-deny.duckdb");
+    const conn = makeConnection("duckdb", { id: "duck-ops-deny", database: file });
+    const editor = await getOrCreateProvider(conn, {}, { allowExternalFileAccess: true });
+
+    const acquired = await acquireExecutionProfileProvider(conn, "agent-operations").then(
+      (provider) => provider,
+      (error: unknown) => error,
+    );
+
+    if (process.platform === "win32") {
+      expect(acquired).toBeInstanceOf(Error);
+    } else {
+      expect(acquired).not.toBe(editor);
+      expect(getExecutionProfileCacheStats().size).toBe(1);
+    }
+    await removeProvider(conn.id);
+  });
+
+  test("isSingleWriterFileOpen sees a held file whatever posture holds it, which the borrow cannot", async () => {
+    // The question Test Connection asks when the borrow answers null: is the file open under the
+    // OTHER posture, where a second read-write handle must not be opened beside it.
+    const file = join(dir, "posture-held.duckdb");
+    const conn = makeConnection("duckdb", { id: "duck-held-admin", database: file });
+    const other = makeConnection("duckdb", { id: "duck-held-other", database: file });
+    expect(isSingleWriterFileOpen(other)).toBe(false);
+
+    await getOrCreateProvider(conn, {}, { allowExternalFileAccess: true });
+
+    expect(findOpenSingleWriterProvider(other, false)).toBeNull();
+    expect(isSingleWriterFileOpen(other)).toBe(true);
+    await removeProvider(conn.id);
+    // Closed, so nothing holds it any more.
+    expect(isSingleWriterFileOpen(other)).toBe(false);
+  });
+
+  test("isSingleWriterFileOpen is false for a connection with no file, an anonymous in-memory one included", async () => {
+    const memory = makeConnection("duckdb", { id: "duck-held-memory", database: ":memory:" });
+    await getOrCreateProvider(memory, {}, { allowExternalFileAccess: true });
+
+    expect(isSingleWriterFileOpen(memory)).toBe(false);
+    expect(isSingleWriterFileOpen(makeConnection("mongodb", { database: undefined }))).toBe(false);
+    await removeProvider(memory.id);
   });
 
   test("an engine that admits many handles is not borrowed from, and keeps its read-only boundary", async () => {
@@ -2014,6 +2534,213 @@ describe("withOneShotTunnel", () => {
     await withOneShotTunnel(stringOnly, async () => undefined);
 
     expect(mockCreateSSHTunnel).not.toHaveBeenCalled();
+  });
+});
+
+// ─── A readOnly the engine cannot keep is refused before anything is built or dialled (#1089) ──
+
+describe("assertReadOnlyHonoured", () => {
+  // `mockHasTunnel` is not reset by the file-level beforeEach, and two assertions below are that no
+  // pool is consulted: negatives that only mean anything against a counter this describe owns.
+  beforeEach(() => {
+    mockHasTunnel.mockClear();
+  });
+
+  const bastion: SSHTunnelConfig = {
+    enabled: true,
+    host: "bastion.example.com",
+    port: 22,
+    username: "jump",
+    authMethod: "password",
+    password: "pw",
+  };
+
+  /** The factory's refusal of `readOnly: true` on an engine whose provider does not enforce it. */
+  const unenforced = (type: string) =>
+    `readOnly: true is refused for ${type}: its provider does not enforce a read-only mode, so the connection would open able to write. Remove readOnly from the connection, or connect with a database role that cannot write.`;
+
+  const thrownBy = (run: () => void): unknown => {
+    try {
+      run();
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  };
+
+  /** The lines `createDatabaseProvider` logs, one for every provider it builds. */
+  const buildLines = (log: { readonly mock: { readonly calls: readonly (readonly unknown[])[] } }) =>
+    log.mock.calls.filter(([line]) => String(line).startsWith("[DB] Creating"));
+
+  /** A mode that is not a boolean: the fourth part of the cache key reads it as `read-write`. */
+  const notABoolean = "true" as unknown as boolean;
+
+  test("an absent or false readOnly passes on every shipped engine", () => {
+    for (const type of SHIPPED_DATABASE_TYPES) {
+      expect({ type, error: thrownBy(() => assertReadOnlyHonoured(makeConnection(type))) }).toEqual({
+        type,
+        error: undefined,
+      });
+      expect({
+        type,
+        error: thrownBy(() => assertReadOnlyHonoured(makeConnection(type, { readOnly: false }))),
+      }).toEqual({ type, error: undefined });
+    }
+  });
+
+  test("readOnly: true is refused on every engine that does not enforce it, naming the type and the field", () => {
+    const refusing = SHIPPED_DATABASE_TYPES.filter((type) => !READ_ONLY_ENFORCED[type]);
+    // Vacuity, by name: an empty population would refuse nothing and pass.
+    expect(refusing).toContain("postgres");
+    for (const type of refusing) {
+      const error = thrownBy(() => assertReadOnlyHonoured(makeConnection(type, { readOnly: true })));
+      expect(error).toBeInstanceOf(DatabaseConfigError);
+      expect({ type, message: (error as Error).message }).toEqual({ type, message: unenforced(type) });
+    }
+  });
+
+  test.each([
+    ["a string", "read-only-please"],
+    ["a number", 1],
+    ["null", null],
+  ])("a readOnly that is %s is refused on any engine, naming the field and never the value", (_label, value) => {
+    const error = thrownBy(() =>
+      assertReadOnlyHonoured(makeConnection("postgres", { readOnly: value as unknown as boolean })),
+    );
+
+    expect(error).toBeInstanceOf(DatabaseConfigError);
+    expect((error as Error).message).toBe("readOnly must be true or false.");
+  });
+
+  test("the refusal names a type it does not know with its line breaks taken out", () => {
+    // The type arrives in the request body, and the factory strips a line break from every
+    // caller-supplied value it interpolates into a message, so a type cannot write a line of its own.
+    const error = thrownBy(() => assertReadOnlyHonoured(makeConnection("postgres\r\ninjected", { readOnly: true })));
+
+    expect(error).toBeInstanceOf(DatabaseConfigError);
+    expect((error as Error).message).toBe(unenforced("postgres  injected"));
+  });
+
+  test("createDatabaseProvider refuses before it builds a provider", async () => {
+    // The first thing the factory does after the check is log the provider it is creating, so a log
+    // line here would mean a provider was built for a connection it must refuse.
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await expect(createDatabaseProvider(makeConnection("postgres", { readOnly: true }))).rejects.toThrow(
+        unenforced("postgres"),
+      );
+      expect(buildLines(log)).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("getOrCreateProvider refuses before the cache and before the tunnel, and builds and opens nothing", async () => {
+    const connection = makeConnection("postgres", {
+      id: "read-only-tunnelled",
+      host: "db.internal",
+      port: 5432,
+      readOnly: true,
+      sshTunnel: bastion,
+    });
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await expect(getOrCreateProvider(connection)).rejects.toThrow(unenforced("postgres"));
+      expect(buildLines(log)).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+
+    expect(mockHasTunnel).not.toHaveBeenCalled();
+    expect(mockCreateSSHTunnel).not.toHaveBeenCalled();
+    expect(getProviderCacheStats().size).toBe(0);
+  });
+
+  test("the same connection without the field opens its tunnel and is cached, as before", async () => {
+    // The control: the refusal above is the field's, not a tunnelled PostgreSQL record's.
+    const connection = makeConnection("postgres", {
+      id: "read-write-tunnelled",
+      host: "db.internal",
+      port: 5432,
+      sshTunnel: bastion,
+    });
+
+    const provider = await getOrCreateProvider(connection);
+
+    expect(provider.isConnected()).toBe(true);
+    expect(mockCreateSSHTunnel).toHaveBeenCalledTimes(1);
+    expect(getProviderCacheStats().connections).toEqual(["read-write-tunnelled"]);
+  });
+
+  test("getOrCreateProvider refuses a mode that is not a boolean although a read-write provider is cached under its key", async () => {
+    // A mode that is not `true` keys as `read-write`, so it answers the key the connection's cached
+    // provider sits under: only a check ahead of the lookup refuses it rather than handing that
+    // provider out.
+    const connection = makeConnection("postgres", { id: "cached-read-write", host: "db.internal", port: 5432 });
+    const cached = await getOrCreateProvider(connection);
+    expect(cached.isConnected()).toBe(true);
+
+    await expect(getOrCreateProvider({ ...connection, readOnly: notABoolean })).rejects.toThrow(
+      "readOnly must be true or false.",
+    );
+  });
+
+  test("acquireExecutionProfileProvider refuses before the profiled cache and before the tunnel", async () => {
+    const connection = makeConnection("postgres", {
+      id: "read-only-profiled",
+      host: "db.internal",
+      port: 5432,
+      readOnly: true,
+      sshTunnel: bastion,
+    });
+
+    await expect(acquireExecutionProfileProvider(connection, "agent-operations")).rejects.toThrow(
+      unenforced("postgres"),
+    );
+
+    expect(mockHasTunnel).not.toHaveBeenCalled();
+    expect(mockCreateSSHTunnel).not.toHaveBeenCalled();
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("acquireExecutionProfileProvider refuses a mode that is not a boolean although a profiled provider is cached under its key", async () => {
+    // The profiled key embeds the provider cache key, so the same reading holds there: the check has
+    // to come before the profiled cache is consulted.
+    const connection = makeConnection("postgres", { id: "cached-profiled", host: "db.internal", port: 5432 });
+    const cached = await acquireExecutionProfileProvider(connection, "agent-operations");
+    expect(cached.isConnected()).toBe(true);
+
+    await expect(
+      acquireExecutionProfileProvider({ ...connection, readOnly: notABoolean }, "agent-operations"),
+    ).rejects.toThrow("readOnly must be true or false.");
+  });
+
+  test("withOneShotTunnel refuses before it dials, and never runs its callback", async () => {
+    const run = mock(async () => "ran");
+    const connection = makeConnection("postgres", {
+      id: "read-only-one-shot",
+      host: "db.internal",
+      port: 5432,
+      readOnly: true,
+      sshTunnel: bastion,
+    });
+
+    await expect(withOneShotTunnel(connection, run)).rejects.toThrow(unenforced("postgres"));
+
+    expect(run).not.toHaveBeenCalled();
+    expect(mockCreateSSHTunnel).not.toHaveBeenCalled();
+  });
+
+  test("withOneShotTunnel refuses a connection with no tunnel too, and never runs its callback", async () => {
+    // The pass-through branch hands the callback the connection as it is, so a check placed only on
+    // the tunnelled path would let the callback build and connect a provider for it.
+    const run = mock(async () => "ran");
+
+    await expect(withOneShotTunnel(makeConnection("postgres", { readOnly: true }), run)).rejects.toThrow(
+      unenforced("postgres"),
+    );
+
+    expect(run).not.toHaveBeenCalled();
   });
 });
 

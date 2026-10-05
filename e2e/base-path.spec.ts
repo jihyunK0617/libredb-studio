@@ -1,14 +1,20 @@
-import { expect, test } from "@playwright/test";
+import { type Cookie, expect, test } from "@playwright/test";
+import { addVirtualAuthenticator } from "./helpers/virtual-authenticator";
 
 const prefix = "/~/libredb";
 
 test("production deployment behind a path-preserving reverse proxy", async ({ page, context, request, baseURL }) => {
   const failedAppRequests: string[] = [];
   const pageErrors: string[] = [];
+  // Set while the test is signed out behind the editor's back (the logout below is a bare fetch, so
+  // the editor stays mounted). Its in-flight calls then get the session-required 401 an API path
+  // answers without a session (#1420); before that they got a redirect, which this check never saw.
+  let signedOut = false;
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("response", (response) => {
-    if (response.url().startsWith(baseURL!) && response.status() >= 400)
-      failedAppRequests.push(`${response.status()} ${response.url()}`);
+    if (!response.url().startsWith(baseURL!) || response.status() < 400) return;
+    if (signedOut && response.status() === 401) return;
+    failedAppRequests.push(`${response.status()} ${response.url()}`);
   });
   await page.route("**/*", (route) => (route.request().url().startsWith(baseURL!) ? route.continue() : route.abort()));
 
@@ -24,7 +30,7 @@ test("production deployment behind a path-preserving reverse proxy", async ({ pa
   const rootRedirect = await request.get(prefix, { maxRedirects: 0 });
   expect(new URL(rootRedirect.headers().location, baseURL).href).toBe(`${baseURL}${prefix}/login`);
   const redirect = await request.get(`${prefix}/admin`, { maxRedirects: 0 });
-  expect(new URL(redirect.headers().location, baseURL).href).toBe(`${baseURL}${prefix}/login`);
+  expect(new URL(redirect.headers().location, baseURL).href).toBe(`${baseURL}${prefix}/login?next=%2Fadmin`);
   const oidcError = await request.get(`${prefix}/api/auth/oidc/login`, { maxRedirects: 0 });
   expect(new URL(oidcError.headers().location, baseURL).href).toBe(`${baseURL}${prefix}/login?error=oidc_config`);
 
@@ -65,14 +71,21 @@ test("production deployment behind a path-preserving reverse proxy", async ({ pa
 
   const session = await page.evaluate(async (path) => (await fetch(`${path}/api/auth/me`)).json(), prefix);
   expect(session.user.role).toBe("user");
+  // The redirect lands on the editor, which checks the active connection's health once it mounts.
+  // Wait for that check here: sent after the logout below, it would carry no cookie and answer 401.
+  const pulse = page.waitForResponse(
+    (response) => response.url().endsWith(`${prefix}/api/db/health`) && response.request().method() === "POST",
+  );
   await page.goto(`${prefix}/admin`);
   await expect(page).toHaveURL(new RegExp(`${prefix}/?$`));
+  expect((await pulse).status()).toBe(200);
 
   expect((await request.get(`${prefix}/logo.svg`)).status()).toBe(200);
   expect((await request.get(`${prefix}/monaco/vs/loader.js`)).status()).toBe(200);
   expect(failedAppRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
 
+  signedOut = true;
   const logoutStatus = await page.evaluate(
     async (path) => (await fetch(`${path}/api/auth/logout`, { method: "POST" })).status,
     prefix,
@@ -86,6 +99,7 @@ test("production deployment behind a path-preserving reverse proxy", async ({ pa
   await page.locator('input[type="password"]:visible').fill("test-admin");
   await page.getByRole("button", { name: /sign in/i }).click();
   await expect(page).toHaveURL(`${baseURL}${prefix}/admin/overview`);
+  signedOut = false;
   await expect(page.getByTestId("admin-content-overview")).toBeVisible();
   // Server redirects, Next links and native quick actions all stay inside the mount.
   await expect(page.getByRole("link", { name: "Operations", exact: true })).toHaveAttribute(
@@ -103,4 +117,52 @@ test("production deployment behind a path-preserving reverse proxy", async ({ pa
   await page.getByRole("button", { name: "Logout", exact: true }).click();
   await expect(page).toHaveURL(`${baseURL}${prefix}/login`);
   expect((await context.cookies()).some((value) => value.name === "auth-token")).toBe(false);
+});
+
+test("a passkey registers and signs in under the base path", async ({ page, context, baseURL }) => {
+  // WebAuthn accepts plain http only on the host name localhost, so this test leaves baseURL's 127.0.0.1.
+  const origin = new URL(baseURL!);
+  origin.hostname = "localhost";
+  const studio = `${origin.origin}${prefix}`;
+  // The editor answers at the prefix with or without its trailing slash, as in the test above.
+  const editor = new RegExp(`^${origin.origin}${prefix}/?$`);
+  await addVirtualAuthenticator(page);
+
+  await page.goto(`${studio}/login`);
+  await page.locator('input[type="email"]:visible').fill("user@libredb.org");
+  await page.locator('input[type="password"]:visible').fill("test-user");
+  await page.getByRole("button", { name: /sign in/i }).click();
+  await expect(page).toHaveURL(editor);
+  await page.getByRole("button", { name: "User menu" }).click();
+  await page.getByRole("menuitem", { name: "Sign-in security" }).click();
+  await expect(page).toHaveURL(`${studio}/settings/authenticator`);
+
+  // Read between the options and the verify request, while the ceremony cookie exists.
+  let ceremonyCookie: Cookie | undefined;
+  await page.route(
+    (url) => url.pathname === `${prefix}/api/auth/passkey`,
+    async (route) => {
+      if (route.request().postDataJSON()?.action === "register-verify") {
+        ceremonyCookie = (await context.cookies()).find((cookie) => cookie.name === "passkey-registration");
+      }
+      await route.continue();
+    },
+  );
+  await page.getByRole("button", { name: "Add passkey" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.locator("#passkey-add-name").fill("Base path");
+  await dialog.locator("#passkey-add-password").fill("test-user");
+  await dialog.getByRole("button", { name: "Create passkey" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("Base path", { exact: true })).toBeVisible();
+  expect(ceremonyCookie).toMatchObject({ path: `${prefix}/api/auth/passkey`, httpOnly: true, sameSite: "Strict" });
+
+  const logoutStatus = await page.evaluate(
+    async (path) => (await fetch(`${path}/api/auth/logout`, { method: "POST" })).status,
+    prefix,
+  );
+  expect(logoutStatus).toBe(200);
+  await page.goto(`${studio}/login`);
+  await page.getByRole("button", { name: "Use a passkey" }).click();
+  await expect(page).toHaveURL(editor);
 });

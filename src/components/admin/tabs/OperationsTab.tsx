@@ -18,6 +18,13 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { TypedConfirmDialog } from "@/components/typed-confirm";
+import {
+  MaintenanceEntityDialog,
+  closedEntityDialog,
+  entityRequest,
+  type EntityDialogOpening,
+} from "@/components/maintenance-entity-dialog";
 import {
   RefreshCw,
   Zap,
@@ -38,10 +45,19 @@ import {
 } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useMonitoringData } from "@/hooks/use-monitoring-data";
+import { useReturnFocus } from "@/hooks/use-return-focus";
 import { storage } from "@/lib/storage";
 import { useAllConnections } from "@/hooks/use-all-connections";
-import { maintenanceControl, type ActiveSessionDetails, type MaintenanceType, type TableStats } from "@/lib/db/types";
+import {
+  declaredEntityOperations,
+  maintenanceControl,
+  type ActiveSessionDetails,
+  type MaintenanceOperation,
+  type MaintenanceType,
+  type TableStats,
+} from "@/lib/db/types";
 import { readObjectPathParam } from "@/lib/db/object-path";
+import { withConnectedMaintenance } from "@/lib/db/types";
 import { useProviderMetadata } from "@/hooks/use-provider-metadata";
 
 /**
@@ -61,6 +77,14 @@ const TABLE_ACTIONS: { type: MaintenanceType; label: string; Icon: LucideIcon; h
   { type: "reindex", label: "Reindex", Icon: RefreshCw, hover: "hover:text-hue-purple" },
   { type: "check", label: "Check", Icon: ShieldCheck, hover: "hover:text-hue-green" },
 ];
+
+/** One per-row control: a `TABLE_ACTIONS` entry, or a declared operation outside `MaintenanceType` (spec 3.11). */
+interface TableAction {
+  type: MaintenanceOperation;
+  label: string;
+  Icon: LucideIcon;
+  hover: string;
+}
 
 /**
  * Why no per-table maintenance control is anywhere on this page.
@@ -91,6 +115,16 @@ function TableMaintenanceUnreachableNote({
   );
 }
 
+/** The Global Operations heading, shared by the section's cards and by the line that replaces them. */
+function GlobalOperationsHeading() {
+  return (
+    <div className="flex items-center gap-2 mb-3">
+      <ShieldAlert className="h-4 w-4 text-brand" />
+      <h3 className="text-sm font-bold text-fg-secondary">Global Operations</h3>
+    </div>
+  );
+}
+
 interface OperationLogEntry {
   id: string;
   timestamp: Date;
@@ -100,6 +134,40 @@ interface OperationLogEntry {
   duration: number;
   error?: string;
 }
+
+/**
+ * A whole-database card the provider words itself (#1089, section 7.2): an operation `maintenanceControl` offers
+ * globally with a `title`, drawn with the spec's `label` on its button, the `title` as its heading and the
+ * `description` as its body.
+ */
+interface DeclaredCard {
+  type: MaintenanceOperation;
+  label?: string;
+  title: string;
+  description?: string;
+  /** The spec's `confirmation: "typed"`: the card asks for the connection's name before it sends anything. */
+  typed: boolean;
+}
+
+/** One opening of a declared card's typed dialog, keyed so that every opening mounts a fresh dialog. */
+interface TypedDialogOpening {
+  card: DeclaredCard;
+  /** False keeps the dialog in place while it animates out. */
+  open: boolean;
+  key: number;
+}
+
+/** The same opening, closed. */
+function closedDialog(current: TypedDialogOpening | null): TypedDialogOpening | null {
+  return current ? { ...current, open: false } : current;
+}
+
+/**
+ * Said in a declared card's typed dialog in place of the field, for a stored connection whose name is empty
+ * (#1089, section 3.4): the name is what the dialog asks for, and there is nothing to type.
+ */
+const UNNAMED_CONNECTION =
+  "This operation is confirmed by typing the connection's name, and this connection has none. Give it a name in its connection settings first.";
 
 export function OperationsTab() {
   // Only the operator's CHOICE is state; the list and the selected object are both
@@ -116,8 +184,19 @@ export function OperationsTab() {
     connections.find((c) => c.id === selectedId) ?? (connections.length > 0 ? connections[0] : null);
   const [operationLog, setOperationLog] = useState<OperationLogEntry[]>([]);
   const [confirmKill, setConfirmKill] = useState<ActiveSessionDetails | null>(null);
+  const confirmKillReturnFocus = useReturnFocus();
   const [killingPid, setKillingPid] = useState<number | string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  // A declared card's typed dialog, and the count that keys each opening: the dialog keeps its match and any refusal
+  // in its own state, so every opening mounts a fresh one, as the account dialogs do (#1089, section 7.2).
+  const [typedDialog, setTypedDialog] = useState<TypedDialogOpening | null>(null);
+  const [typedDialogOpenings, setTypedDialogOpenings] = useState(0);
+  // A whole-database run waiting for its confirmation (#1438), with the name its card gave it.
+  const [confirmGlobal, setConfirmGlobal] = useState<{ type: MaintenanceOperation; name: string } | null>(null);
+  const confirmGlobalReturnFocus = useReturnFocus();
+  // A per-row operation's dialog, keyed per opening the same way (spec 3.11).
+  const [entityDialog, setEntityDialog] = useState<EntityDialogOpening | null>(null);
+  const [entityDialogOpenings, setEntityDialogOpenings] = useState(0);
 
   /*
     The object an Explorer deep link named (`onOpenMaintenance("tables", object.path)` →
@@ -172,7 +251,7 @@ export function OperationsTab() {
   // is reactive so it settles as soon as the capability arrives.
   const monitoringOptions = useMemo(() => ({ includeTables: true, includeIndexes: false, includeStorage: false }), []);
 
-  const { data, loading, error, refresh, killSession, runMaintenance } = useMonitoringData(
+  const { data, loading, error, refresh, killSession, runMaintenance, previewMaintenance } = useMonitoringData(
     selectedConnection,
     monitoringOptions,
   );
@@ -180,7 +259,17 @@ export function OperationsTab() {
   // src/lib/db/types.ts - so that neither can offer a control the other's engine
   // rejects. `capabilities` may be undefined here (provider-meta in flight, or its
   // request failed), which that helper reads as a denial.
-  const capabilities = metadata?.capabilities;
+  //
+  // The maintenance half comes from the monitoring payload when it carries one (#1387): that is
+  // read off the CONNECTED provider, which measured what this server accepts, where provider-meta
+  // answers the type id's declaration and so offered PostgreSQL's and MySQL's whole sets to
+  // CockroachDB, RisingWave, TiDB and the rest.
+  const declaredCapabilities = metadata?.capabilities;
+  const connectedMaintenance = data?.maintenance;
+  const capabilities = useMemo(
+    () => withConnectedMaintenance(declaredCapabilities, connectedMaintenance),
+    [declaredCapabilities, connectedMaintenance],
+  );
   const offers = (type: MaintenanceType, placement: "perEntity" | "global") =>
     maintenanceControl(capabilities, type, placement).offered;
   // The six analyze/vacuum global ProviderLabels fields were declared, set by
@@ -202,18 +291,54 @@ export function OperationsTab() {
   // Oracle's, MySQL's and ClickHouse's own words written and never shown, and sending
   // `vacuum` to any of those four is a 400 from /api/db/maintenance.
   const vacuumOperation = labels?.vacuumActionOperation ?? "vacuum";
-  const globalAnalyze = offers("analyze", "global");
-  const globalVacuum = offers(vacuumOperation, "global");
+  // One card per operation the gate offers globally with a `title`, in declaration order and in the provider's own
+  // words (#1089, section 7.2). Keyed on the title, not on "offered globally with no card of its own": that rule
+  // would give cards to DuckDB's optimize and to the global check of SQL Server, SQLite, libSQL and MySQL, and a
+  // kill card with no target to every engine on the base default, none of which asked for one.
+  const declaredCards = [...new Set(capabilities?.maintenanceOperations ?? [])].flatMap((type): DeclaredCard[] => {
+    const control = maintenanceControl(capabilities, type, "global");
+    if (!control.offered || control.title === undefined) return [];
+    return [
+      {
+        type,
+        label: control.label,
+        title: control.title,
+        description: control.description,
+        typed: control.confirmation === "typed",
+      },
+    ];
+  });
+  // A declared operation's card is its only one: the card worded from ProviderLabels that would send it is withheld.
+  const declared = new Set(declaredCards.map((card) => card.type));
+  const globalAnalyze = !declared.has("analyze") && offers("analyze", "global");
+  const globalVacuum = !declared.has(vacuumOperation) && offers(vacuumOperation, "global");
   // Never twice: where the vacuum slot already names `reindex`, this card would send
   // the same operation under a second set of words.
-  const globalReindex = vacuumOperation !== "reindex" && offers("reindex", "global");
-  const anyMaintenance = globalAnalyze || globalVacuum || globalReindex;
+  const globalReindex = vacuumOperation !== "reindex" && !declared.has("reindex") && offers("reindex", "global");
+  // What each whole-database card's button says, so the confirmation names the run the way the card did.
+  const globalNames: Partial<Record<MaintenanceOperation, string>> = {
+    analyze: labels?.analyzeGlobalLabel ?? "Run Analyze",
+    reindex: labels?.reindexGlobalLabel ?? "Run Reindex",
+    [vacuumOperation]: labels?.vacuumGlobalLabel ?? "Run Vacuum",
+    ...Object.fromEntries(declaredCards.map((card) => [card.type, card.label ?? card.title])),
+  };
+  // Declared cards count: an engine may offer none of the operations the three worded cards send.
+  const anyMaintenance = globalAnalyze || globalVacuum || globalReindex || declaredCards.length > 0;
 
-  // The per-row controls, in the provider's own words.
-  const tableActions = TABLE_ACTIONS.flatMap((action) => {
-    const control = maintenanceControl(capabilities, action.type, "perEntity");
-    return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
-  });
+  // The per-row controls, in the provider's own words: the tab's own candidates, then every declared operation outside
+  // `MaintenanceType` that runs on one row, in declaration order and under a generic icon (spec 3.11).
+  const tableActions: TableAction[] = [
+    ...TABLE_ACTIONS.flatMap((action) => {
+      const control = maintenanceControl(capabilities, action.type, "perEntity");
+      return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
+    }),
+    ...declaredEntityOperations(capabilities).map((operation) => ({
+      type: operation.type,
+      label: operation.label,
+      Icon: Wrench,
+      hover: "hover:text-brand",
+    })),
+  ];
 
   const handleConnectionChange = (id: string) => {
     const conn = connections.find((c) => c.id === id);
@@ -243,7 +368,7 @@ export function OperationsTab() {
   // Same reason as TablesTab: `table.schemaName` is the namespace for every engine, and the
   // row keys on it already. The log entry keeps naming the table alone, since that is what an
   // operator reads back (#772).
-  const handleRunMaintenance = async (type: string, target?: string, container?: string) => {
+  const runMaintenanceNow = async (type: MaintenanceOperation, target?: string, container?: string) => {
     const actionId = `${type}-${target || "global"}`;
     setActionLoading(actionId);
     const start = Date.now();
@@ -257,6 +382,41 @@ export function OperationsTab() {
     } finally {
       setActionLoading(null);
     }
+  };
+
+  // The handler every maintenance control on this tab calls (#1089, section 7.2). A declared card whose spec asks
+  // for a typed confirmation opens the typed dialog here instead, and the dialog sends the operation only once the
+  // connection's name matches. Every other whole-database call opens the plain confirmation (#1438). A per-row call
+  // whose spec asks for the row's own name or for a preview opens the per-row dialog instead (spec 3.11); every other
+  // per-row call sends with one click, as before.
+  const handleRunMaintenance = async (type: MaintenanceOperation, target?: string, container?: string) => {
+    const typedCard = target === undefined ? declaredCards.find((card) => card.type === type && card.typed) : undefined;
+    if (typedCard !== undefined) {
+      setTypedDialog({ card: typedCard, open: true, key: typedDialogOpenings });
+      setTypedDialogOpenings(typedDialogOpenings + 1);
+      return;
+    }
+    // A whole-database run asks first (#1438). The cards warn that these operations are
+    // resource-intensive, and on PostgreSQL "Run Reindex" is REINDEX DATABASE, which locks every
+    // table; terminating one session already asked, and these sent on the first click.
+    if (target === undefined) {
+      setConfirmGlobal({ type, name: globalNames[type] ?? type.toUpperCase() });
+      return;
+    }
+    const entity = entityRequest(capabilities, type, target, container);
+    if (entity !== null) {
+      setEntityDialog({ request: entity, open: true, key: entityDialogOpenings });
+      setEntityDialogOpenings(entityDialogOpenings + 1);
+      return;
+    }
+    await runMaintenanceNow(type, target, container);
+  };
+
+  // The whole-database confirmation's own button (#1438): the run it was opened for, once.
+  const handleConfirmGlobal = async () => {
+    if (!confirmGlobal) return;
+    setConfirmGlobal(null);
+    await runMaintenanceNow(confirmGlobal.type);
   };
 
   const handleKillClick = (session: ActiveSessionDetails) => {
@@ -412,12 +572,9 @@ export function OperationsTab() {
           whole-database form. On Couchbase every operation needs a keyspace, so this
           section is absent rather than three cards that answer "requires a
           target" (#496). */}
-      {anyMaintenance && (
+      {anyMaintenance && selectedConnection?.readOnly !== true && (
         <div>
-          <div className="flex items-center gap-2 mb-3">
-            <ShieldAlert className="h-4 w-4 text-brand" />
-            <h3 className="text-sm font-bold text-fg-secondary">Global Operations</h3>
-          </div>
+          <GlobalOperationsHeading />
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             {/* Analyze */}
             {globalAnalyze && (
@@ -434,7 +591,7 @@ export function OperationsTab() {
                     disabled={!!actionLoading || !selectedConnection}
                   >
                     {actionLoading === "analyze-global" ? <RefreshCw className="w-3 h-3 animate-spin mr-1" /> : null}
-                    {labels?.analyzeGlobalLabel ?? "Run Analyze"}
+                    {globalNames.analyze}
                   </Button>
                 </div>
                 <h4 className="text-sm font-bold text-fg mb-1">{labels?.analyzeGlobalTitle ?? "Update Statistics"}</h4>
@@ -461,7 +618,7 @@ export function OperationsTab() {
                     {actionLoading === `${vacuumOperation}-global` ? (
                       <RefreshCw className="w-3 h-3 animate-spin mr-1" />
                     ) : null}
-                    {labels?.vacuumGlobalLabel ?? "Run Vacuum"}
+                    {globalNames[vacuumOperation]}
                   </Button>
                 </div>
                 <h4 className="text-sm font-bold text-fg mb-1">{labels?.vacuumGlobalTitle ?? "Reclaim Space"}</h4>
@@ -490,7 +647,7 @@ export function OperationsTab() {
                     disabled={!!actionLoading || !selectedConnection}
                   >
                     {actionLoading === "reindex-global" ? <RefreshCw className="w-3 h-3 animate-spin mr-1" /> : null}
-                    {labels?.reindexGlobalLabel ?? "Run Reindex"}
+                    {globalNames.reindex}
                   </Button>
                 </div>
                 <h4 className="text-sm font-bold text-fg mb-1">{labels?.reindexGlobalTitle ?? "Rebuild Indexes"}</h4>
@@ -499,6 +656,34 @@ export function OperationsTab() {
                 </p>
               </div>
             )}
+
+            {/* The provider's own cards (#1089, section 7.2), one per operation it declares a title for, in its order. */}
+            {declaredCards.map((card) => (
+              <div
+                key={card.type}
+                className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors"
+              >
+                <div className="flex items-start justify-between mb-3">
+                  <div className="w-8 h-8 rounded-lg bg-brand-tint/10 border border-brand-tint/20 flex items-center justify-center">
+                    <Wrench className="w-4 h-4 text-brand" />
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs border-hairline-strong hover:bg-brand-tint/10 hover:text-brand"
+                    onClick={() => handleRunMaintenance(card.type)}
+                    disabled={!!actionLoading || !selectedConnection}
+                  >
+                    {actionLoading === `${card.type}-global` ? (
+                      <RefreshCw className="w-3 h-3 animate-spin mr-1" />
+                    ) : null}
+                    {card.label}
+                  </Button>
+                </div>
+                <h4 className="text-sm font-bold text-fg mb-1">{card.title}</h4>
+                <p className="text-xs text-fg-muted leading-relaxed">{card.description}</p>
+              </div>
+            ))}
 
             {/* Warning Card */}
             <div className="p-4 rounded-xl border border-danger-tint/10 bg-danger-tint/5 flex flex-col justify-center">
@@ -511,6 +696,18 @@ export function OperationsTab() {
               </p>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* A read-only connection's provider refuses every maintenance operation (#1089), so the section
+          says so in one line in place of every card it would draw. Read from the public field, with no
+          type branch. */}
+      {anyMaintenance && selectedConnection?.readOnly === true && (
+        <div data-testid="operations-read-only">
+          <GlobalOperationsHeading />
+          <p className="text-xs text-fg-muted leading-relaxed">
+            This connection is read-only: use a read-write connection for maintenance
+          </p>
         </div>
       )}
 
@@ -784,7 +981,7 @@ export function OperationsTab() {
 
       {/* Kill Session Confirmation Dialog */}
       <AlertDialog open={!!confirmKill} onOpenChange={() => setConfirmKill(null)}>
-        <AlertDialogContent className="bg-surface border-hairline-strong">
+        <AlertDialogContent className="bg-surface border-hairline-strong" {...confirmKillReturnFocus}>
           <AlertDialogHeader>
             <AlertDialogTitle className="text-fg">Terminate Session?</AlertDialogTitle>
             <AlertDialogDescription className="text-fg-tertiary">
@@ -813,6 +1010,76 @@ export function OperationsTab() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* A whole-database run's confirmation (#1438): the operation, the connection and the database, as the
+          Terminate dialog above names the session it will end. */}
+      <AlertDialog open={!!confirmGlobal} onOpenChange={() => setConfirmGlobal(null)}>
+        <AlertDialogContent className="bg-surface border-hairline-strong" {...confirmGlobalReturnFocus}>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-fg">{confirmGlobal?.name}?</AlertDialogTitle>
+            <AlertDialogDescription className="text-fg-tertiary">
+              This runs <span className="font-mono font-bold text-fg">{confirmGlobal?.type.toUpperCase()}</span> over
+              the whole database.
+              <br />
+              <br />
+              Connection: <span className="font-medium text-fg-secondary">{selectedConnection?.name}</span>
+              {selectedConnection?.database ? (
+                <>
+                  <br />
+                  Database: <span className="font-medium text-fg-secondary">{selectedConnection.database}</span>
+                </>
+              ) : null}
+              <br />
+              <br />
+              These operations can be resource-intensive. Avoid running them during peak traffic hours.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-hairline-strong text-fg-tertiary">Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmGlobal}>{confirmGlobal?.name}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* A declared card's typed confirmation (#1089, section 7.2): the connection's name, typed exactly. */}
+      {typedDialog && (
+        <TypedConfirmDialog
+          key={typedDialog.key}
+          open={typedDialog.open}
+          onOpenChange={(open) => !open && setTypedDialog(closedDialog)}
+          title={typedDialog.card.title}
+          description={typedDialog.card.description}
+          expected={selectedConnection?.name ?? ""}
+          match="exact"
+          unavailable={selectedConnection?.name ? undefined : UNNAMED_CONNECTION}
+          confirmLabel={typedDialog.card.title}
+          destructive
+          onConfirm={async () => {
+            // The outcome is the notification and the operation log, as for every other control on this tab, so
+            // the dialog closes once the request has answered, whatever it answered.
+            await runMaintenanceNow(typedDialog.card.type);
+            return null;
+          }}
+        />
+      )}
+
+      {/* A per-row operation's typed target or preview (spec 3.11): the row's own name, typed exactly, and the
+          provider's preview before the confirm button where the spec asks for one. */}
+      {entityDialog && (
+        <MaintenanceEntityDialog
+          key={entityDialog.key}
+          open={entityDialog.open}
+          onOpenChange={(open) => !open && setEntityDialog(closedEntityDialog)}
+          request={entityDialog.request}
+          loadPreview={previewMaintenance}
+          onConfirm={async () => {
+            // The outcome is the notification and the operation log, as for every other control on this tab.
+            const { type, target, container } = entityDialog.request;
+            await runMaintenanceNow(type, target, container);
+            return null;
+          }}
+        />
+      )}
     </div>
   );
 }

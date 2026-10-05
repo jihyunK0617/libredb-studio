@@ -147,6 +147,19 @@ describe("published image variants", () => {
     expect(dockerfile).toContain('CMD ["node", "server.js"]');
   });
 
+  test.each(VARIANTS)("%s copies the discovery exporter root-owned and creates no discovery directory", (variant) => {
+    const lines = instructions(readRepoFile(variant));
+
+    // Exactly this instruction: the exporter runs as root with the Docker socket, so a --chown here
+    // would let the uid 1001 web process rewrite a script that is host root one redeploy later.
+    expect(lines.filter((line) => line.includes("docker/discover.mjs"))).toEqual([
+      "COPY docker/discover.mjs /usr/local/lib/libredb-studio/discover.mjs",
+    ]);
+    // Docker must create the shared volume's root itself (root:root 0755): an image that ships
+    // /app/discovery would hand its owner to the volume, and the exporter refuses any other owner.
+    expect(lines.join("\n")).not.toContain("/app/discovery");
+  });
+
   test.each(VARIANTS)("%s starts as root so the entrypoint can chown the volume and drop privileges", (variant) => {
     const dockerfile = readRepoFile(variant);
 
@@ -213,6 +226,60 @@ describe("published image variants", () => {
     for (const line of instructions(readRepoFile(variant))) {
       expect(line).not.toContain("node-bindings-linux-x64");
     }
+  });
+
+  // db2-node (#786) is one package with eight addons at its root, and file
+  // tracing copies all eight into the standalone tree, so every variant prunes
+  // that tree to the one addon its libc and arch can load, then proves it.
+  const db2Libc = (variant: string) => (variant === "Dockerfile" ? "gnu" : "musl");
+
+  test.each(VARIANTS)("%s prunes db2-node to the addon it loads", (variant) => {
+    const cmds = commands(readRepoFile(variant));
+    const keep = `! -name "db2-node.linux-\${ARCH}-${db2Libc(variant)}.node" -delete`;
+
+    expect(cmds.some((line) => line.includes(".next/standalone/node_modules/db2-node") && line.includes(keep))).toBe(
+      true,
+    );
+  });
+
+  test.each(VARIANTS)("%s asserts the one db2-node addon in the standalone tree", (variant) => {
+    const cmds = commands(readRepoFile(variant));
+
+    // The standalone path, not the builder's own node_modules: that is the tree
+    // the runner copies, and asserting the other one proves nothing about it.
+    expect(cmds).toContain(
+      `test -f ".next/standalone/node_modules/db2-node/db2-node.linux-\${ARCH}-${db2Libc(variant)}.node"`,
+    );
+    expect(cmds).toContain(`test "$(find .next/standalone/node_modules/db2-node -name '*.node' | wc -l)" -eq 1`);
+  });
+
+  test.each(VARIANTS)("%s load-probes db2-node with the runtime that serves it", (variant) => {
+    const lines = instructions(readRepoFile(variant));
+    if (variant === "Dockerfile.alpine-slim") {
+      // The runner is alpine with Alpine's own nodejs, not the builder's node
+      // image, so only a probe in the runner proves the addon's libgcc_s.
+      const copy = lines.findIndex((line) => line.includes("/usr/src/app/.next/standalone ./"));
+      const probe = lines.indexOf(`RUN node -e "require('/app/node_modules/db2-node')"`);
+      expect(copy).toBeGreaterThan(-1);
+      expect(probe).toBeGreaterThan(copy);
+    } else {
+      expect(commands(readRepoFile(variant))).toContain(
+        `node -e "require('/usr/src/app/.next/standalone/node_modules/db2-node')"`,
+      );
+    }
+  });
+
+  test.each(VARIANTS)("%s names no per-arch db2-node addon", (variant) => {
+    for (const line of instructions(readRepoFile(variant))) {
+      expect(line).not.toMatch(/db2-node\.linux-(x64|arm64)/);
+    }
+  });
+
+  test.each(VARIANTS)("%s ships the third-party notices", (variant) => {
+    // The db2-node tarball carries no notices for the crates in its addons.
+    expect(instructions(readRepoFile(variant))).toContainEqual(
+      expect.stringMatching(/^COPY .*\/usr\/src\/app\/THIRD_PARTY_NOTICES\.txt \.\/THIRD_PARTY_NOTICES\.txt$/),
+    );
   });
 
   test("the Docker build matrix builds every variant, and only those", () => {

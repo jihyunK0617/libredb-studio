@@ -94,6 +94,10 @@ const CONNECTION_RELEVANCE: Record<keyof DatabaseConnection, FieldRelevance> = {
   // copies of a seed differing only here reach the same database with the same
   // credentials, so a run may still be started on the seed's id.
   skipObjectScan: "cosmetic",
+  // What the connection may DO, not which database it reaches or as whom (#1089): two copies of a
+  // seed differing only here reach the same database with the same credentials, so a run may still be
+  // started on the seed's id, where the seed's own mode applies.
+  readOnly: "cosmetic",
   type: "resolution",
   host: "resolution",
   port: "resolution",
@@ -126,6 +130,12 @@ const CONNECTION_RELEVANCE: Record<keyof DatabaseConnection, FieldRelevance> = {
   // The secret half authenticates but does not itself decide the catalog view.
   apiKeyId: "resolution",
   apiKeySecret: "resolution",
+  // Whether a Db2 connection may connect with no TLS at all (#786): like every transport field
+  // below, it decides whether, and how, the connection connects.
+  allowInsecureAuth: "resolution",
+  // Which addresses a read may reach and the token may be sent to: two copies differing only here reach different
+  // servers, so they do not resolve to the same connection.
+  dataServers: "resolution",
   ssl: "nested",
   sshTunnel: "nested",
 };

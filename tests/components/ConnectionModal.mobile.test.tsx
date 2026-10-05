@@ -114,6 +114,7 @@ function getDefaultForm() {
     setName: mock(() => {}),
     host: "localhost",
     setHost: mock(() => {}),
+    settleHost: mock(() => {}),
     port: "5432",
     setPort: mock(() => {}),
     user: "",
@@ -204,11 +205,12 @@ const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
   sqlite: ["database"],
   libredb: ["database"],
   duckdb: ["database"],
-  libsql: ["host", "port", "password", "connectionString"],
+  libsql: ["host", "port", "user", "password", "connectionString"],
   druid: ["host", "port", "user", "password"],
   elasticsearch: ["host", "port", "user", "password", "apiKeyId", "apiKeySecret"],
   opensearch: ["host", "port", "user", "password"],
   kafka: ["host", "port", "saslMechanism", "user", "password"],
+  etcd: ["host", "port", "user", "password"],
 };
 const mockFields = (type: string): string[] =>
   MOCK_CONNECTION_FIELDS[type] ?? ["host", "port", "user", "password", "database"];
@@ -240,11 +242,16 @@ mock.module("@/lib/db-ui-config", () => ({
   takesConnectionField: (type: string, field: string) => mockFields(type).includes(field),
   // The real rule: false only where an entry declares `showSshTunnel: false`, which Kafka's does.
   offersSshTunnel: (type: string) => type !== "kafka",
-  // The modal reads its field copy through these two; this table declares copy for Kafka alone, so
+  // The modal reads its field copy through these; this table declares copy for Kafka alone, so
   // every other engine reads the modal's own words. See the same pair in ConnectionModal.test.tsx.
   connectionFieldLabel: (config: { fieldLabels?: Record<string, string> }, field: string, fallback: string) =>
     config.fieldLabels?.[field] ?? fallback,
   connectionFieldHint: (config: { fieldHints?: Record<string, string> }, field: string) => config.fieldHints?.[field],
+  connectionFieldPlaceholder: (
+    config: { fieldPlaceholders?: Record<string, string> },
+    field: string,
+    fallback: string,
+  ) => config.fieldPlaceholders?.[field] ?? fallback,
   getDBIcon: () => () => null,
   getDBColor: () => "text-hue-blue",
   // See the same note in ConnectionModal.test.tsx: `DB_UI_CONFIG` became an exported

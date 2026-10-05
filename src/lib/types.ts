@@ -16,6 +16,7 @@
 */
 import type { StoredObject } from "@/lib/db/detailed-object";
 import type { ObjectSourceDocument } from "@/lib/db/types";
+import type { VectorColumn } from "@/lib/db/vector/types";
 
 export type DatabaseType =
   | "postgres"
@@ -25,6 +26,11 @@ export type DatabaseType =
   | "redis"
   | "oracle"
   | "mssql"
+  // IBM Db2 for Linux, UNIX and Windows (issue #786), reached through a Rust DRDA client shipped
+  // as native N-API addons, so no IBM client library is installed anywhere. Db2 for z/OS
+  // and Db2 for IBM i speak the same protocol and are out of scope: neither has been connected
+  // to, and their catalogs are not the `SYSCAT` views this provider reads.
+  | "db2"
   | "libredb"
   | "couchbase"
   | "clickhouse"
@@ -94,7 +100,46 @@ export type DatabaseType =
   // `queryLanguage: "json"` with a `queryDialect` of its own. The connection is one bootstrap
   // address plus TLS and an optional SASL credential, `saslMechanism` below naming how `user` and
   // `password` are checked; the client learns every other broker from the cluster's metadata.
-  | "kafka";
+  | "kafka"
+  // etcd (#1089). A key-value store read and written over its gRPC API, the second member of the
+  // `keyvalue/` family beside Redis. Its editor text is a subset of etcdctl's command line, so it
+  // declares `queryLanguage: "json"` with a `queryDialect` of its own, as Redis does for its commands.
+  // The connection is one endpoint plus TLS and an optional password; a client certificate names the
+  // user where etcd's RBAC is on, and `readOnly` below is a mode its provider enforces.
+  | "etcd"
+  // Neo4j (issue #424). A property graph queried in Cypher over Bolt, the first member of the
+  // `graph/` family, served read-only on the shared graph layer in `src/lib/db/graph/`. The
+  // connection is one Bolt endpoint plus TLS, a user and password, and an optional `database`;
+  // with none, the server's home database is used. Every write is refused before it is sent,
+  // whatever `readOnly` says.
+  | "neo4j"
+  // Milvus (vector-family spec 5). A vector database read over its gRPC API by a client of this repository's own,
+  // the first member of the `vector/` family. Its editor text is Milvus's own `POST /v2/vectordb/<route>` request
+  // with one JSON body, so it declares `queryLanguage: "json"` with a `queryDialect` of its own. The connection is
+  // one endpoint plus TLS, an optional user and a password or token, and an optional database; `readOnly` is a mode
+  // its provider enforces.
+  | "milvus"
+  // Qdrant (vector-family spec 6). A vector database read over its REST API by a client of this repository's own on
+  // the shared node transport (`src/lib/db/http/node-transport.ts`), a member of the `vector/` family. Its editor
+  // text is Qdrant's own `METHOD /path` request with one JSON body, so it declares `queryLanguage: "json"` with a
+  // `queryDialect` of its own. The connection is one REST endpoint plus TLS and an API key or JWT in `password`;
+  // there is no user and no database, and `readOnly` is a mode its provider enforces.
+  | "qdrant"
+  // InfluxDB (InfluxDB spec I2). A time-series store read over the v1 `/query` endpoint, as a form POST (R14), in
+  // InfluxQL: the TSM generation (1.x, and 2.x through its virtual DBRP mappings) and InfluxDB 3 through its
+  // v1-compatible handler. It declares `queryLanguage: "influxql"`. The connection is a host, a port, an optional
+  // user, a password or token, and an optional database; it is read-only whatever `readOnly` says.
+  | "influxdb"
+  // InfluxDB 3 (InfluxDB spec I2). InfluxDB 3 Core and Enterprise read over `POST /api/v3/query_sql` in Apache
+  // DataFusion SQL, extending `SQLBaseProvider`. The connection is a host, a port, a token in `password` and an
+  // optional database, the one session database whose tables are top-level objects (R1, R16); there is no user.
+  // Served from the same directory as `influxdb` (I2, I23), and read-only whatever `readOnly` says.
+  | "influxdb3"
+  // Oxia (CNCF Sandbox), a sharded key-value store read over its gRPC client API by a client of this repository's
+  // own (`src/lib/db/providers/keyvalue/oxia/`). Its editor text is one `oxia client` read command. Read-only in
+  // this version whatever `readOnly` says. The connection's Database field is the namespace and Password is a bearer
+  // token; `dataServers` lists a cluster's data servers.
+  | "oxia";
 
 export type ConnectionEnvironment = "production" | "staging" | "development" | "local" | "other";
 
@@ -136,7 +181,9 @@ export const ENVIRONMENT_LABELS: Record<ConnectionEnvironment, string> = {
  * `verify-ca` checks the chain and `verify-full` also the server name. That split is honoured
  * only where the driver exposes the name check on its own - Oracle's `sslServerDNMatch` is
  * the one that does; the Node TLS drivers cannot separate the two, so both land on
- * `rejectUnauthorized: true` there and each provider doc says so.
+ * `rejectUnauthorized: true` there and each provider doc says so. etcd's gRPC adapter could
+ * separate them and checks the name in both all the same, by decision, so that one mode means
+ * one thing across engines (#1089 E5).
  *
  * Adding a member here widens a published type (src/exports/types.ts), so every switch and
  * lookup table over SSLMode has to answer for it: the providers listed above, the seed schema
@@ -282,6 +329,30 @@ export interface DatabaseConnection {
    */
   saslMechanism?: "PLAIN" | "SCRAM-SHA-256" | "SCRAM-SHA-512";
   /**
+   * Db2: connect with no TLS although the password then crosses the network in cleartext (#786).
+   *
+   * An explicit acceptance of a risk, and never a default. A stock Db2 server without TLS offers
+   * only DRDA SECMEC 3, user and cleartext password, so the Db2 provider REFUSES a connection with
+   * no TLS unless this is `true`, and then asks db2-node for that mechanism by name, which 1.0.24
+   * and later refuse to fall back to otherwise (`docs/providers/db2.md`, section 3.3). Read by Db2 and by both
+   * InfluxDB types (`influxdb`, `influxdb3`, InfluxDB spec I7), each of which refuses a non-empty secret
+   * with TLS off, to a host that is not loopback and outside a tunnel, unless this is `true`. Oxia reads
+   * it too (DECISIONS O7): its bearer token crosses the network on every call, so an Oxia connection with
+   * a token and no TLS to a host other than this machine is refused unless this is `true`. Read by no
+   * other engine: each of those either encrypts the password itself or follows its own driver's default.
+   */
+  allowInsecureAuth?: boolean;
+  /**
+   * Oxia only (DECISIONS O6): the public addresses of a cluster's data servers, as `host:port` entries separated by
+   * commas or whitespace, at most 64. A shard leader the server advertises is dialled only when it equals the
+   * address the connection's own bootstrap call was sent to, or one of these entries; every listed leader gets the
+   * connection's TLS mode, CA and client pair and its own host as TLS identity, and the bearer token with them.
+   * Exact entries only, never a pattern: a pattern would send the token to any address it matches. Absent and empty
+   * are one value. Refused together with an SSH tunnel, because the leaders would bypass the tunnel. Read by no
+   * other engine.
+   */
+  dataServers?: string;
+  /**
    * Read no catalog when this connection opens.
    *
    * For a connection whose owner holds tens of thousands of objects, even the two cheap
@@ -296,6 +367,29 @@ export interface DatabaseConnection {
    * Oracle owner, and the flag follows the one that hurts.
    */
   skipObjectScan?: boolean;
+  /**
+   * Refuse every write on this connection, before any request (#1089): the provider answers a write
+   * command, an object edit and a maintenance operation with a refusal that names the read-only mode
+   * and where it was set, and sends nothing.
+   *
+   * Accepted only on an engine whose provider enforces it, which `READ_ONLY_ENFORCED` in
+   * `src/lib/db/compatibility.ts` records and a census holds equal to
+   * `ProviderCapabilities.enforcesReadOnly`. On any other engine `true` is refused, by the seed schema
+   * at load and by `assertReadOnlyHonoured` in `src/lib/db/factory.ts` before anything is built or
+   * dialled, because a mode the provider ignores would list the connection as read-only and send its
+   * writes. A value that is not a boolean is refused on every engine.
+   *
+   * What it binds depends on who holds the credentials. On a managed seed it is the operator's rule:
+   * the server re-resolves a `seed:` id from the operator's file and discards what the caller sent,
+   * and the seed schema refuses the field on a seed that is not managed. On a connection of the user's
+   * own it is a safety rail the user can turn off.
+   *
+   * `false` and absent are one mode, and the form writes nothing for `false`. It is the fourth part of
+   * `providerCacheKey`, so a read-only and a read-write connection never share a cached provider, and
+   * part of no identity digest (`connectionFingerprint`, `credentialDigest`, `connectionIdentity`),
+   * because it changes neither the server a connection reaches, nor as whom, nor which database.
+   */
+  readOnly?: boolean;
   managed?: boolean; // true = admin-controlled, read-only in UI
   seedId?: string; // stable reference to seed config ID
   agentUser?: string; // optional least-privilege role for the agent read-only execution profile (#328)
@@ -392,6 +486,18 @@ export interface ColumnSchema {
    * not model; see {@link defaultValue} and issue #1032.
    */
   defaultExpression?: string;
+  /**
+   * How the engine knows this column: `"sampled"` where the provider inferred it from rows it read rather than
+   * from a declaration the engine holds, so another row may carry a key this list lacks and a listed one may be
+   * absent from most rows.
+   *
+   * Absent means declared, which is every column of every engine that shipped before the field existed. Optional
+   * because this type is part of the published package surface. The object tree and the mobile column list show
+   * "(sampled)" beside such a column's type; the Source is provider-authored and states the sample itself.
+   * `machineColumns` in `src/lib/db/detailed-object.ts`
+   * keeps a sampled column from every model and MCP surface, because its name was read out of the data.
+   */
+  provenance?: "sampled";
 }
 
 export interface IndexSchema {
@@ -427,6 +533,13 @@ export interface QueryWarning {
    * reports no identifier, rather than claiming a zero.
    */
   code?: number | string;
+  /**
+   * The level the engine raised it at, as the server spells it (`WARNING`, `NOTICE`), which
+   * may be localized (`lc_messages`), when it reports one. A PostgreSQL-wire server sends
+   * both levels through the same channel (#1401), and `table "t" does not exist, skipping`
+   * is not a warning.
+   */
+  severity?: string;
 }
 
 /**
@@ -480,6 +593,11 @@ export interface QueryResult {
   rowCount: number;
   executionTime: number;
   explainPlan?: unknown;
+  /**
+   * Set by the client, only when SANDBOX ran this statement and the server CONFIRMED the
+   * rollback. The write's affected-row count is then said to be rolled back (#1425).
+   */
+  rolledBack?: boolean;
   pagination?: QueryPagination;
   /**
    * Notices the engine attached to this run. **Absent** when it reported none -
@@ -495,6 +613,32 @@ export interface QueryResult {
    * source for a computed column or an ad-hoc projection - the schema tree has no
    * catalog entry to answer with. Absent when the source declared none.
    */
+  columnTypes?: Record<string, string>;
+  /**
+   * The columns of this result that hold vectors, keyed by their names in `fields`: each one's kind, element type,
+   * dimension and, for a sparse column, its cell encoding. A cell of a declared column holds its engine's native
+   * form and renders as a vector cell, and Copy Cell copies it whole, as search data for the same engine; a column
+   * that is not declared renders as before, whatever its cells hold.
+   *
+   * **Absent** when the result has no vector column, never an empty object.
+   */
+  vectorColumns?: Readonly<Record<string, VectorColumn>>;
+  /**
+   * Every result set the text produced, in order, when it produced MORE than one: a T-SQL
+   * batch sent as one request (#1312), or a procedure that returns several. `rows`, `fields`
+   * and `columnTypes` above stay the first set's, as they always were. **Absent** for a text
+   * with one result set or none.
+   *
+   * The multi-statement route reads it to show a batch's last result with rows, the same
+   * rule it applies across a script's statements; `POST /api/db/query` and `POST /api/db/transaction` do not send it.
+   */
+  resultSets?: QueryResultSet[];
+}
+
+/** One result set of a text that produced several (`QueryResult.resultSets`). */
+export interface QueryResultSet {
+  rows: Record<string, unknown>[];
+  fields: string[];
   columnTypes?: Record<string, string>;
 }
 
@@ -573,7 +717,19 @@ export interface QueryTab {
    */
   runError?: string;
   isExecuting: boolean;
-  type: "sql" | "mongodb" | "redis" | "libredb" | "promql" | "kafka";
+  type:
+    | "sql"
+    | "mongodb"
+    | "redis"
+    | "libredb"
+    | "promql"
+    | "kafka"
+    | "etcd"
+    | "cypher"
+    | "milvus"
+    | "qdrant"
+    | "influxql"
+    | "oxia";
   viewMode?: "results" | "explain" | "history" | "saved";
   explainPlan?: unknown;
   // Pagination state
@@ -645,6 +801,13 @@ export interface QueryHistoryItem {
   executionTime: number;
   status: "success" | "error";
   executedAt: Date;
+  /**
+   * Absent for an ordinary run. `"explain"` marks a run that asked for the statement's PLAN:
+   * `query` is still the statement itself, and `rowCount` is omitted because the rows of a plan
+   * are not the statement's rows (#1447). Entries stored before this field existed read as
+   * ordinary runs.
+   */
+  kind?: "explain";
   rowCount?: number;
   errorMessage?: string;
 }

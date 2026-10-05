@@ -9,10 +9,11 @@ import {
   INVENTORY_PAIR_LIMIT,
   ObjectRouteError,
   handleObjectRequest,
-  readBoundedJson,
+  readObjectRouteBody,
   type ObjectRequestContext,
 } from "@/lib/api/object-route";
 import { SOURCE_CHARACTER_LIMIT, SOURCE_PART_LIMIT, sourceBoundTruncationReason } from "@/lib/db/object-kinds";
+import { EDIT_BODY_BYTE_LIMIT } from "@/lib/db/object-edit";
 // The CLIENT's shape check, imported into the route's own suite on purpose: the route carries a
 // refusal sentence through untouched and the client refuses that document, and one test pinning
 // both ends is the only thing that keeps the pair from drifting into a contradiction (#789).
@@ -1375,6 +1376,52 @@ describe("POST /api/db/objects/inventory", () => {
     });
   });
 
+  test("includeDefaultSql asks describeObjects for default SQL, and only then is an options argument passed", async () => {
+    // #1031: MySQL's catalog spells a default as a value, so the SQL text costs one DDL read per
+    // table. Only SchemaDiff asks. The call without the flag is byte-for-byte the call above.
+    const describeObjects = mock<DatabaseProvider["describeObjects"]>(async () => ({ details: [] }));
+    activeProvider = objectProvider({
+      objectKinds: [TABLE_KIND],
+      listContainers: mock(async () => [{ path: ["app"], name: "app", level: 0 }]),
+      listObjects: mock(async () => [object(["app", "orders"], "table")]),
+      describeObjects,
+    });
+
+    await inventoryRoute.POST(
+      createMockRequest("/api/db/objects/inventory", {
+        method: "POST",
+        body: { connection, includeColumns: true, includeDefaultSql: true },
+      }) as never,
+    );
+
+    expect(describeObjects.mock.calls[0]).toEqual([["app"], "table", 1, { defaultSql: true }]);
+  });
+
+  test.each([
+    [
+      "is not a boolean",
+      { includeColumns: true, includeDefaultSql: "true" },
+      '"includeDefaultSql" must be true or false',
+    ],
+    [
+      "comes without includeColumns, where there is no column to carry it",
+      { includeDefaultSql: true },
+      '"includeDefaultSql" needs "includeColumns": default SQL is carried on the columns',
+    ],
+  ])("includeDefaultSql that %s is a caller mistake", async (_label, flags, error) => {
+    activeProvider = objectProvider({
+      listContainers: mock(async () => []),
+      listObjects: mock(async () => []),
+    });
+
+    const response = await inventoryRoute.POST(
+      createMockRequest("/api/db/objects/inventory", { method: "POST", body: { connection, ...flags } }) as never,
+    );
+
+    expect(response.status).toBe(400);
+    expect((await parseResponseJSON<{ error: string }>(response)).error).toBe(error);
+  });
+
   test("includeColumns must be a boolean, and anything else is a caller mistake", async () => {
     // Answering the cheap read to a caller who is about to render an empty column list is the
     // silent degradation this surface exists to avoid.
@@ -1653,6 +1700,121 @@ describe("POST /api/db/objects/inventory", () => {
 
     const body = await parseResponseJSON<Record<string, unknown>>(response);
     expect("defaultContainer" in body).toBe(false);
+  });
+});
+
+// ============================================================================
+// a kind only the Keys panel enumerates (#1089 3.4)
+// ============================================================================
+
+describe("a kind the Keys panel enumerates, on the inventory and search routes", () => {
+  const PREFIX_KIND: ObjectKindSpec = {
+    id: "prefix",
+    role: "relation",
+    label: "Key Prefix",
+    labelPlural: "Key Prefixes",
+  };
+  const KEY_KIND: ObjectKindSpec = {
+    id: "key",
+    role: "config",
+    label: "Key",
+    labelPlural: "Keys",
+    enumeratedBy: "key-browser",
+    hasSource: true,
+    sourceLanguage: "json",
+  };
+  const REFUSAL =
+    'redis enumerates the kind "key" in the Keys panel alone, so no inventory or search lists it; browse it in the Keys panel';
+
+  /**
+   * No container level, a prefix kind and a key kind, and a `listObjects` that THROWS for the key kind,
+   * as a provider declaring it refuses it by name: a route that walked it would answer that error
+   * rather than the prefix groups, which is how each test below tells a kind left out from one listed.
+   */
+  function keyValueProvider() {
+    const listObjects = mock(async (_container: readonly string[], kind: string) => {
+      if (kind === "key") throw new QueryError('the kind "key" is listed by the Keys panel', "redis");
+      return [object(["/app/*"], "prefix")];
+    });
+    activeProvider = objectProvider({
+      type: "redis",
+      containerLevels: [],
+      objectKinds: [PREFIX_KIND, KEY_KIND],
+      listObjects,
+    });
+    return listObjects;
+  }
+
+  test("an inventory that names no kinds answers the other kinds and never lists it", async () => {
+    const listObjects = keyValueProvider();
+
+    const response = await inventoryRoute.POST(
+      createMockRequest("/api/db/objects/inventory", { method: "POST", body: { connection } }) as never,
+    );
+
+    expect(response.status).toBe(200);
+    expect((await parseResponseJSON<{ objects: DatabaseObject[] }>(response)).objects).toEqual([
+      { path: ["/app/*"], name: "/app/*", kind: "prefix" },
+    ]);
+    expect(listObjects.mock.calls.map((call) => call[1])).toEqual(["prefix"]);
+  });
+
+  test("a search that names no kinds answers the other kinds and never lists it", async () => {
+    const listObjects = keyValueProvider();
+
+    const response = await searchRoute.POST(
+      createMockRequest("/api/db/objects/search", { method: "POST", body: { connection, term: "app" } }) as never,
+    );
+
+    expect(response.status).toBe(200);
+    expect((await parseResponseJSON<DatabaseObject[]>(response)).map((found) => found.path)).toEqual([["/app/*"]]);
+    expect(listObjects.mock.calls.map((call) => call[1])).toEqual(["prefix"]);
+  });
+
+  test("an inventory naming it is a 400 that points at the Keys panel, and lists nothing", async () => {
+    const listObjects = keyValueProvider();
+
+    const response = await inventoryRoute.POST(
+      createMockRequest("/api/db/objects/inventory", { method: "POST", body: { connection, kinds: ["key"] } }) as never,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await parseResponseJSON<Record<string, unknown>>(response)).toEqual({ error: REFUSAL });
+    expect(listObjects).toHaveBeenCalledTimes(0);
+  });
+
+  test("a search naming it beside another kind is the same 400, and lists nothing", async () => {
+    const listObjects = keyValueProvider();
+
+    const response = await searchRoute.POST(
+      createMockRequest("/api/db/objects/search", {
+        method: "POST",
+        body: { connection, term: "app", kinds: ["prefix", "key"] },
+      }) as never,
+    );
+
+    expect(response.status).toBe(400);
+    expect((await parseResponseJSON<{ error: string }>(response)).error).toBe(REFUSAL);
+    expect(listObjects).toHaveBeenCalledTimes(0);
+  });
+
+  // The ORDER of the two refusals, pinned: a kind the engine never declared is a claim about the
+  // engine, and telling the caller it lives in the Keys panel would name a kind that does not exist.
+  test("a kind the engine does not declare is still refused as undeclared, never pointed at the Keys panel", async () => {
+    const listObjects = keyValueProvider();
+
+    const response = await inventoryRoute.POST(
+      createMockRequest("/api/db/objects/inventory", {
+        method: "POST",
+        body: { connection, kinds: ["value"] },
+      }) as never,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await parseResponseJSON<Record<string, unknown>>(response)).toEqual({
+      error: 'redis declares no object kind "value"',
+    });
+    expect(listObjects).toHaveBeenCalledTimes(0);
   });
 });
 
@@ -2185,12 +2347,12 @@ describe("the body read the handler actually performs", () => {
   });
 
   test("the two reads DIVERGE on an empty JSON object, and the divergence is pinned here", async () => {
-    // `readDefaultBody` refuses `{}` itself; `readBoundedJson` RETURNS it and `resolveConnection` is
+    // `readDefaultBody` refuses `{}` itself; `readObjectRouteBody` RETURNS it and `resolveConnection` is
     // what then refuses. Both answers are 400 and both sentences are true of the body, but they are
     // different sentences on one handler, so the pair is asserted rather than left for a later reader
     // to discover from a bug report.
     const response = await handleObjectRequest(post({}), probeRoute, async () => ({ ok: true }), {
-      readBody: (req) => readBoundedJson(req, 1024),
+      readBody: (req) => readObjectRouteBody(req, 1024),
     });
 
     expect(response.status).toBe(400);
@@ -2199,16 +2361,16 @@ describe("the body read the handler actually performs", () => {
     });
   });
 
-  test("readBoundedJson's 413 reaches the wire THROUGH the handler, sentence and status", async () => {
+  test("readObjectRouteBody's 413 reaches the wire THROUGH the handler, sentence and status", async () => {
     // The edit routes' exact call shape, with a small limit standing in for EDIT_BODY_BYTE_LIMIT so
-    // the body is a test-sized one. Before this, `readBoundedJson` had never once been reached
+    // the body is a test-sized one. Before this, `readObjectRouteBody` had never once been reached
     // through `handleObjectRequest`, so nothing proved its `ObjectRouteError` was rendered by the
     // catch rather than escaping as a 500.
     const response = await handleObjectRequest(
       post({ text: "x".repeat(2048) }),
       probeRoute,
       async () => ({ ok: true }),
-      { readBody: (req) => readBoundedJson(req, 1024) },
+      { readBody: (req) => readObjectRouteBody(req, 1024) },
     );
 
     expect(response.status).toBe(413);
@@ -2229,6 +2391,70 @@ describe("the body read the handler actually performs", () => {
       error: "that plan is not one this server will run",
       code: "EDIT_PLAN_INVALID",
     });
+  });
+});
+
+/**
+ * The two refusals the edit routes' body read took from the shared reader in
+ * `src/lib/api/bounded-json.ts`, measured through the real route handlers. Before that reader, a
+ * byte that is not UTF-8 was decoded to U+FFFD and parsed, and a declared Content-Length over the
+ * bound was read before it was refused.
+ */
+describe("the edit routes' body read", () => {
+  const editRoutes = ["edit-plan", "edit-apply"] as const;
+
+  test("a body that is not valid UTF-8 answers 400 with the not-valid-JSON sentence", async () => {
+    const prefix = new TextEncoder().encode('{"connectionId":"seed-1","sql":"');
+    const bytes = new Uint8Array([...prefix, 0xff, 0x22, 0x7d]);
+    for (const name of editRoutes) {
+      // oxlint-disable-next-line no-await-in-loop -- one route after the other, so a failure names its route.
+      const response = await objectRoutes[name].POST(
+        new Request(`http://localhost:3000/api/db/objects/${name}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bytes,
+        }) as never,
+      );
+      expect(response.status).toBe(400);
+      // oxlint-disable-next-line no-await-in-loop -- one route after the other, so a failure names its route.
+      expect(await parseResponseJSON<Record<string, unknown>>(response)).toEqual({
+        error: "this request body is not valid JSON",
+      });
+    }
+    expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(0);
+  });
+
+  test("a declared Content-Length over the bound answers 413 before the body is read", async () => {
+    for (const name of editRoutes) {
+      let pulls = 0;
+      const stream = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            pulls += 1;
+            controller.enqueue(new TextEncoder().encode('{"connectionId":"seed-1"}'));
+            controller.close();
+          },
+        },
+        // No read-ahead: a pull happens only when the reader asks, so a zero count proves no read.
+        { highWaterMark: 0 },
+      );
+      const request = new Request(`http://localhost:3000/api/db/objects/${name}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "content-length": String(EDIT_BODY_BYTE_LIMIT + 1) },
+        body: stream,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+      // oxlint-disable-next-line no-await-in-loop -- one route after the other, so a failure names its route.
+      const response = await objectRoutes[name].POST(request as never);
+      expect(response.status).toBe(413);
+      // oxlint-disable-next-line no-await-in-loop -- one route after the other, so a failure names its route.
+      expect(await parseResponseJSON<Record<string, unknown>>(response)).toEqual({
+        error: `this request body is larger than ${EDIT_BODY_BYTE_LIMIT} bytes`,
+      });
+      expect(pulls).toBe(0);
+      expect(request.bodyUsed).toBe(false);
+    }
+    expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(0);
   });
 });
 

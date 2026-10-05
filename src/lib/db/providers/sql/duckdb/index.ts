@@ -25,6 +25,17 @@
  *   for. What closes it is a SECOND engine option, `enable_external_access: 'false'`,
  *   passed beside `access_mode` when the read-only handle is opened (`client.ts`); the
  *   statement guard below is the layer above it, not the boundary.
+ * - **File access is decided per requester and per connection on the editor handle,
+ *   independently of `access_mode` (non-admin DuckDB file access).** `enable_external_access: 'false'` closes every
+ *   statement-level file route on a WRITABLE handle too, but for the database's own files and the
+ *   handle's private temp directory (`client.ts`), with the database still writable
+ *   (measured). Every non-admin role opens that denied posture and keeps its writes, and so does
+ *   every role on a seed a non-admin role can use, because that record is one handle for all of
+ *   them; an admin on an inline connection or an admin-only seed keeps full reach. The posture
+ *   reaches the provider through `ProviderExecutionContext.allowExternalFileAccess`, derived
+ *   server-side by `editorExecutionContext`; `getOrCreateProvider` keys the handle cache by it.
+ *   The statement denylist below is NOT added to this editor path: the engine option is the
+ *   boundary, as it is for the agent profile.
  * - **No statement router.** `SQLBaseProvider.isReadOnlyQuery` types a statement by its
  *   leading keyword, and DuckDB has four row-producing forms that keyword set does not
  *   know (`FROM tbl`, `CALL`, `SUMMARIZE`, `PIVOT`). Rather than extend a router this
@@ -87,7 +98,7 @@ import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import { readLeadingKeyword } from "@/lib/sql/leading-keyword";
 import { findCodeWord } from "@/lib/sql/words";
 import { hasUnterminatedSpan } from "@/lib/sql/spans";
-import { type DuckDBClient, describeOpenFailure, openDuckDBClient } from "./client";
+import { type DuckDBClient, MEMORY_TARGET, describeOpenFailure, openDuckDBClient } from "./client";
 import {
   readActiveSessions,
   readHealth,
@@ -138,15 +149,14 @@ import {
 } from "./objects";
 import { comparePaths } from "@/lib/db/object-path";
 import { readCount, toQueryResult } from "./values";
+import { isUnwritableExistingFile } from "@/lib/db/utils/unwritable-file";
+import { logger } from "@/lib/logger";
 import * as fs from "fs";
 import * as path from "path";
 
 // ============================================================================
 // Constants
 // ============================================================================
-
-/** DuckDB's in-memory target. Accepted wherever a path is, and never touched on disk. */
-const MEMORY_TARGET = ":memory:";
 
 /** DuckDB's default schema; a maintenance target with no schema is resolved into it. */
 const DEFAULT_SCHEMA = "main";
@@ -183,8 +193,42 @@ const QUERY_ERROR_PREFIXES = [
 /** DuckDB's own word for a statement `interrupt()` stopped. */
 const INTERRUPT_PREFIX = "INTERRUPT Error";
 
+/**
+ * DuckDB's own sentence for a write on a database attached read-only, measured on v1.5.5:
+ * `Invalid Input Error: Cannot execute statement of type "INSERT" on database "<name>"
+ * which is attached in read-only mode!`. Matched as a whole from the start, so the same
+ * words echoed inside some other error (a cast of a string literal, say) are not read as
+ * it, and the database it names is captured: a refusal on another ATTACHed database is
+ * not about the editor's file.
+ */
+const READ_ONLY_REFUSAL =
+  /^Invalid Input Error: Cannot execute statement of type "[^"]+" on database "([^"]+)" which is attached in read-only mode!/;
+
 /** The lock message; shared with `client.ts`'s open-time diagnosis. */
 const LOCK_CONFLICT_MARKER = "conflicting lock is held";
+
+/**
+ * How the engine opens every refusal `enable_external_access: 'false'` raises, measured on
+ * v1.5.5-r.5: a file read or write ("Cannot access file"), `INSTALL` and `CREATE SECRET`
+ * ("Cannot access directory"), `LOAD` and `SET temp_directory`.
+ */
+const PERMISSION_REFUSAL_PREFIX = "Permission Error:";
+
+/**
+ * The reason put in front of such a refusal on an editor handle opened with file access denied (the
+ * non-admin DuckDB file-access change). The engine says only that file system operations are "disabled
+ * by configuration", which reads like a server fault to the user and tells the operator nothing about
+ * why, so the handle's posture is named the way the read-only reason is for an unwritable file
+ * (#1405).
+ *
+ * It is worded around the HANDLE, not Studio's roles alone, because the handle opens denied in three
+ * cases: a non-admin role, every role on a connection a non-admin role can use, and a library embedder
+ * of `@libredb/studio/providers` that built the provider without passing
+ * `{ allowExternalFileAccess: true }` (fail closed). The last caller has no admin/non-admin model, so
+ * the opt-in is named rather than a role policy it cannot act on.
+ */
+const FILE_ACCESS_DENIED_REASON =
+  "File and network access is off on this DuckDB connection: the handle was opened with external access denied, which Studio does for every role but admin and for any connection a non-admin role can use, and which an embedder overrides by passing { allowExternalFileAccess: true }";
 
 export function mapDuckDBError(error: unknown, sql?: string): Error {
   if (error instanceof DatabaseError || error instanceof ExecutionProfileError) return error;
@@ -352,9 +396,25 @@ export function assertReadOnlyStatementIsBounded(sql: string): void {
 
 export class DuckDBProvider extends SQLBaseProvider {
   private client: DuckDBClient | null = null;
+  /**
+   * The editor's file and its catalog name, when it was opened read-only because this
+   * process cannot write it (#1405). The name is what DuckDB's refusal quotes.
+   */
+  private unwritableFile: { path: string; catalog: string } | null = null;
 
   /** True when this instance was opened under the agent read-only profile. */
   private readonly readOnlyProfile: boolean;
+
+  /**
+   * True when the editor handle must open with `enable_external_access: 'false'` (non-admin DuckDB file access):
+   * the posture for every role but admin, and for an admin too on a seed a non-admin role can
+   * use (one writer per file). Derived once in the constructor from the
+   * server-injected execution context and NEVER from `config` or `ProviderOptions`, both of
+   * which are caller-supplied. Absent means deny (fail closed). The agent read-only profile
+   * already closes file access through `readOnly`, so this stays false there and does not
+   * double up.
+   */
+  private readonly denyExternalAccess: boolean;
 
   /**
    * Client-supplied query tokens currently in flight, so `cancelQuery` can tell "I
@@ -369,8 +429,13 @@ export class DuckDBProvider extends SQLBaseProvider {
     super(config, options);
     // Server-injected only (see ProviderExecutionContext): the shared editor path
     // builds providers from caller-supplied ProviderOptions, which has no route to
-    // this flag in either direction.
+    // these flags in either direction.
     this.readOnlyProfile = execution.readOnly === true;
+    // Deny the editor handle's file and network reach unless the server-derived posture
+    // allowed it. `readOnly` already closes file access and keeps precedence, so an agent handle
+    // does not also carry this (it would be redundant). Absent allowExternalFileAccess is
+    // deny, which is the fail-closed polarity: a forged or missing context sandboxes.
+    this.denyExternalAccess = execution.readOnly !== true && execution.allowExternalFileAccess !== true;
     this.validate();
   }
 
@@ -397,6 +462,11 @@ export class DuckDBProvider extends SQLBaseProvider {
       // so a second Studio handle on it is not a lesser handle - it is no handle at
       // all. See `findOpenSingleWriterProvider` (BACKLOG D3, B49).
       singleWriterFile: true,
+      // This provider reads `ProviderExecutionContext.allowExternalFileAccess` and opens its editor
+      // handle under that posture (the non-admin DuckDB file-access change). The cache key and the
+      // single-writer borrow split DuckDB handles by posture because of it, through
+      // `READS_FILE_ACCESS_POSTURE`, never a `connection.type` branch.
+      readsFileAccessPosture: true,
       // Declared explicitly rather than left to `query-generators.ts`'s port
       // heuristics: `defaultPort: null` is shared with sqlite, and two engines behind
       // one null port is the collision that forced this field for the search engines.
@@ -449,7 +519,7 @@ export class DuckDBProvider extends SQLBaseProvider {
       // publishes a definition text for each of them and no fifth kind is declared, so
       // the "declares nothing" half of this engine's row in #789 is empty. `sql` is the
       // honest id rather than a compromise: DuckDB's dialect is PostgreSQL-shaped, the
-      // installed monaco-editor 0.56.0 registers no DuckDB id, and the text the engine
+      // installed monaco-editor 0.57.0 registers no DuckDB id, and the text the engine
       // publishes is ordinary SQL. The `macro` text is the only `partial` form ON THIS
       // ENGINE, not in the fleet: the #789 design names PostgreSQL `view` and
       // `materialized_view` and Couchbase `function` as producers of the same arm, and
@@ -599,7 +669,29 @@ export class DuckDBProvider extends SQLBaseProvider {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       }
 
-      this.client = await openDuckDBClient(dbPath, { readOnly: false });
+      // An existing file this process cannot write, or whose directory it cannot write, is
+      // opened read-only rather than left to fail (#1404): a read-write open of an
+      // unwritable file answers "Permission denied" and reads nothing at all, and one in an
+      // unwritable directory fails its first commit on the `.wal` it cannot create.
+      const unwritableFile = isUnwritableExistingFile(dbPath);
+      // The denied editor posture rides on `denyExternalAccess`: a writable handle with
+      // `enable_external_access: 'false'`, composed with `access_mode: 'READ_ONLY'` when the
+      // file is also unwritable. A full-reach editor passes neither (non-admin DuckDB file access).
+      this.client = await openDuckDBClient(dbPath, {
+        readOnly: false,
+        unwritableFile,
+        denyExternalAccess: this.denyExternalAccess,
+      });
+      // Set on every open, never carried over from an earlier handle on this provider.
+      this.unwritableFile = null;
+      // Logged once the open succeeded, so a file refused at open is not announced as opened.
+      if (unwritableFile) {
+        const [{ name }] = (await this.client.run("SELECT current_database() AS name")).rows as { name: string }[];
+        this.unwritableFile = { path: dbPath, catalog: name };
+        logger.info(`[DuckDB] Opened ${dbPath} read-only: this process cannot write the file or its directory`, {
+          provider: "duckdb",
+        });
+      }
       this.setConnected(true);
     } catch (error) {
       this.setError(error instanceof Error ? error : new Error(String(error)));
@@ -634,10 +726,17 @@ export class DuckDBProvider extends SQLBaseProvider {
 
   public async disconnect(): Promise<void> {
     if (this.client) {
-      this.client.close();
-      this.client = null;
-      this.runningQueryIds.clear();
-      this.setConnected(false);
+      try {
+        this.client.close();
+      } finally {
+        // Cleared whatever close() raised. It closes the engine handle before it removes the private
+        // temp directory, so a removal that fails (EACCES, or EBUSY on Windows) must not leave this
+        // provider marked connected on a closed client: connect() would return early on it and the
+        // handle could never be reopened. The error still reaches the caller.
+        this.client = null;
+        this.runningQueryIds.clear();
+        this.setConnected(false);
+      }
     }
   }
 
@@ -664,7 +763,24 @@ export class DuckDBProvider extends SQLBaseProvider {
           try {
             return await this.client!.run(sql, params);
           } catch (error) {
-            throw mapDuckDBError(error, sql);
+            const mapped = mapDuckDBError(error, sql);
+            // The engine's refusal names the read-only mode but not why the editor is in
+            // it, so the reason is put in front of it (#1405), as the SQLite provider does,
+            // and only when the refused database is the editor's own file.
+            const refusedCatalog = READ_ONLY_REFUSAL.exec(mapped.message)?.[1];
+            if (this.unwritableFile !== null && refusedCatalog === this.unwritableFile.catalog) {
+              throw new QueryError(
+                `DuckDB database ${this.unwritableFile.path} is open read-only because this process cannot write the file or its directory: ${mapped.message}`,
+                "duckdb",
+                sql,
+              );
+            }
+            // The same for the file-access posture (non-admin DuckDB file access): only on a handle opened with file
+            // access denied, and only for the engine's permission refusals.
+            if (this.denyExternalAccess && mapped.message.startsWith(PERMISSION_REFUSAL_PREFIX)) {
+              throw new QueryError(`${FILE_ACCESS_DENIED_REASON}: ${mapped.message}`, "duckdb", sql);
+            }
+            throw mapped;
           }
         });
 

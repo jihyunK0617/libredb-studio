@@ -29,7 +29,7 @@ import {
 import { DatabaseConnection, SavedQuery, QueryHistoryItem } from "@/lib/types";
 import { relationObjects, type DetailedObject } from "@/lib/db/detailed-object";
 import { pathKey } from "@/lib/db/object-path";
-import type { ProviderCapabilities } from "@/lib/db/types";
+import { offersSchemaDiagram, type ProviderCapabilities } from "@/lib/db/types";
 import { storage } from "@/lib/storage";
 import { getDBIcon } from "@/lib/db-ui-config";
 
@@ -47,7 +47,12 @@ interface CommandPaletteProps {
   capabilities?: ProviderCapabilities;
   onSelectConnection: (conn: DatabaseConnection) => void;
   onTableClick: (path: readonly string[]) => void;
-  onAddConnection: () => void;
+  /**
+   * Opens the connection dialog. Optional, and the item is not rendered without it: the
+   * standalone shell withholds it while the server refuses custom connections
+   * (`ALLOW_CUSTOM_CONNECTIONS`), the same rule `onAskAgent` below follows.
+   */
+  onAddConnection?: () => void;
   onExecuteQuery: () => void;
   onLoadSavedQuery: (query: string) => void;
   onLoadHistoryQuery: (query: string) => void;
@@ -162,10 +167,12 @@ export function CommandPalette({
               <span>Ask the agent about this query</span>
             </CommandItem>
           )}
-          <CommandItem onSelect={() => runAction(onAddConnection)}>
-            <Plus strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-emerald" />
-            <span>New Connection</span>
-          </CommandItem>
+          {onAddConnection && (
+            <CommandItem onSelect={() => runAction(onAddConnection)}>
+              <Plus strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-emerald" />
+              <span>New Connection</span>
+            </CommandItem>
+          )}
           <CommandItem onSelect={() => runAction(onNavigateHealth)}>
             <Activity strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-emerald" />
             <span>Health Dashboard</span>
@@ -174,7 +181,8 @@ export function CommandPalette({
             <Gauge strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-purple" />
             <span>Monitoring</span>
           </CommandItem>
-          {activeConnection && (
+          {/* Not on a Cypher connection: its relationship types are no tables (SR20). */}
+          {activeConnection && offersSchemaDiagram(capabilities) && (
             <CommandItem onSelect={() => runAction(onShowDiagram)}>
               <Layers strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-cyan" />
               <span>Schema Diagram (ERD)</span>

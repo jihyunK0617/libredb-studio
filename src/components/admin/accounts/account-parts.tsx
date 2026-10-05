@@ -1,6 +1,6 @@
 "use client";
 
-import { ShieldCheck } from "lucide-react";
+import { Fingerprint, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import type { PublicAccount } from "@/lib/local-accounts";
@@ -43,6 +43,30 @@ export function TwoFactorStatus({ enabled, className }: { enabled: boolean; clas
   );
 }
 
+/** "1 passkey", "2 passkeys": the count as the dialogs and the mobile badge say it. */
+export function passkeyPhrase(count: number): string {
+  return `${count} ${count === 1 ? "passkey" : "passkeys"}`;
+}
+
+/** The Passkeys column: the count, or a muted "None". */
+export function PasskeyCount({ count }: { count: number }) {
+  return count > 0 ? (
+    <span className="text-xs text-fg-secondary tabular-nums">{count}</span>
+  ) : (
+    <span className="text-xs text-fg-subtle">None</span>
+  );
+}
+
+/** The folded mobile row's mark for an account that has passkeys. */
+export function PasskeyBadge({ count }: { count: number }) {
+  return (
+    <Badge variant="outline" className="gap-1 border-hairline-strong text-fg-tertiary">
+      <Fingerprint aria-hidden className="size-3" />
+      {passkeyPhrase(count)}
+    </Badge>
+  );
+}
+
 export function YouTag() {
   return (
     <span className="inline-flex shrink-0 items-center rounded border border-hairline-strong px-1.5 text-[0.6875rem] leading-4 font-medium text-fg-muted">
@@ -53,16 +77,6 @@ export function YouTag() {
 
 export function MonoEmail({ value }: { value: string }) {
   return <span className="font-mono break-all text-fg">{value}</span>;
-}
-
-/** A refusal shown next to the control that caused it. */
-export function FormError({ message }: { message: string | null }) {
-  if (!message) return null;
-  return (
-    <p role="alert" className="text-sm text-danger">
-      {message}
-    </p>
-  );
 }
 
 export function formatCreated(createdAt: string): string {

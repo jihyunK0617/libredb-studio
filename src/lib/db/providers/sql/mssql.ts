@@ -5,7 +5,7 @@
 
 import mssql from "mssql";
 import { SQLBaseProvider } from "./sql-base";
-import { mssqlColumnTypes } from "./column-types";
+import { type MssqlColumnMetadata, mssqlColumnTypes } from "./column-types";
 import {
   type DatabaseConnection,
   type QueryResult,
@@ -439,7 +439,7 @@ const TRIGGER_KIND = "trigger";
  * stopped highlighting.
  *
  * `sql` and NOT `tsql`. MEASURED in #789: `tsql` is not among the 89 language ids the
- * installed monaco-editor 0.56.0 bundle registers, and neither are `plsql` and `cql`, so
+ * installed monaco-editor 0.57.0 bundle registers, and neither are `plsql` and `cql`, so
  * the one id in the bundle that highlights this dialect is the generic one. T-SQL keywords
  * the generic grammar does not know (`OUTER APPLY`, `MERGE ... OUTPUT`) render as plain
  * identifiers, which is a compromise `docs/providers/mssql.md` records rather than hides.
@@ -1465,6 +1465,81 @@ function byObjectId<T extends BulkRow>(rows: readonly T[]): Map<number, T[]> {
   return grouped;
 }
 
+/**
+ * The declarations whose `Date` is NOT the honest shape of the value (#1132).
+ *
+ * `time` is a time-of-day on an invented 1970-01-01, `date` a calendar day at UTC midnight
+ * and `datetime2` a wall-clock reading with no zone, so an ISO instant reports a moment
+ * none of them holds - and the format cuts a `time(7)` from seven digits to three.
+ * `datetimeoffset` is deliberately absent: it IS an instant, so its ISO shape is right.
+ */
+const ZONELESS_VALUE_DECLARATIONS = new Set(["time", "date", "datetime2"]);
+
+/** Two digits, the width every part of a date or time text carries except the year. */
+function pad2(value: number): string {
+  return value.toString().padStart(2, "0");
+}
+
+/** `2026-09-01` - the calendar day, from the UTC-midnight `Date` the driver reads. */
+function dateText(value: Date): string {
+  return `${value.getUTCFullYear().toString().padStart(4, "0")}-${pad2(value.getUTCMonth() + 1)}-${pad2(value.getUTCDate())}`;
+}
+
+/**
+ * `10:30:00.1234567` - the time-of-day text, carrying the `scale` digits the column declared.
+ *
+ * The driver's `Date` holds the millisecond part and keeps the REST of the seven digits a
+ * `time(7)` can carry beside it, as a non-enumerable `nanosecondsDelta` (`tedious`
+ * `value-parser.js` sets it on every one of these reads), so the fraction is reconstructed
+ * exactly rather than rounded to milliseconds: 123 and 4567, not 1230000.
+ */
+function timeText(value: Date, scale: number | undefined): string {
+  const base = `${pad2(value.getUTCHours())}:${pad2(value.getUTCMinutes())}:${pad2(value.getUTCSeconds())}`;
+  const digits = scale ?? 0;
+  if (digits <= 0) return base;
+  const milliseconds = value.getUTCMilliseconds().toString().padStart(3, "0");
+  const remainder = Math.round(((value as { nanosecondsDelta?: number }).nanosecondsDelta ?? 0) * 1e7)
+    .toString()
+    .padStart(4, "0");
+  return `${base}.${`${milliseconds}${remainder}`.slice(0, digits)}`;
+}
+
+/**
+ * Rewrites, in place, every value whose declaration is one of those, into its text (#1132).
+ *
+ * Keyed on `recordset.columns` - the map `mssqlColumnTypes` reads - because a value cannot
+ * be told from its own shape: `time` and `datetimeoffset` arrive as the same kind of
+ * `Date`, and only the column says which one holds an instant. A result without the map is
+ * left exactly as the driver built it.
+ *
+ * All three query paths call it as the recordset is taken, before anything measures or
+ * shapes the result.
+ */
+/** A result set's column names: its declared columns, or the first row's keys without them. */
+function mssqlFields(recordset: Record<string, unknown>[] & { columns?: object }): string[] {
+  if (recordset.columns) return Object.keys(recordset.columns);
+  return recordset.length > 0 ? Object.keys(recordset[0]) : [];
+}
+
+function convertZonelessValues(recordset: Record<string, unknown>[]): void {
+  const columns = (recordset as { columns?: Record<string, MssqlColumnMetadata> }).columns;
+  if (!columns) return;
+  for (const [name, column] of Object.entries(columns)) {
+    const declaration = (column.type as { declaration?: unknown } | undefined)?.declaration;
+    if (typeof declaration !== "string" || !ZONELESS_VALUE_DECLARATIONS.has(declaration)) continue;
+    for (const row of recordset) {
+      const value = row[name];
+      if (!(value instanceof Date)) continue;
+      row[name] =
+        declaration === "date"
+          ? dateText(value)
+          : declaration === "time"
+            ? timeText(value, column.scale)
+            : `${dateText(value)} ${timeText(value, column.scale)}`;
+    }
+  }
+}
+
 // ============================================================================
 // MSSQL Provider
 // ============================================================================
@@ -1815,18 +1890,33 @@ export class MSSQLProvider extends SQLBaseProvider {
       });
 
       const recordset = result.recordset || [];
-      const fields = recordset.columns
-        ? Object.keys(recordset.columns)
-        : recordset.length > 0
-          ? Object.keys(recordset[0])
-          : [];
+      convertZonelessValues(recordset);
+
+      // A text with several result sets carries all of them (#1312). The editor sends a
+      // T-SQL batch as one request, so `SELECT * FROM a; SELECT * FROM b` reaches here whole,
+      // and the multi-statement route shows the last one with rows, as it does across a
+      // script's statements. `rows` stays the FIRST set, which is what `EXEC sp_help` and
+      // every caller before batches were shown.
+      const recordsets = (result.recordsets ?? []) as (typeof result.recordset)[];
+      const resultSets =
+        recordsets.length > 1
+          ? recordsets.map((set) => {
+              if (set !== recordset) convertZonelessValues(set);
+              return {
+                rows: set as Record<string, unknown>[],
+                fields: mssqlFields(set),
+                ...mssqlColumnTypes(set.columns),
+              };
+            })
+          : undefined;
 
       return {
         rows: recordset as Record<string, unknown>[],
-        fields,
+        fields: mssqlFields(recordset),
         rowCount: result.rowsAffected?.[0] ?? recordset.length,
         executionTime,
         ...mssqlColumnTypes(recordset.columns),
+        ...(resultSets && { resultSets }),
       };
     });
   }
@@ -2136,6 +2226,7 @@ export class MSSQLProvider extends SQLBaseProvider {
       });
 
       const recordset = result.recordset || [];
+      convertZonelessValues(recordset);
       // The ROW budget bounds DATA rows, and a plan's rows are not data: they are the
       // optimizer's nodes, one per operator. Measured on AdventureWorks2022, an ordinary
       // `SELECT TOP 10 *` over one shipped view compiles to 170 of them and the same view
@@ -2591,6 +2682,7 @@ export class MSSQLProvider extends SQLBaseProvider {
       });
 
       const recordset = result.recordset || [];
+      convertZonelessValues(recordset);
       const fields = recordset.length > 0 ? Object.keys(recordset[0]) : [];
 
       return {

@@ -7,13 +7,20 @@ import type * as Monaco from "monaco-editor";
 import { Zap, LoaderCircle, TextAlignStart, Trash2, Copy, Play, Hash } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { format } from "sql-formatter";
+import { DIALECT_EDITORS, formatterForLanguage, registerDialectConsoles } from "@/lib/editor/dialect-editors";
 import { registerSQLCompletionProvider } from "@/lib/editor/sql-completions";
 import type { SchemaCompletionCache, SchemaColumnItem } from "@/lib/editor/sql-completions";
 import { registerMongoDBCompletionProvider } from "@/lib/editor/mongodb-completions";
 import { registerLibreDBLanguage } from "@/lib/editor/libredb-language";
 import { registerRedisLanguage } from "@/lib/editor/redis-language";
+import { registerEtcdLanguage } from "@/lib/editor/etcd-language";
+import { registerOxiaLanguage } from "@/lib/editor/oxia-language";
 import { registerPromqlLanguage } from "@/lib/editor/promql-language";
+import { CYPHER_LANGUAGE_ID, registerCypherLanguage } from "@/lib/editor/cypher-language";
+import { cypherCompletionSchemaOf, registerCypherCompletionProvider } from "@/lib/editor/cypher-completions";
+import { INFLUXQL_LANGUAGE_ID, registerInfluxqlLanguage } from "@/lib/editor/influxql-language";
+import { influxqlCompletionSchemaOf, registerInfluxqlCompletionProvider } from "@/lib/editor/influxql-completions";
+import { graphPolicyProfileOf } from "@/lib/db/graph-policy-profiles";
 import { configureMonacoLoader } from "@/lib/editor/monaco-loader";
 import { defineStudioThemes, STUDIO_THEME_DARK, STUDIO_THEME_LIGHT } from "@/lib/editor/monaco-theme";
 import { useEffectiveTheme } from "@/hooks/use-effective-theme";
@@ -22,9 +29,10 @@ import { logger } from "@/lib/logger";
 import { setLineNumbersPreference, useLineNumbersPreference } from "@/hooks/use-line-numbers-preference";
 import { writeToClipboard } from "@/components/copy-button";
 import { toast } from "sonner";
-import { splitStatements } from "@/lib/sql/statement-splitter";
+import { splitCursorTargets } from "@/lib/sql/statement-splitter";
 import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import type { DatabaseType } from "@/lib/types";
+import { quoteIdentifier } from "@/lib/query-generators";
 
 // Serve Monaco from our own origin rather than @monaco-editor/react's jsdelivr default.
 // Runs at module load so it is in place before the first <Editor> mounts.
@@ -71,7 +79,18 @@ interface QueryEditorProps {
   /** Called when content changes in real-time. Use sparingly as it triggers on every keystroke. */
   onContentChange?: (val: string) => void;
   onExplain?: () => void;
-  language?: "sql" | "json" | "libredb" | "redis" | "promql";
+  language?:
+    | "sql"
+    | "json"
+    | "libredb"
+    | "redis"
+    | "promql"
+    | "etcd"
+    | "graph-cypher"
+    | "milvus"
+    | "qdrant"
+    | "influxql"
+    | "oxia";
   /**
    * The connected engine, whose grammar decides where a statement ends.
    *
@@ -81,11 +100,32 @@ interface QueryEditorProps {
   databaseType?: DatabaseType;
   schemaContext?: string;
   capabilities?: import("@/lib/db/types").ProviderCapabilities;
+  /**
+   * The container the session resolves a bare name in, as the object inventory reported it.
+   * A table outside it completes to its qualified address (#1397); absent, every table keeps
+   * the bare name it always had, because a default nobody reported cannot be assumed.
+   */
+  defaultContainer?: readonly string[];
+}
+
+/**
+ * What the Format button's tooltip names, for each language that has a formatter: JSON for MongoDB and Kafka, a
+ * request of its dialect for a tab whose editor record carries a console language (vector-family spec 3.5; the dialect id
+ * is the engine's name in lower case, so `qdrant` reads "Qdrant request"), and SQL for the rest, the only other
+ * formatter. Read from the records, so no engine is named here.
+ */
+function formatTitleNoun(language: QueryEditorProps["language"]): string {
+  if (language === "json") return "JSON";
+  const consoleSpec = Object.values(DIALECT_EDITORS).find((editor) => editor.monacoId === language)?.console?.spec;
+  if (consoleSpec === undefined) return "SQL";
+  return `${consoleSpec.id.charAt(0).toUpperCase()}${consoleSpec.id.slice(1)} request`;
 }
 
 interface ParsedTable {
   name: string;
-  rowCount?: number;
+  /** The object's address; Cypher completion reads a label or relationship type from its last segment. */
+  path?: string[];
+  rowCount?: number | null;
   columns?: Array<{
     name: string;
     type: string;
@@ -141,6 +181,7 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       databaseType,
       schemaContext,
       capabilities,
+      defaultContainer,
     },
     ref,
   ) => {
@@ -170,9 +211,10 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
 
     // Format gate for the "Format SQL" context-menu action (#1085). Its label is fixed at
     // registration, so it is offered on an SQL tab only: a JSON tab formats through its toolbar
-    // button and the shortcut, and a PromQL, Redis or LibreDB tab has no formatter. Read at
-    // invocation time for the reason the explain gate above gives.
-    const canFormatSql = language === "sql";
+    // button and the shortcut, and a PromQL, Redis or LibreDB tab has no formatter. It also asks
+    // the dialect registry, as the toolbar does, so the entry is never offered where SQL's record
+    // gives no formatter. Read at invocation time for the reason the explain gate above gives.
+    const canFormatSql = language === "sql" && formatterForLanguage(language) !== undefined;
     const canFormatSqlRef = useRef(canFormatSql);
     const canFormatSqlKeyRef = useRef<Monaco.editor.IContextKey<boolean> | null>(null);
 
@@ -239,8 +281,12 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       // Nobody here wrote this, so it came from outside: a query loaded from history or
       // the saved list, a generated statement. It replaces the buffer, which makes every
       // outstanding echo a description of text that no longer exists.
+      //
+      // Equal text is still a no-op: re-applying an incoming `value` the buffer already
+      // holds would replace the model's content, dropping the undo stack and moving the
+      // caret for nothing. The document-change arm above makes the same distinction.
       echoes.values = [];
-      editor.setValue(value);
+      if (value !== editor.getValue()) editor.setValue(value);
     }, [value, documentId]);
 
     // Update editor options when line numbers toggle changes
@@ -269,13 +315,25 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       const columnMap = new Map<string, SchemaColumnItem[]>();
       const allColumns = new Map<string, SchemaColumnItem>();
 
+      const defaultKey = defaultContainer === undefined ? undefined : JSON.stringify(defaultContainer);
       parsedSchema.forEach((table) => {
         const tableLower = table.name.toLowerCase();
+        const path = table.path;
+        const container = path && path.length > 0 ? path.slice(0, -1) : undefined;
         tableItems.push({
           label: table.name,
           labelLower: tableLower,
-          rowCount: table.rowCount || 0,
+          // Absent stays absent: the detail line says "(0 rows)" only for a measured zero (#1397).
+          // `== null` so a null count from the JSON is as absent as a missing one.
+          ...(table.rowCount == null ? {} : { rowCount: table.rowCount }),
           columnNames: table.columns?.map((c) => c.name).join(", ") || "",
+          ...(container === undefined
+            ? {}
+            : {
+                container,
+                segment: path![path!.length - 1],
+                qualify: container.length > 0 && defaultKey !== undefined && JSON.stringify(container) !== defaultKey,
+              }),
         });
 
         const tableColumns: SchemaColumnItem[] = [];
@@ -297,35 +355,28 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
         columnMap.set(tableLower, tableColumns);
       });
 
-      return { tableItems, columnMap, allColumns };
-    }, [parsedSchema]);
+      return {
+        tableItems,
+        columnMap,
+        allColumns,
+        ...(capabilities === undefined
+          ? {}
+          : { quoteSegment: (segment: string) => quoteIdentifier(segment, capabilities) }),
+      };
+    }, [parsedSchema, defaultContainer, capabilities]);
+
+    // The formatter of the tab's language, from its `DIALECT_EDITORS` record: SQL's, the JSON one MongoDB and
+    // Kafka share, or none, in which case the toolbar draws no Format button and the shortcut does nothing.
+    const formatter = formatterForLanguage(language);
 
     const handleFormat = () => {
       if (!editorRef.current) return;
       const currentValue = editorRef.current.getValue();
       if (!currentValue) return;
+      if (formatter === undefined) return;
 
       try {
-        let formatted: string;
-        if (language === "json") {
-          // JSON formatting, for MongoDB queries and Kafka read requests alike. A read request is
-          // read from JSON.parse's value alone, so its formatted text reads as the typed one (#1088).
-          const parsed = JSON.parse(currentValue);
-          formatted = JSON.stringify(parsed, null, 2);
-        } else if (language === "sql") {
-          formatted = format(currentValue, {
-            language: "postgresql",
-            keywordCase: "upper",
-            dataTypeCase: "upper",
-            indentStyle: "tabularLeft",
-            logicalOperatorNewline: "before",
-            expressionWidth: 100,
-            tabWidth: 2,
-            linesBetweenQueries: 2,
-          });
-        } else {
-          return;
-        }
+        const formatted = formatter(currentValue);
         editorRef.current.setValue(formatted);
         onChange?.(formatted);
       } catch (e) {
@@ -370,12 +421,18 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       // cut at a `;` inside a nested comment, so what reached the engine was a line
       // comment plus the SELECT, and the grid read 0 rows where psql answers 2. A `;`
       // inside a literal (`SELECT 'a;b'`) cut the same way.
+      //
+      // A procedural body is one target (#1312): a caret inside a PL/SQL unit, a SQLite
+      // trigger or a T-SQL `CREATE PROCEDURE` batch runs the whole definition, and a `GO` or
+      // `/` line is never sent. A T-SQL batch that is a run of statements still offers them
+      // one by one, so a caret on a SELECT never sends the DELETE after it; a script whose
+      // statements share a `DECLARE @x` is run by selecting it.
       if (language === "sql") {
         const position = editorRef.current.getPosition();
         if (position) {
           const fullText = model.getValue();
           const cursorOffset = model.getOffsetAt(position);
-          const statements = splitStatements(fullText, resolveSqlGrammar(databaseType));
+          const statements = splitCursorTargets(fullText, resolveSqlGrammar(databaseType));
           // The statement the cursor is inside or immediately after, which is what "run
           // this one" means with the caret resting at a statement's end. Whitespace
           // between two statements belongs to neither, so the last one that starts at or
@@ -494,12 +551,19 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
     }, []);
 
     const handleBeforeMount = (monacoInstance: typeof Monaco) => {
-      // Register the LibreDB and Redis command languages and PromQL (each idempotent)
-      // so their tabs highlight correctly instead of being treated as JSON or SQL
-      // (#427, #1085).
+      // Register the LibreDB, Redis, etcd and Oxia command languages, PromQL, Cypher and InfluxQL (each
+      // idempotent) so their tabs highlight correctly instead of being treated as JSON or SQL
+      // (#427, #1085, #1089, #424, Neo4j spec 6.5, InfluxDB spec 6.7).
       registerLibreDBLanguage(monacoInstance);
       registerRedisLanguage(monacoInstance);
       registerPromqlLanguage(monacoInstance);
+      registerEtcdLanguage(monacoInstance);
+      registerOxiaLanguage(monacoInstance);
+      registerCypherLanguage(monacoInstance);
+      registerInfluxqlLanguage(monacoInstance);
+      // Every console dialect's language, from its editor record (vector-family spec 3.5): the records are the
+      // only input, so nothing here names a dialect.
+      registerDialectConsoles(monacoInstance);
 
       // Suppress Monaco's "Canceled" errors in console (with cleanup tracking)
       if (!originalConsoleErrorRef.current) {
@@ -540,6 +604,32 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
         return () => disposable.dispose();
       }
     }, [monaco, language, schemaCompletionCache, completesMongoDB]);
+
+    // Cypher completion provider (Neo4j spec 6.5, SR6). Its names are read from the schema objects'
+    // kind-qualified paths, never from the SQL cache's lowercased table names, and its CALL and SHOW
+    // allowlists from the connected engine's policy profile, looked up by type as the SQL provider
+    // gets its dialect.
+    const graphPolicy = graphPolicyProfileOf(databaseType);
+    useEffect(() => {
+      if (monaco && language === CYPHER_LANGUAGE_ID) {
+        const disposable = registerCypherCompletionProvider(
+          monaco,
+          cypherCompletionSchemaOf(parsedSchema),
+          graphPolicy,
+        );
+        return () => disposable.dispose();
+      }
+    }, [monaco, language, parsedSchema, graphPolicy]);
+
+    // InfluxQL completion provider (InfluxDB spec 6.7). Its sources and keys are read from the schema
+    // objects' `[database, measurement]` paths and typed columns, and every insert is quoted by the
+    // provider's own quoter, so an inserted name passes the read policy.
+    useEffect(() => {
+      if (monaco && language === INFLUXQL_LANGUAGE_ID) {
+        const disposable = registerInfluxqlCompletionProvider(monaco, influxqlCompletionSchemaOf(parsedSchema));
+        return () => disposable.dispose();
+      }
+    }, [monaco, language, parsedSchema]);
 
     // Every model change reaches here: a keystroke, and equally the writes Format, Clear
     // and the imperative setValue make, since Monaco reports those through the same
@@ -612,17 +702,17 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
               className="h-7 text-xs font-medium text-white bg-brand-solid hover:bg-brand-solid-hover hover:text-white gap-2 shadow-[0_0_10px_rgba(37,99,235,0.3)] animate-in fade-in zoom-in duration-200"
               onClick={handleExecute}
             >
-              <Play strokeWidth={1.5} className="w-3 h-3 fill-current" /> Run Sel
+              <Play strokeWidth={1.5} className="w-3 h-3 fill-current" /> Run Selected
             </Button>
           )}
 
-          {(language === "sql" || language === "json") && (
+          {formatter !== undefined && (
             <Button
               variant="ghost"
               size="sm"
               className="h-7 text-xs font-medium text-fg-muted hover:text-fg-bright gap-2"
               onClick={handleFormat}
-              title={`Format ${language === "json" ? "JSON" : "SQL"} (${shortcutLabel(SHORTCUTS.formatQuery)})`}
+              title={`Format ${formatTitleNoun(language)} (${shortcutLabel(SHORTCUTS.formatQuery)})`}
             >
               <TextAlignStart strokeWidth={1.5} className="w-3 h-3" /> Format
             </Button>

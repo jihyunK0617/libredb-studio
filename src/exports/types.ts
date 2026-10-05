@@ -12,6 +12,7 @@ export type {
   ForeignKeySchema,
   QueryPagination,
   QueryResult,
+  QueryResultSet,
   QueryWarning,
   QueryTab,
   QueryHistoryItem,
@@ -23,7 +24,25 @@ export type {
 } from "../lib/types";
 
 // Also export provider types
-export type { ProviderCapabilities, ProviderLabels, MaintenanceOperationSpec } from "../lib/db/types";
+export type {
+  ProviderCapabilities,
+  ProviderLabels,
+  MaintenanceOperationSpec,
+  MaintenancePreview,
+} from "../lib/db/types";
+
+/**
+ * The server-side execution context the provider factories take (non-admin DuckDB file access).
+ *
+ * Exported because an ABSENT context denies DuckDB's file access: `createDatabaseProvider` and
+ * `getOrCreateProvider` called without one open a DuckDB handle with `enable_external_access: 'false'`.
+ * Pass `{ allowExternalFileAccess: true }` as the third argument for the full editor reach.
+ * `getOrCreateProvider` takes the narrower `EditorExecutionContext` and refuses a `readOnly`.
+ */
+export type { EditorExecutionContext, ProviderExecutionContext } from "../lib/db/types";
+
+// The vector column declaration a result carries (`QueryResult.vectorColumns`, `WorkspaceQueryResult.vectorColumns`)
+export type { VectorColumn, VectorKind, VectorDType, SparseEncoding } from "../lib/db/vector/types";
 
 /**
  * The shape a consumer of `StudioWorkspaceProps.onSchemaFetch` returns (#789).
@@ -46,6 +65,7 @@ export type {
   ContainerLevelSpec,
   Container,
   DatabaseObject,
+  ObjectReadRange,
   KindCount,
   ObjectDetail,
   ObjectDetailBatch,

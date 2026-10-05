@@ -10,7 +10,7 @@
 | **Status** | Implemented & shipped |
 | **Database type id** | `kafka` |
 | **Family** | Stream (`src/lib/db/providers/stream/kafka/`), the first provider in that family |
-| **Driver** | `@platformatic/kafka` 2.11.0, pinned exactly, pure TypeScript, loaded under Bun and Node alike ([§2.5](#25-the-client-and-why)) |
+| **Driver** | `@platformatic/kafka` 2.13.0, pinned exactly, pure TypeScript, loaded under Bun and Node alike ([§2.5](#25-the-client-and-why)) |
 | **Query language** | `json` with `queryDialect: "kafka"`: a JSON read request of this product's own schema, not MongoDB's JSON ([§5.1](#51-the-read-request)) |
 | **Default port** | `9092`, the port a stock broker listens on; the same number is the default under TLS, because a secured listener serves on whatever port its operator chose |
 | **Connection pooling** | One `Admin`, one `Consumer` and one fetch `ConnectionPool` per connection, all closed by `disconnect()` ([§3.4](#34-one-client-per-connection-and-no-fetch-session)) |
@@ -102,7 +102,8 @@ A connect that fails after the client was built closes it again.
 
 ### 2.5 The client, and why
 
-`@platformatic/kafka` 2.11.0, used fetch-only, was chosen by a broker-side measurement before any code was written (#1088, section 3.2 and Appendix B).
+`@platformatic/kafka`, used fetch-only, was chosen at 2.11.0 by a broker-side measurement before any code was written (#1088, section 3.2 and Appendix B).
+2.12.0 and then 2.13.0 were each taken only after the live read-only check passed on them ([§11.4](#114-the-live-read-only-check)).
 Reading by partition, offset and timestamp through its `listOffsets`, `listOffsetsWithTimestamps` and a fetch registered no consumer group and never created `__consumer_offsets`, under Bun and Node.
 Its `consume()` in MANUAL mode, with explicit offsets and `autocommit: false`, joins the group and leaves an `Empty` group registered after `close()`, so `consume()` is never called.
 All four codecs, gzip, snappy, lz4 and zstd, decode with no native addon: snappy and lz4 come from WebAssembly, gzip and zstd from `node:zlib`, and the optional `@node-rs/crc32` falls back to WebAssembly.
@@ -129,7 +130,7 @@ A broker whose Fetch range does not hold version 13 is refused at the first read
 
 The editor text is JSON, so the provider declares `queryLanguage: "json"` and names its kind of JSON with `queryDialect: "kafka"`, the rule Prometheus's design stated: `queryDialect` distinguishes kinds of JSON, and a new `queryLanguage` is for text that is not JSON (#1088, section 3.3).
 The cost is the #427 bug class: a reader keyed on `"json"` alone treats the text as MongoDB.
-Every reader of either field has a Kafka arm or a test pinning that its branch is correct for Kafka: a Kafka tab type rendered in Monaco's built-in `json` mode, a Kafka arm before the MongoDB arm in both generators, the MongoDB completion provider registered only where no JSON dialect is declared, and the gates below.
+Every reader of either field has a Kafka arm or a test pinning that its branch is correct for Kafka: a Kafka tab type rendered in Monaco's built-in `json` mode, a Kafka record in `DIALECT_GENERATORS`, read before the MongoDB arm in both generators, the MongoDB completion provider registered only where no JSON dialect is declared, and the gates below.
 On a topic row both row menus withhold Profile, through `offersColumnProfiling`, Code Generator, through `offersCodeGeneration`, and Generate Test Data, because no kind declares `acceptsRowWrites`.
 Code generation is withheld because the models it writes over a topic's fixed columns reject the rows a read returns: a `Date` timestamp against the ISO string, a record-typed value against text, base64 and the Confluent label.
 Both menus also withhold Generate Count Query, through `offersCountQuery` (#702): a read request is JSON of its own dialect, with no count grammar.
@@ -319,6 +320,7 @@ The `from` forms:
 Bound `params` are refused with a `DatabaseConfigError`: there is no binding, and ignoring them would run a different read from the one the caller built.
 Text that is empty once whitespace is removed is refused with a `QueryError`, before the request is parsed.
 Invalid JSON is refused with a `QueryError` carrying the fixed text "The read request is not valid JSON", never the parser's message, which under Node quotes the start of the text.
+A `partition` the topic does not have is refused with a `QueryError` naming the partitions the topic has, such as `Topic "orders" has partitions 0 to 2; partition 3 does not exist`, before any offset is read.
 `supportsResultPagination` and `supportsExternalQueryLimiting` are both `false`, as on Redis and MongoDB, and `prepareQuery` is the base pass-through: the request carries its own limit.
 
 A topic click in the tree writes and runs `{"topic": <name>, "from": "latest", "limit": 50}`, the action the labels name "Read Latest 50".
@@ -553,6 +555,7 @@ Mapped from the protocol error name, the client's error code and the Node error 
 | a package the client library requires that the installation does not resolve, at connect ([§2.5](#25-the-client-and-why)) | `DatabaseConfigError` naming the package, never the runtime's text, which carries the server's paths |
 | empty editor text | `QueryError` |
 | a read request that is invalid JSON or breaks the schema of [§5.1](#51-the-read-request) | `QueryError` |
+| a partition the topic does not have | `QueryError` naming the partitions the topic has |
 | an unknown topic ("Unknown topic <name>.") | `QueryError`: the topic does not exist |
 | an internal topic, refused by name before any request names it | `QueryError`: internal to Kafka and not readable here |
 | a partition with no leader | `QueryError` naming the leaderless partitions |
@@ -627,6 +630,9 @@ With `--tripwire` it first reads every seeded topic on a broker never asked for 
 Its log searches for an automatic topic creation and for the never-joined group id are each paired with a control that finds that kind of line in the broker's whole log.
 
 Measured on 2026-09-25: every check passed on `kafka` (57, with the tripwire), on `redpanda` (39), on `kafka-cluster` (47), and on `kafka-auth` as `reader` (7), and every snapshot after a run equalled the one before it.
+Measured again on 2026-09-28 with `@platformatic/kafka` 2.12.0: the same four counts, eight of eight with `--failover`, and every snapshot after a run equalled the one before it.
+The same day, under Node through `next start`, a connect, the topic listing and two reads on a broker never asked for a group coordinator left `__consumer_offsets` absent, and the group seed that followed created it.
+Measured again on 2026-10-05 with `@platformatic/kafka` 2.13.0: the same four counts, eight of eight with `--failover`, and every snapshot after a run equalled the one before it.
 Against the provider with one rule broken at a time, the check failed each time: a `disconnect()` that closes nothing, `autocreateTopics: true`, a `metadata([])` answered from the cache, lag that ignores the committed offset, a transaction filter that keeps aborted records, a group listing without the `consumer` type, and a lag listing that shows one partition twice.
 A config write made during the run from outside the provider, setting `orders` to the `compression.type=gzip` line `codec-gzip` already holds, failed the check too; the check as first committed, which compared bare lines as a set, passed it.
 
@@ -730,7 +736,7 @@ See [`docs/API_DOCS.md`](../API_DOCS.md) for the full request and response contr
 
 - Source: [`src/lib/db/providers/stream/kafka/`](../../src/lib/db/providers/stream/kafka/)
 - Design: [#1088](https://github.com/libredb/libredb-studio/issues/1088)
-- Client: [`@platformatic/kafka`](https://github.com/platformatic/kafka), version 2.11.0
+- Client: [`@platformatic/kafka`](https://github.com/platformatic/kafka), version 2.13.0
 - Kafka protocol: <https://kafka.apache.org/protocol>
 - KIP-848, the consumer group protocol: <https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol>
 - KIP-516, topic identifiers: <https://cwiki.apache.org/confluence/display/KAFKA/KIP-516%3A+Topic+Identifiers>

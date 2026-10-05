@@ -11,6 +11,8 @@ import { objectPathLabel, pathKey } from "@/lib/db/object-path";
 import { resolveTabType } from "@/lib/editor/tab-language";
 import { logger } from "@/lib/logger";
 import { newLocalId } from "@/lib/ids";
+import { workspaceTabsKey } from "@/lib/storage/local-storage";
+import { useStableCallback } from "@/hooks/use-stable-callback";
 
 /** A tab `closeTab` removed, where it sat, and the workspace it sat in, so its Undo can put it back (#747). */
 interface ClosedTab {
@@ -70,8 +72,6 @@ function sourceTab(id: string, object: DatabaseObject): QueryTab {
     source: { path: object.path, kind: object.kind },
   };
 }
-
-const WORKSPACE_STORAGE_PREFIX = "libredb_workspace_tabs_v1";
 
 interface PersistedTabState {
   id: string;
@@ -174,10 +174,7 @@ export function useTabManager({ activeConnection, metadata, schema, persistWorks
   const [editingTabName, setEditingTabName] = useState("");
   const [isWorkspaceHydrated, setIsWorkspaceHydrated] = useState(false);
 
-  const workspaceKey = useMemo(
-    () => `${WORKSPACE_STORAGE_PREFIX}:${activeConnection?.id ?? "default"}`,
-    [activeConnection?.id],
-  );
+  const workspaceKey = useMemo(() => workspaceTabsKey(activeConnection?.id ?? "default"), [activeConnection?.id]);
   const shouldPersistWorkspace = persistWorkspace ?? process.env.NODE_ENV !== "test";
 
   const currentTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
@@ -349,29 +346,29 @@ export function useTabManager({ activeConnection, metadata, schema, persistWorks
     setActiveTabId(closed.tab.id);
   }, []);
 
-  const closeTab = useCallback(
-    (id: string, e: React.MouseEvent) => {
-      e.stopPropagation();
-      if (tabs.length === 1) return;
-      const index = tabs.findIndex((t) => t.id === id);
-      if (index === -1) return;
-      const closed: ClosedTab = { tab: tabs[index], index, nextTabId: tabs[index + 1]?.id ?? null, workspaceKey };
+  // One identity for the strip, whose memoized bar must not re-render on a keystroke (X5):
+  // the handler reads `tabs` and `activeTabId`, both of which change with the query on
+  // every keystroke, so a plain `useCallback` would mint a new function each time.
+  const closeTab = useStableCallback((id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (tabs.length === 1) return;
+    const index = tabs.findIndex((t) => t.id === id);
+    if (index === -1) return;
+    const closed: ClosedTab = { tab: tabs[index], index, nextTabId: tabs[index + 1]?.id ?? null, workspaceKey };
 
-      // The last-tab guard is evaluated again inside the updater, against the state actually
-      // being written: two closes batched into one commit both pass the check above.
-      setTabs((prev) => (prev.length === 1 ? prev : prev.filter((t) => t.id !== id)));
-      if (activeTabId === id) {
-        const remaining = tabs.filter((t) => t.id !== id);
-        setActiveTabId(remaining[remaining.length - 1].id);
-      }
+    // The last-tab guard is evaluated again inside the updater, against the state actually
+    // being written: two closes batched into one commit both pass the check above.
+    setTabs((prev) => (prev.length === 1 ? prev : prev.filter((t) => t.id !== id)));
+    if (activeTabId === id) {
+      const remaining = tabs.filter((t) => t.id !== id);
+      setActiveTabId(remaining[remaining.length - 1].id);
+    }
 
-      const toastId = toast(`Closed "${closed.tab.name}"`, {
-        action: { label: "Undo", onClick: () => reopenClosedTab(closed) },
-      });
-      undoToastIdsRef.current.push(toastId);
-    },
-    [tabs, activeTabId, workspaceKey, reopenClosedTab],
-  );
+    const toastId = toast(`Closed "${closed.tab.name}"`, {
+      action: { label: "Undo", onClick: () => reopenClosedTab(closed) },
+    });
+    undoToastIdsRef.current.push(toastId);
+  });
 
   /**
    * Open a tab holding the statement for one object and RUN it, or focus the one already open
@@ -462,8 +459,9 @@ export function useTabManager({ activeConnection, metadata, schema, persistWorks
       // type-aware, and the sampled key type lives on the schema node's `type` column (#427).
       const table = schema.find((t) => pathKey(t.path) === key);
       const columns = columnsOverride ?? table?.columns ?? [];
+      // A group's readable pieces ride on its schema entry, and only the etcd arm reads them (#1089 4.7).
       const newQuery = capabilities
-        ? generateTableQuery(path, capabilities, columns)
+        ? generateTableQuery(path, capabilities, columns, { readRanges: table?.readRanges })
         : `SELECT * FROM ${path.join(".")};`;
 
       const newId = newLocalId();
@@ -504,8 +502,11 @@ export function useTabManager({ activeConnection, metadata, schema, persistWorks
       const table = schema.find((t) => pathKey(t.path) === key);
       const columns = table?.columns || [];
 
+      // The group's readable pieces and the connection's own mode, which only the etcd arm reads (#1089 6.4):
+      // on a read-only connection Generate Command writes the read alone.
+      const scope = { readRanges: table?.readRanges, readOnly: activeConnection?.readOnly === true };
       const newQuery = capabilities
-        ? generateSelectQuery(path, columns, capabilities)
+        ? generateSelectQuery(path, columns, capabilities, scope)
         : `SELECT\n${columns.map((c) => `  ${c.name}`).join(",\n") || "  *"}\nFROM ${path.join(".")}\nWHERE 1=1\nLIMIT 100;`;
 
       const tabType = resolveTabType(capabilities);
@@ -524,7 +525,7 @@ export function useTabManager({ activeConnection, metadata, schema, persistWorks
       ]);
       setActiveTabId(newId);
     },
-    [metadata, schema],
+    [activeConnection, metadata, schema],
   );
 
   const handleGenerateCount = useCallback(

@@ -14,6 +14,7 @@ import { readFile } from "fs/promises";
 import { logger } from "@/lib/logger";
 
 const DEFAULT_K8S_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+const DEFAULT_K8S_AUTH_PATH = "kubernetes";
 const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 /** Re-login this long before a Kubernetes auth lease lapses, so a token never dies mid-request. */
@@ -101,7 +102,7 @@ async function vaultFetch(url: string, init: RequestInit, deps: Required<VaultDe
 }
 
 async function kubernetesLogin(addr: string, role: string, deps: Required<VaultDeps>): Promise<KubernetesToken> {
-  const tokenPath = process.env.VAULT_K8S_TOKEN_PATH || DEFAULT_K8S_TOKEN_PATH;
+  const tokenPath = process.env.VAULT_K8S_TOKEN_PATH?.trim() || DEFAULT_K8S_TOKEN_PATH;
 
   let jwt: string;
   try {
@@ -112,7 +113,9 @@ async function kubernetesLogin(addr: string, role: string, deps: Required<VaultD
     );
   }
 
-  const url = `${addr}/v1/auth/kubernetes/login`;
+  // One Vault serving several clusters mounts each cluster's Kubernetes auth at its own path.
+  const authPath = (process.env.VAULT_K8S_AUTH_PATH ?? "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_K8S_AUTH_PATH;
+  const url = `${addr}/v1/auth/${authPath}/login`;
   const res = await vaultFetch(
     url,
     {

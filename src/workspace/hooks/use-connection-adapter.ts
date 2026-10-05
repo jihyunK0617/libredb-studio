@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useMemo } from "react";
 import type { DatabaseConnection } from "@/lib/types";
-import type { DetailedObject } from "@/lib/db/detailed-object";
+import { schemaContextOf, type DetailedObject } from "@/lib/db/detailed-object";
 import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
 import type { ObjectSource } from "@/components/object-tree";
 import type { ObjectSourceApplier, ObjectSourceReader } from "@/components/object-source";
@@ -197,19 +197,21 @@ export function useConnectionAdapter({
   onSchemaFetch,
   onObjectsFetch,
 }: UseConnectionAdapterParams) {
+  // Stamped once, at mount: a clock read is impure, so it stays out of the render-time mapping.
+  const [mountedAt] = useState(() => new Date());
   const connections: DatabaseConnection[] = useMemo(
     () =>
       externalConnections.map((c) => ({
         id: c.id,
         name: c.name,
         type: c.type,
-        createdAt: new Date(),
+        createdAt: new Date(mountedAt),
         managed: true,
         // A hand-written field list, so a host field this forgets is dropped in silence.
         // Forgetting this one reads the catalog the host asked it not to (#765).
         skipObjectScan: c.skipObjectScan,
       })),
-    [externalConnections],
+    [externalConnections, mountedAt],
   );
 
   // The selection is held by ID, not by object, so it resolves against the host's
@@ -447,7 +449,9 @@ export function useConnectionAdapter({
     };
   }, [onObjectsFetch]);
 
-  const schemaContext = useMemo(() => JSON.stringify(schema), [schema]);
+  // The same derivation as the standalone shell's, so a host's `readRanges` reaches the
+  // generators and never the AI panels (etcd spec E13).
+  const schemaContext = useMemo(() => schemaContextOf(schema), [schema]);
 
   // The embedded shell's stand-in for `useProviderMetadata`: it has no
   // `/api/db/provider-meta` of its own and holds no credentials to describe, so

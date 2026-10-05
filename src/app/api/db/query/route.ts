@@ -1,13 +1,23 @@
+import { firstResultSet } from "@/lib/api/first-result-set";
+import { pageOfProbe, pageOptionError, probePastPage } from "@/lib/api/page-probe";
 import { NextRequest, NextResponse } from "next/server";
 import { createDatabaseProvider, getOrCreateProvider } from "@/lib/db";
 import { createErrorResponse } from "@/lib/api/errors";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
 import { guardRoute } from "@/lib/api/require-session";
+import { editorExecutionContext } from "@/lib/api/execution-context";
 import { readBoundParams } from "@/lib/api/bound-params";
+import { consoleTextByteLimit, consoleTextOverLimit } from "@/lib/db/destructive-commands";
 import { ObjectRouteError, objectRouteErrorBody, optionalDatabase } from "@/lib/api/object-route";
+import { containerDepth } from "@/lib/db/object-kinds";
 import { getExplainStrategy, type ExplainMode } from "@/lib/explain";
+import { countCodeStatements } from "@/lib/sql/statement-splitter";
+import { hasUnterminatedSpan } from "@/lib/sql/spans";
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import { endsOpenQueryTransactions, newQueryCallScope } from "@/lib/db/types";
+import { supportsQueryCancel } from "@/lib/db/query-cancel";
 import type { ExplainFormat, OpenQueryTransactionOutcome } from "@/lib/db/types";
+import { rowsWithNonFiniteWords } from "@/lib/non-finite";
 
 /**
  * The error an unreadable `explain` field gets. It names the whole allowed shape
@@ -57,6 +67,31 @@ export async function POST(req: NextRequest) {
     if (!sql) {
       return NextResponse.json({ error: "Connection and query are required" }, { status: 400 });
     }
+    // The id a provider tracks the run under and the cancel route names it by: a provider
+    // sends it on to the engine (ClickHouse) or keys a Map with it, so only a string (#1364).
+    if (queryId !== undefined && typeof queryId !== "string") {
+      return NextResponse.json({ error: "queryId must be a string" }, { status: 400 });
+    }
+
+    const optionError = pageOptionError(options);
+    if (optionError !== null) {
+      return NextResponse.json({ error: optionError }, { status: 400 });
+    }
+
+    // A connection type that declares a console text bound is held to it here, before the bound parameters, the
+    // provider and the statement cache are reached, so an oversize text opens no socket. The answer names the size
+    // and the bound and never repeats the text. The bound is read from the type in the body, after the JSON has been
+    // parsed: a streamed bound on the request itself would change every engine and is a separate decision.
+    const textLimit = consoleTextByteLimit(connection.type);
+    if (textLimit !== undefined) {
+      if (typeof sql !== "string") {
+        return NextResponse.json({ error: "sql must be a string" }, { status: 400 });
+      }
+      const over = consoleTextOverLimit(sql, textLimit);
+      if (over !== undefined) {
+        return NextResponse.json({ error: over }, { status: 413 });
+      }
+    }
 
     // A generated statement sends its values here rather than writing them into the
     // SQL (#290). They go straight to the driver's bind path, so what may be bound
@@ -69,6 +104,26 @@ export async function POST(req: NextRequest) {
     const explain = readExplainRequest(body.explain);
     if (!explain.valid) {
       return NextResponse.json({ error: explain.message }, { status: 400 });
+    }
+
+    // AN EXPLAIN PREFIXES ONE STATEMENT (#1311). Handed `SELECT 1 AS a; INSERT ...` it
+    // explained the SELECT and the simple-query protocol then RAN the INSERT as a
+    // statement of its own: measured on Materialize 26.44.1, AlloyDB Omni 17.9 and
+    // Cloudberry 2.1.0, one RUN of that text applied the INSERT twice, once in the run
+    // and once in its background plan request. A plan of several statements is not a
+    // plan of anything, so the text is refused before a provider is opened. It is read
+    // under the connection's own grammar, the one the editor splits a run with, so a
+    // `;` inside a quote or a comment is not a second statement, and neither is a note
+    // after the final `;` (a fragment of comments only is not counted). A text with a
+    // run the grammar cannot close is refused too: the splitter finds no boundary in
+    // it, yet `SELECT E'\''; INSERT ...` is two statements to PostgreSQL.
+    const explainGrammar = resolveSqlGrammar(connection.type);
+    if (
+      explain.explain &&
+      typeof sql === "string" &&
+      (countCodeStatements(sql, explainGrammar) > 1 || hasUnterminatedSpan(sql, explainGrammar))
+    ) {
+      return NextResponse.json({ error: "Only a single statement can be explained" }, { status: 400 });
     }
 
     // The database one RUN should reach. A key lives in exactly one numbered database and
@@ -112,7 +167,8 @@ export async function POST(req: NextRequest) {
        * request that was never valid, and a reachable one was connected only to be refused.
        */
       const declared = await createDatabaseProvider(connection);
-      if (declared.getCapabilities().keyScan === undefined) {
+      const capabilities = declared.getCapabilities();
+      if (capabilities.keyScan === undefined) {
         return NextResponse.json(
           {
             error:
@@ -122,10 +178,30 @@ export async function POST(req: NextRequest) {
           { status: 400 },
         );
       }
+      /*
+       * AND ONLY WHERE THERE IS A DATABASE TO NAME (spec 3.4). A walk declared with no container level
+       * is one key space per connection (etcd), so a number here names nothing the engine has. It is
+       * refused from the same unconnected declaration, before `getOrCreateProvider`, so no provider, SSH
+       * forward or channel is opened or cached for it; `containerDepth` is the rule the Keys panel
+       * applies before it sends one at all.
+       */
+      if (containerDepth(capabilities) === 0) {
+        return NextResponse.json(
+          {
+            error:
+              `${connection.type} walks one key space and declares no database level: "database" names the ` +
+              `numbered database a key was walked in, and this engine has none to name`,
+          },
+          { status: 400 },
+        );
+      }
       connection = { ...connection, database: String(database) };
     }
 
-    const provider = await getOrCreateProvider(connection);
+    // The DuckDB editor file-access posture rides on the server-derived execution context: an
+    // admin keeps the full editor reach, every other role opens with external access off, and so
+    // does every role on a seed a non-admin role can use, whose one handle they share (non-admin DuckDB file access).
+    const provider = await getOrCreateProvider(connection, {}, editorExecutionContext(guard.session, connection));
 
     // The statement that actually runs. For an explain request it is the one the
     // CONNECTED provider's strategy builds, never the caller's own SQL: falling
@@ -160,6 +236,9 @@ export async function POST(req: NextRequest) {
 
     const prepared = provider.prepareQuery(statement, options);
 
+    // The statement that runs asks for a row past the page (#1440); see `probePastPage`.
+    const probe = probePastPage(provider, statement, options, prepared);
+
     // A SINGLE STATEMENT CAN LEAVE A TRANSACTION OPEN, SO THIS ROUTE ENDS IT (D74).
     //
     // MEASURED 2026-09-15 against PostgreSQL 18.4 through this handler with the real
@@ -184,10 +263,10 @@ export async function POST(req: NextRequest) {
     let openTransaction: OpenQueryTransactionOutcome = "none";
 
     // Pass queryId to provider for cancellation tracking
-    const supportsCancel = "cancelQuery" in provider;
+    const supportsCancel = supportsQueryCancel(provider);
     let result: Awaited<ReturnType<typeof provider.query>>;
     try {
-      result = await provider.query(prepared.query, bound.params, supportsCancel ? queryId : undefined, scope);
+      result = await provider.query(probe.query, bound.params, supportsCancel ? queryId : undefined, scope);
     } finally {
       if (endsOpenQueryTransactions(provider)) {
         openTransaction = await provider.endOpenQueryTransaction(scope);
@@ -207,10 +286,17 @@ export async function POST(req: NextRequest) {
     // One rule, per statement, with no branching on database type: if the bound is ours,
     // pagination is offered; if it is the user's, or the statement could not be
     // rewritten, it is not.
-    const hasMore = prepared.wasLimited && result.rows.length === prepared.limit;
-
+    //
+    // The probe row is the proof (#1440): more than `prepared.limit` rows came back, so a next
+    // page exists, and the page itself is cut back to the limit asked for.
+    const { hasMore, rows: pageRows } = pageOfProbe(prepared, result.rows);
     return NextResponse.json({
-      ...result,
+      ...firstResultSet(result),
+      // The probe row is not part of the answer, so the count that names the rows is the page's.
+      ...(hasMore && { rowCount: pageRows.length }),
+      // NaN and the infinities as words: `JSON.stringify` would write each as null, which
+      // the grid and every export then show as SQL NULL (`src/lib/non-finite.ts`).
+      rows: rowsWithNonFiniteWords(pageRows),
       ...(explainFormat !== undefined && { explainFormat }),
       // Present only when there was a transaction to end, the way `/api/db/multi-query`
       // reports it, so an always-present "none" would announce something that did not happen.
@@ -222,7 +308,7 @@ export async function POST(req: NextRequest) {
         limit: prepared.limit,
         offset: prepared.offset,
         hasMore,
-        totalReturned: result.rows.length,
+        totalReturned: pageRows.length,
         // A bound the PROVIDER applied is reported too (#1085, section 5.4). A provider that cuts
         // its own result, as the Prometheus provider cuts a vector at its series cap, says so on
         // the result's own `pagination`, and the badge this field drives says "Studio bounded this

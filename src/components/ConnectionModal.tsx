@@ -33,9 +33,11 @@ import { cn } from "@/lib/utils";
 import {
   connectionFieldHint,
   connectionFieldLabel,
+  connectionFieldPlaceholder,
   getDBConfig,
   isFileBased,
   offersSshTunnel,
+  readOnlyHint,
   takesConnectionField,
   type ConnectionField,
   type DatabaseUIConfig,
@@ -75,6 +77,12 @@ function fieldHintId(field: ConnectionField): string {
 function describedByHint(config: DatabaseUIConfig, field: ConnectionField): string | undefined {
   return connectionFieldHint(config, field) === undefined ? undefined : fieldHintId(field);
 }
+
+/**
+ * The id of the Host box's refusal, drawn right under the box so the person sees why an address was not split
+ * without scrolling to the result banner, which repeats it.
+ */
+const HOST_ERROR_ID = "host-error";
 
 /**
  * The hint an engine DECLARES for one connection field (#1085), drawn under that field in this
@@ -166,6 +174,9 @@ export function ConnectionModal({
     setName,
     host,
     setHost,
+    takeHostAddress,
+    settleHost,
+    hostError,
     port,
     setPort,
     user,
@@ -180,6 +191,12 @@ export function ConnectionModal({
     setQueryTimeout,
     skipObjectScan,
     setSkipObjectScan,
+    readOnly,
+    setReadOnly,
+    allowInsecureAuth,
+    setAllowInsecureAuth,
+    dataServers,
+    setDataServers,
     connectionString,
     setConnectionString,
     mongoConnectionMode,
@@ -254,6 +271,8 @@ export function ConnectionModal({
 
     // Derived data
     dbTypes,
+    readOnlyOffered,
+    credentialWarning,
   } = useConnectionForm({ isOpen, onClose, onConnect, editConnection, onTestConnection });
 
   // Couchbase pins one bucket per connection (issue #262, decision 4), so the shared
@@ -275,10 +294,11 @@ export function ConnectionModal({
   // So the ordinary deployment - users in `admin`, data elsewhere - had no way through
   // the discrete fields at all, and failed as a credentials error.
   const isMongoDB = type === "mongodb";
-  // libSQL has no user names at all: the credential a server checks is a TOKEN it
-  // minted (Turso prints one per database), so the shared `password` field holds a
-  // JWT here. A field labelled Password invites a password no libSQL server has,
-  // which is why this one is relabelled rather than left to be guessed at.
+  // libSQL's usual credential is a TOKEN its server minted (Turso prints one per
+  // database), so the shared `password` field holds a JWT here and is relabelled
+  // rather than left to be guessed at. A self-hosted server started with
+  // SQLD_HTTP_AUTH checks a user name and password instead, and the Username box's
+  // declared hint (db-ui-config.ts) says when this box takes the password.
   const isLibSQL = type === "libsql";
   const passwordFieldLabel = isLibSQL ? "Auth Token" : "Password";
   const databaseFieldLabel = isCouchbase ? "Bucket" : isTrino ? "Catalog" : isCassandra ? "Keyspace" : "Database";
@@ -364,7 +384,7 @@ export function ConnectionModal({
                   </Button>
                 </div>
                 <p className="text-xs text-fg-muted">
-                  Supports: postgres://, mysql://, mongodb://, redis://, oracle://, mssql://
+                  Supports: postgres://, mysql://, mongodb://, redis://, oracle://, mssql://, db2://
                 </p>
               </div>
             </motion.div>
@@ -432,6 +452,31 @@ export function ConnectionModal({
               The editor still works. The object panel offers a load action instead.
             </p>
           </div>
+
+          {/*
+            The read-only mode (#1089), drawn only where the form offers it: an engine whose provider
+            enforces the mode, and never a copy of a seed, whose mode the server re-resolves from the
+            operator's file. Beside the no-scan choice, because it too is about what this connection
+            does rather than how it is reached.
+          */}
+          {readOnlyOffered && (
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  id="readOnly"
+                  type="checkbox"
+                  checked={readOnly}
+                  onChange={(e) => setReadOnly(e.target.checked)}
+                  aria-describedby="readOnly-hint"
+                  className="rounded border-edge bg-panel"
+                />
+                <span className="text-xs font-medium text-fg-muted">Read-only</span>
+              </label>
+              <p id="readOnly-hint" className="text-xs text-fg-muted">
+                {readOnlyHint(uiConfig)}
+              </p>
+            </div>
+          )}
 
           {/* Environment Selector */}
           <div className="space-y-2">
@@ -591,10 +636,22 @@ export function ConnectionModal({
                       <Input
                         id="host"
                         value={host}
-                        onChange={(e) => setHost(e.target.value)}
+                        onChange={(e) => setHost(e.target.value, (e.nativeEvent as InputEvent).inputType)}
+                        onBlur={settleHost}
+                        onPaste={(e) => {
+                          if (takeHostAddress(e.clipboardData.getData("text/plain"))) e.preventDefault();
+                        }}
+                        onDrop={(e) => {
+                          if (takeHostAddress(e.dataTransfer.getData("text/plain"))) e.preventDefault();
+                        }}
                         placeholder="localhost"
                         autoComplete="off"
-                        aria-describedby={describedByHint(uiConfig, "host")}
+                        aria-invalid={hostError === undefined ? undefined : true}
+                        aria-describedby={
+                          [describedByHint(uiConfig, "host"), hostError === undefined ? undefined : HOST_ERROR_ID]
+                            .filter((id) => id !== undefined)
+                            .join(" ") || undefined
+                        }
                         className="md:col-span-3 h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs"
                       />
                       <Input
@@ -606,6 +663,11 @@ export function ConnectionModal({
                         className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs font-mono"
                       />
                     </div>
+                    {hostError !== undefined && (
+                      <p id={HOST_ERROR_ID} data-testid={HOST_ERROR_ID} role="alert" className="text-xs text-danger">
+                        {hostError}
+                      </p>
+                    )}
                     <DeclaredFieldHint config={uiConfig} field="host" />
                     <DeclaredFieldHint config={uiConfig} field="port" />
                   </div>
@@ -629,9 +691,8 @@ export function ConnectionModal({
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {/*
-                      Only when the engine takes it. libSQL authenticates with a token the
-                      server minted and has no user names at all, so a Username box there
-                      collected a value `buildConnection` then discarded.
+                      Only when the engine takes it, so no box collects a value
+                      `buildConnection` would then discard.
                     */}
                     {takesConnectionField(type, "user") && (
                       <div className="space-y-2">
@@ -673,6 +734,23 @@ export function ConnectionModal({
                         className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs"
                       />
                       <DeclaredFieldHint config={uiConfig} field="password" />
+                      {/*
+                        A credential the engine declares a warning for (src/lib/db/credential-warnings.ts),
+                        drawn before Test Connection and apart from its result: a caution about what was
+                        typed, which blocks nothing. An `output` rather than a p with role="status": it
+                        carries the polite live region natively, and jsx-a11y's prefer-tag-over-role is an
+                        error in this repository.
+                      */}
+                      {credentialWarning !== undefined && (
+                        <output
+                          id="credential-warning"
+                          data-testid="credential-warning"
+                          className="flex items-start gap-1.5 text-xs text-warning"
+                        >
+                          <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 shrink-0" />
+                          <span>{credentialWarning}</span>
+                        </output>
+                      )}
                       {/*
                         Measured on Trino 476 with authentication DISABLED: a request
                         carrying `Authorization: Basic` over plain HTTP is answered 401,
@@ -716,7 +794,7 @@ export function ConnectionModal({
                         id="database"
                         value={database}
                         onChange={(e) => setDatabase(e.target.value)}
-                        placeholder={databaseFieldPlaceholder}
+                        placeholder={connectionFieldPlaceholder(uiConfig, "database", databaseFieldPlaceholder)}
                         aria-describedby={describedByHint(uiConfig, "database")}
                         className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs font-mono"
                       />
@@ -732,6 +810,32 @@ export function ConnectionModal({
                           keyspace in full.
                         </p>
                       )}
+                    </div>
+                  )}
+
+                  {/*
+                    A cluster's data-server addresses, drawn where the engine takes the field: the same list
+                    `buildConnection` writes from. Its label and hint are the engine's own declaration; the
+                    provider parses and refuses the text.
+                  */}
+                  {takesConnectionField(type, "dataServers") && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Server strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
+                        <Label htmlFor="dataServers" className="text-xs font-medium text-fg-muted">
+                          {connectionFieldLabel(uiConfig, "dataServers", "Data servers")}
+                        </Label>
+                      </div>
+                      <Input
+                        id="dataServers"
+                        value={dataServers}
+                        onChange={(e) => setDataServers(e.target.value)}
+                        autoComplete="off"
+                        spellCheck={false}
+                        aria-describedby={describedByHint(uiConfig, "dataServers")}
+                        className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs font-mono"
+                      />
+                      <DeclaredFieldHint config={uiConfig} field="dataServers" />
                     </div>
                   )}
 
@@ -1044,6 +1148,30 @@ export function ConnectionModal({
                   </motion.div>
                 )}
               </AnimatePresence>
+
+              {/*
+                The consent to a cleartext password (#786), outside the accordion so it is seen while
+                SSL Mode is disable: the provider of a type that takes it refuses such a connection
+                without it, and the refusal names this box. The sentence under it is the type's own
+                declared hint (InfluxDB spec R4), never a fallback; tests/unit/lib/db-ui-config.test.ts
+                holds every type that takes the field to declaring one.
+              */}
+              {takesConnectionField(type, "allowInsecureAuth") && sslMode === "disable" && (
+                <div className="space-y-1 p-3 rounded-lg border border-warning-tint/10 bg-warning-tint/5">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      id="allowInsecureAuth"
+                      type="checkbox"
+                      checked={allowInsecureAuth}
+                      onChange={(e) => setAllowInsecureAuth(e.target.checked)}
+                      aria-describedby={describedByHint(uiConfig, "allowInsecureAuth")}
+                      className="rounded border-edge bg-panel"
+                    />
+                    <span className="text-xs font-medium text-warning">Send the password without TLS</span>
+                  </label>
+                  <DeclaredFieldHint config={uiConfig} field="allowInsecureAuth" />
+                </div>
+              )}
 
               {/*
                 The SSH half only where the engine offers a tunnel (#1088). A Kafka client reaches

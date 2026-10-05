@@ -316,9 +316,9 @@ describe("StudioDesktopHeader", () => {
       expect(mockRouterPush).toHaveBeenCalledWith("/settings/mcp");
     });
 
-    test("offers every signed-in user the authenticator screen", () => {
+    test("offers every signed-in user the sign-in security screen", () => {
       const { getByText } = render(<StudioDesktopHeader {...defaultProps} isAdmin={false} user={{ role: "user" }} />);
-      fireEvent.click(getByText("Authenticator"));
+      fireEvent.click(getByText("Sign-in security"));
       expect(mockRouterPush).toHaveBeenCalledWith("/settings/authenticator");
     });
 
@@ -426,6 +426,31 @@ describe("StudioDesktopHeader", () => {
       const header = container.querySelector("header");
       expect(header?.className).toContain("hidden");
       expect(header?.className).toContain("md:flex");
+    });
+  });
+
+  describe("the read-only marker (#1089)", () => {
+    test("renders beside the active connection's name, titled with what it refuses", () => {
+      const { getByText } = render(
+        <StudioDesktopHeader {...defaultProps} activeConnection={{ ...baseConnection, readOnly: true }} />,
+      );
+      const marker = getByText("Read-only");
+
+      expect(marker.getAttribute("title")).toBe("Writes, value edits and maintenance are refused on this connection");
+      expect(marker.parentElement?.querySelector("h1")?.textContent).toBe("staging-db");
+    });
+
+    test("renders nothing for a read-write connection or for no connection", () => {
+      const view = render(<StudioDesktopHeader {...defaultProps} />);
+      expect(view.queryByText("Read-only")).toBeNull();
+
+      view.rerender(
+        <StudioDesktopHeader {...defaultProps} activeConnection={{ ...baseConnection, readOnly: false }} />,
+      );
+      expect(view.queryByText("Read-only")).toBeNull();
+
+      view.rerender(<StudioDesktopHeader {...defaultProps} activeConnection={null} />);
+      expect(view.queryByText("Read-only")).toBeNull();
     });
   });
 });

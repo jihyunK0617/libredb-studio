@@ -1,12 +1,23 @@
 import { defineConfig, devices } from "@playwright/test";
+import { LAUNCH_E2E_ENV } from "./e2e/helpers/launch-token";
 
-// Override with E2E_PORT when localhost:3000 is occupied by another instance.
+// Ports of every Playwright configuration, so none collides with another: this file's main server
+// 3000 (E2E_PORT), offline server 3010 (E2E_OFFLINE_PORT), passkey server 3011 (E2E_PASSKEY_PORT) and
+// launch server 3012 (E2E_LAUNCH_PORT); playwright.base-path.config.ts's app 3020 and proxy 3021.
+// Override one with its variable when that port is occupied by another instance.
 const port = Number(process.env.E2E_PORT ?? 3000);
 
-// offline-editor.spec.ts and kafka-provider.spec.ts get a second server process on its own port -
-// see the projects and the webServer array below for why. Override with E2E_OFFLINE_PORT under the
-// same collision circumstances as E2E_PORT.
+// offline-editor.spec.ts, the kafka, etcd, neo4j, milvus and qdrant provider specs, the influxdb
+// providers spec and the oxia provider spec get a second server process on its own port - see the
+// projects and the webServer array below for why. Override with E2E_OFFLINE_PORT under the same
+// collision circumstances as E2E_PORT.
 const offlinePort = Number(process.env.E2E_OFFLINE_PORT ?? 3010);
+
+// passkey.spec.ts gets a third server process: see the chromium-passkey project for why.
+const passkeyPort = Number(process.env.E2E_PASSKEY_PORT ?? 3011);
+
+// launch.spec.ts gets a fourth server process: see the chromium-launch project for why.
+const launchPort = Number(process.env.E2E_LAUNCH_PORT ?? 3012);
 
 const testCredentials = {
   JWT_SECRET: "test-jwt-secret-for-e2e-tests-32ch",
@@ -45,9 +56,11 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
-      // offline-editor.spec.ts and kafka-provider.spec.ts run under their own projects below,
-      // against the second server.
-      testIgnore: /(?:offline-editor|base-path|kafka-provider)\.spec\.ts/,
+      // offline-editor.spec.ts, the kafka, etcd, neo4j, milvus and qdrant provider specs, the influxdb providers
+      // spec and the oxia provider spec run under their own projects below, against the second server,
+      // passkey.spec.ts against the third and launch.spec.ts against the fourth.
+      testIgnore:
+        /(?:offline-editor|base-path|kafka-provider|etcd-provider|neo4j-provider|milvus-provider|qdrant-provider|influxdb-providers|oxia-provider|passkey|launch)\.spec\.ts/,
     },
     {
       // Every other spec in this suite signs in as the same shared user@libredb.org account
@@ -71,10 +84,69 @@ export default defineConfig({
       // bucket, and on the shared server it met the budget the specs before it had spent: CI run
       // 36263561882 answered its refusal check "Too many requests. Try again in 38 seconds." on all
       // three attempts. It runs against the second server for the reason offline-editor.spec.ts
-      // does; the two specs together stay far below that bucket's 120 requests a minute.
+      // does. The specs on that server together no longer fit in that bucket's 120 requests a
+      // minute, so the second server raises it (#1293, see its webServer entry below).
       name: "chromium-kafka",
       use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${offlinePort}` },
       testMatch: /kafka-provider\.spec\.ts/,
+    },
+    {
+      // etcd-provider.spec.ts drives Test Connection too, so it takes the second server for the reason
+      // kafka-provider.spec.ts does.
+      name: "chromium-etcd",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${offlinePort}` },
+      testMatch: /etcd-provider\.spec\.ts/,
+    },
+    {
+      // neo4j-provider.spec.ts drives Test Connection too (two calls, one per refusal it asserts), so it
+      // takes the second server for the reason kafka-provider.spec.ts does.
+      name: "chromium-neo4j",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${offlinePort}` },
+      testMatch: /neo4j-provider\.spec\.ts/,
+    },
+    {
+      // milvus-provider.spec.ts drives Test Connection too (one call, for the refusal it asserts), so it takes the
+      // second server for the reason kafka-provider.spec.ts does.
+      name: "chromium-milvus",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${offlinePort}` },
+      testMatch: /milvus-provider\.spec\.ts/,
+    },
+    {
+      // qdrant-provider.spec.ts drives Test Connection too (one call, for the refusal it asserts), so it takes the
+      // second server for the reason kafka-provider.spec.ts does.
+      name: "chromium-qdrant",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${offlinePort}` },
+      testMatch: /qdrant-provider\.spec\.ts/,
+    },
+    {
+      // influxdb-providers.spec.ts drives Test Connection too (two calls, one refusal per type it asserts), so it takes
+      // the second server for the reason kafka-provider.spec.ts does.
+      name: "chromium-influxdb",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${offlinePort}` },
+      testMatch: /influxdb-providers\.spec\.ts/,
+    },
+    {
+      // oxia-provider.spec.ts drives Test Connection too, so it takes the second server for the reason etcd's does.
+      name: "chromium-oxia",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${offlinePort}` },
+      testMatch: /oxia-provider\.spec\.ts/,
+    },
+    {
+      // Passkeys need an account registry, so this server runs in store mode (STORAGE_PROVIDER=sqlite)
+      // with PASSKEY_ORIGIN set; the servers above keep the default local mode, where passkeys are off
+      // and the Permissions-Policy still denies publickey-credentials-get. Chromium only: the virtual
+      // authenticator is a Chrome DevTools Protocol feature (e2e/helpers/virtual-authenticator.ts).
+      name: "chromium-passkey",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${passkeyPort}` },
+      testMatch: /(^|\/)passkey\.spec\.ts$/,
+    },
+    {
+      // Launch sign-in needs the LAUNCH_TOKEN_* variables, an account registry for the launched person, and
+      // seeded connections for the link to open, so this server runs in store mode with a seed file of its
+      // own; no other server gets the launch variables, so every other spec keeps launch sign-in off.
+      name: "chromium-launch",
+      use: { ...devices["Desktop Chrome"], baseURL: `http://localhost:${launchPort}` },
+      testMatch: /(^|\/)launch\.spec\.ts$/,
     },
     {
       // Scoped to the CSP spec only. The desktop shell renders under WebKitGTK, and this is the
@@ -106,6 +178,14 @@ export default defineConfig({
       // sample takes an exclusive single-writer file lock (src/lib/db/providers/embedded/libredb.ts)
       // that a second process cannot also hold - pointing this server at a separate data dir avoids
       // fighting the primary server for that file (and for the SQLite sample file alongside it).
+      //
+      // RATE_LIMIT_QUERY_MAX is raised because the specs here share two accounts and the
+      // production budget of 120 requests a minute is sized for one person, not for a suite
+      // (#1293). Measured on 2026-10-04: one `beforeEach` that signs in and opens the editor spends
+      // 7 slots before the test does anything, so the admin account's eighteen tests and their
+      // retries ran past 120 in one window and a Test Connection assertion read "Too many
+      // requests". Raised rather than set to 0, so the limiter still runs on every request; no
+      // spec on this server asserts its refusal (tests/unit/e2e-project-servers.test.ts).
       command: "until [ -f .next/BUILD_ID ]; do sleep 1; done; bun start",
       url: `http://localhost:${offlinePort}`,
       reuseExistingServer: !process.env.CI,
@@ -113,6 +193,52 @@ export default defineConfig({
       env: {
         PORT: String(offlinePort),
         STORAGE_SQLITE_PATH: "./data-e2e-offline/libredb-storage.db",
+        RATE_LIMIT_QUERY_MAX: "10000",
+        ...testCredentials,
+      },
+    },
+    {
+      // The same shared build as the server above. rm -rf first: the account registry lives in this
+      // data dir, and a store left by an earlier run would keep its accounts and passkeys.
+      command: "rm -rf data-e2e-passkey && until [ -f .next/BUILD_ID ]; do sleep 1; done; bun start",
+      url: `http://localhost:${passkeyPort}`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+      env: {
+        PORT: String(passkeyPort),
+        STORAGE_PROVIDER: "sqlite",
+        STORAGE_SQLITE_PATH: "./data-e2e-passkey/libredb-storage.db",
+        // The address the browser opens; WebAuthn accepts plain http only on the host name localhost.
+        PASSKEY_ORIGIN: `http://localhost:${passkeyPort}`,
+        // Both embedded samples off: their files take a single-writer lock no spec here needs.
+        LIBREDB_EMBEDDED_SAMPLE: "false",
+        SQLITE_EMBEDDED_SAMPLE: "false",
+        // Without a trusted proxy every request comes from the address "unknown", so all the negative
+        // cases of passkey.spec.ts share one client budget; the defaults (5 and 10) would refuse them.
+        RATE_LIMIT_LOGIN_MAX: "100",
+        RATE_LIMIT_PASSKEY_MAX: "100",
+        ...testCredentials,
+      },
+    },
+    {
+      // The same shared build as the server above. rm -rf first: a store left by an earlier run would keep
+      // the accounts earlier launches created.
+      command: "rm -rf data-e2e-launch && until [ -f .next/BUILD_ID ]; do sleep 1; done; bun start",
+      url: `http://localhost:${launchPort}`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+      env: {
+        PORT: String(launchPort),
+        STORAGE_PROVIDER: "sqlite",
+        STORAGE_SQLITE_PATH: "./data-e2e-launch/libredb-storage.db",
+        SEED_CONFIG_PATH: "./e2e/fixtures/launch-seed-connections.json",
+        // Both embedded samples off: the seed file's two connections are the whole list the spec reads.
+        LIBREDB_EMBEDDED_SAMPLE: "false",
+        SQLITE_EMBEDDED_SAMPLE: "false",
+        // Every request comes from the address "unknown" without a trusted proxy, so the refusal the spec
+        // provokes shares one client budget with every retry.
+        RATE_LIMIT_LOGIN_MAX: "100",
+        ...LAUNCH_E2E_ENV,
         ...testCredentials,
       },
     },

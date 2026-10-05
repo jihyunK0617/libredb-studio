@@ -68,6 +68,11 @@ describe("parseTables and findControlTable", () => {
     expect(table?.rows).toHaveLength(PROGRAMME_CONTROL_IDS.length);
   });
 
+  test("the programme ends with the DuckDB open control then the DuckDB non-admin file-access control", () => {
+    expect(PROGRAMME_CONTROL_IDS.slice(-6)).toEqual(["3.12", "3.13", "3.14", "3.15", "3.16", "3.17"]);
+    expect(PROGRAMME_CONTROL_IDS).toHaveLength(36);
+  });
+
   test("ignores a table that is not the control table", () => {
     const other = ["| A | B |", "|---|---|", "| 1 | 2 |", ""].join("\n");
 

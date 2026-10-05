@@ -21,6 +21,7 @@
  *   otherwise working connection.
  */
 
+import { safeDecodeURIComponent } from "@/lib/connection-string-parser";
 import { BaseDatabaseProvider } from "@/lib/db/base-provider";
 import {
   applySourceBound,
@@ -61,6 +62,7 @@ import {
 import { formatCacheHitRatio } from "@/lib/monitoring-cache-ratio";
 import { formatBytes } from "@/lib/db/utils/pool-manager";
 import { applyQueryLimit, DEFAULT_QUERY_LIMIT, MAX_UNLIMITED_ROWS } from "@/lib/db/utils/query-limiter";
+import { unionFields } from "@/lib/db/utils/result-fields";
 import { CouchbaseHttpTransport } from "./http-transport";
 import { CATALOG_TIMEOUT_MS, inferColumns, inferColumnsEach } from "./introspect";
 import { COUCHBASE_DEFAULT_SCOPE, keyspaceFromDisplayName, keyspacePath, quoteIdentifier } from "./keyspace";
@@ -273,19 +275,6 @@ function messageOf(error: unknown): string {
 }
 
 /**
- * Column names for a wildcard projection. `SELECT *` nests whole documents
- * under the keyspace name and advertises only a wildcard signature, so the
- * columns are the union of the keys the rows actually carry, first seen first.
- */
-function deriveFields(rows: CouchbaseRow[]): string[] {
-  const fields = new Set<string>();
-  for (const row of rows) {
-    for (const key of Object.keys(row)) fields.add(key);
-  }
-  return [...fields];
-}
-
-/**
  * SELECT RAW and SELECT VALUE project bare values, so a row can be a scalar, an
  * array, or null rather than the object the grid's row contract assumes. Passed
  * through unchanged, Object.keys turns a string into one column per character
@@ -442,8 +431,11 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
     if (!this.config.host && !this.config.connectionString) {
       throw new DatabaseConfigError("Couchbase requires a host or a connection string", this.type);
     }
-    if (!this.config.database) {
-      throw new DatabaseConfigError('Couchbase requires a bucket (use the "database" field)', this.type);
+    if (!this.bucket) {
+      throw new DatabaseConfigError(
+        'Couchbase requires a bucket (use the URL path or the "database" field)',
+        this.type,
+      );
     }
   }
 
@@ -481,9 +473,8 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
    * provider talks to, and port discovery handles the rest (decision 3).
    */
   private transportConfig(): DatabaseConnection {
-    if (this.config.host) return this.config;
-    const host = this.hostFromConnectionString();
-    return host ? { ...this.config, host } : this.config;
+    const host = this.config.host || this.hostFromConnectionString();
+    return { ...this.config, ...(host ? { host } : {}), database: this.bucket };
   }
 
   private hostFromConnectionString(): string | null {
@@ -513,7 +504,14 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
   }
 
   private get bucket(): string {
-    return this.config.database ?? "";
+    if (this.config.database) return this.config.database;
+    try {
+      const url = new URL(this.config.connectionString ?? "");
+      if (url.protocol !== "couchbase:" && url.protocol !== "couchbases:") return "";
+      return safeDecodeURIComponent(url.pathname.split("/")[1] ?? "");
+    } catch {
+      return "";
+    }
   }
 
   // ==========================================================================
@@ -545,7 +543,9 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
     const rows = result.rows.map(normalizeRow);
     return {
       rows,
-      fields: result.fieldNames ?? deriveFields(rows),
+      // `SELECT *` nests whole documents under the keyspace name and advertises only a
+      // wildcard signature (`fieldNames` null), so the columns are the keys the rows carry.
+      fields: result.fieldNames ?? unionFields(rows),
       // A mutation returns no rows; its row count is what it changed.
       rowCount: rows.length > 0 ? rows.length : result.mutationCount,
       executionTime: reportedMs > 0 ? reportedMs : measuredMs,

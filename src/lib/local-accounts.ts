@@ -11,22 +11,31 @@
  * removes them, so the same email can be issued again without inheriting the previous rows.
  */
 import { randomBytes, randomInt } from "node:crypto";
-import { emitAuditEvent } from "@/lib/audit";
+import { emitAuditEvent, type AuditReason } from "@/lib/audit";
 import type { Role, UserPayload } from "@/lib/auth";
 import { hmacHex } from "@/lib/auth-compare";
 import { getAuthUsers, type AuthUser } from "@/lib/local-auth";
 import { logger } from "@/lib/logger";
 import { hashPassword, needsRehash, passwordMatchesHash } from "@/lib/password-hash";
 import { getStorageProvider } from "@/lib/storage/factory";
-import { LastAdminError, type ServerStorageProvider, type StoredAccount } from "@/lib/storage/types";
+import {
+  AccountWriteConflict,
+  LastAdminError,
+  type AccountUpdateOptions,
+  type ServerStorageProvider,
+  type StoredAccount,
+} from "@/lib/storage/types";
 import { encodeBase32, claimTotpStep, verifyTotp } from "@/lib/totp";
 
 export class AccountError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** A reauthentication that needs a current TOTP code and got none; the client then asks for one. */
+  readonly codeRequired: boolean;
+  constructor(status: number, message: string, options: { codeRequired?: boolean } = {}) {
     super(message);
     this.name = "AccountError";
     this.status = status;
+    this.codeRequired = options.codeRequired ?? false;
   }
 }
 
@@ -35,8 +44,13 @@ export interface PublicAccount {
   role: Role;
   disabled: boolean;
   totpEnabled: boolean;
+  /** How many passkeys the account has; the admin table shows it. */
+  passkeys: number;
   createdAt: string;
 }
+
+/** A write that read the account before another change to it landed; nothing was written. */
+export const ACCOUNT_CHANGED = "The account changed at the same time. Reload the page and try again.";
 
 const EMAIL_INVALID = "Enter an email address.";
 const PASSWORD_SHORT = "Password must be at least 8 characters.";
@@ -47,6 +61,9 @@ const LAST_ADMIN = "The last enabled admin cannot be removed.";
 const EMPTY_PATCH = "Nothing to change.";
 const DISABLED_TYPE = "disabled must be true or false.";
 const CLEAR_TOTP_TYPE = "clearTotp must be true.";
+const CLEAR_PASSKEYS_TYPE = "clearPasskeys must be true.";
+const KEEP_PASSKEYS_TYPE = "keepPasskeys must be true.";
+const KEEP_PASSKEYS_ALONE = "keepPasskeys applies only together with a new password, and never with clearPasskeys.";
 const OIDC_MODE = "Accounts are managed by the identity provider in OIDC mode.";
 const LOCAL_MODE = "The account registry needs STORAGE_PROVIDER=sqlite or postgres.";
 const TOTP_MISSING = "Start authenticator setup before confirming a code.";
@@ -84,16 +101,18 @@ function readRole(value: unknown): Role {
   return value;
 }
 
-function sameEmail(a: string, b: string): boolean {
+/** An account's email, its username, is matched without regard to case on every sign-in path. */
+export function sameEmail(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase();
 }
 
-function toPublic(account: StoredAccount): PublicAccount {
+function toPublic(account: StoredAccount, passkeys: number): PublicAccount {
   return {
     email: account.email,
     role: account.role,
     disabled: account.disabled,
     totpEnabled: account.totpSecret !== null,
+    passkeys,
     createdAt: account.createdAt,
   };
 }
@@ -116,7 +135,20 @@ function isUniqueViolation(error: unknown): boolean {
   return code === "23505" || code === "SQLITE_CONSTRAINT_PRIMARYKEY" || /UNIQUE constraint failed/i.test(error.message);
 }
 
-function audit(actor: string, action: string, email: string): void {
+export type AccountRefusalReason = Extract<
+  AuditReason,
+  | "bad_credentials"
+  | "bad_totp"
+  | "account_refused"
+  | "passkey_ceremony_invalid"
+  | "passkey_origin_mismatch"
+  | "passkey_rejected"
+  | "passkey_replayed"
+  | "passkey_duplicate"
+>;
+
+/** One shape for every account event, shared with the passkey services; `passkey` is the internal id. */
+export function auditAccountChange(actor: string, action: string, email: string, passkey?: string): void {
   try {
     emitAuditEvent({
       type: "account",
@@ -125,23 +157,43 @@ function audit(actor: string, action: string, email: string): void {
       user: actor,
       result: "success",
       reason: "account_changed",
+      ...(passkey ? { passkey } : {}),
     });
   } catch (error) {
     logger.error("Failed to record account audit event", error, { route: "accounts" });
   }
 }
 
-function auditRefusal(email: string, action: string, reason: "bad_credentials" | "bad_totp"): void {
+/** A refused change the owner made to their own account, shared with the passkey services. */
+export function auditAccountRefusal(
+  email: string,
+  action: string,
+  reason: AccountRefusalReason,
+  passkey?: string,
+): void {
   try {
-    emitAuditEvent({ type: "account", action, target: email, user: email, result: "failure", reason });
+    emitAuditEvent({
+      type: "account",
+      action,
+      target: email,
+      user: email,
+      result: "failure",
+      reason,
+      ...(passkey ? { passkey } : {}),
+    });
   } catch (error) {
     logger.error("Failed to record account audit event", error, { route: "accounts" });
   }
 }
 
-function readCredential(body: unknown, field: "password" | "code", missing: string): string {
+function readCredential(
+  body: unknown,
+  field: "password" | "code",
+  missing: string,
+  options?: { codeRequired: boolean },
+): string {
   const value = isRecord(body) ? body[field] : undefined;
-  if (typeof value !== "string" || value.length === 0) throw new AccountError(400, missing);
+  if (typeof value !== "string" || value.length === 0) throw new AccountError(400, missing, options);
   return value;
 }
 
@@ -149,29 +201,65 @@ function readCredential(body: unknown, field: "password" | "code", missing: stri
  * Changing your own second factor asks for the password again, and turning an active one off asks
  * for a current code too, so a stolen session cookie can neither remove the factor nor replace it
  * with the thief's. A 401 from here is a failed guess, and the route charges it to the login budget.
+ * The passkey services reuse it before adding or removing a passkey. A missing code is marked
+ * `codeRequired`, so the client asks for one instead of guessing from the message.
  */
-async function confirmOwner(current: StoredAccount, body: unknown, action: string, needsCode: boolean): Promise<void> {
+export async function confirmOwner(
+  current: StoredAccount,
+  body: unknown,
+  action: string,
+  needsCode: boolean,
+): Promise<void> {
   const password = readCredential(body, "password", CURRENT_PASSWORD_MISSING);
-  const code = needsCode ? readCredential(body, "code", CURRENT_CODE_MISSING) : "";
+  const code = needsCode ? readCredential(body, "code", CURRENT_CODE_MISSING, { codeRequired: true }) : "";
   if (!(await passwordMatchesHash(password, current.passwordHash))) {
-    auditRefusal(current.email, action, "bad_credentials");
+    auditAccountRefusal(current.email, action, "bad_credentials");
     throw new AccountError(401, CURRENT_PASSWORD_WRONG);
   }
   if (!needsCode || !current.totpSecret) return;
   const step = verifyTotp(current.totpSecret, code);
   if (step === null || !claimTotpStep(hmacHex(current.email.toLowerCase()), step)) {
-    auditRefusal(current.email, action, "bad_totp");
+    auditAccountRefusal(current.email, action, "bad_totp");
     throw new AccountError(401, TOTP_BAD);
   }
 }
 
-async function requireAccountStore(): Promise<ServerStorageProvider> {
+/** The reconciled server store, or 409 in OIDC and local mode; the passkey services reuse it. */
+export async function requireAccountStore(): Promise<ServerStorageProvider> {
   if (process.env.NEXT_PUBLIC_AUTH_PROVIDER === "oidc") throw new AccountError(409, OIDC_MODE);
   const provider = await getStorageProvider();
   if (!provider) throw new AccountError(409, LOCAL_MODE);
   await reconcileOnce(provider);
   await seedAccountsIfEmpty(provider);
   return provider;
+}
+
+/** The session's own stored row, or 404 when it has none; the passkey services reuse it. */
+export async function requireOwnAccount(
+  email: string,
+): Promise<{ provider: ServerStorageProvider; current: StoredAccount }> {
+  const provider = await requireAccountStore();
+  const current = await provider.getAccount(email);
+  if (!current) throw new AccountError(404, NOT_IN_STORE);
+  return { provider, current };
+}
+
+/**
+ * A write that read the row before another change landed would put the old `disabled` and
+ * session version back, so the store refuses it and the caller answers 409. Not a 401, so no
+ * login budget is charged for it.
+ */
+async function writeAccount(
+  provider: ServerStorageProvider,
+  next: StoredAccount,
+  options: AccountUpdateOptions,
+): Promise<number> {
+  try {
+    return await provider.updateAccount(next, options);
+  } catch (error) {
+    if (error instanceof AccountWriteConflict) throw new AccountError(409, ACCOUNT_CHANGED);
+    throw error;
+  }
 }
 
 /**
@@ -218,7 +306,7 @@ export async function seedAccountsIfEmpty(provider: ServerStorageProvider): Prom
 }
 
 const RESET_APPLIED = (email: string) =>
-  `ADMIN_PASSWORD_RESET is set: ${email} is an enabled admin again and signs in with ADMIN_PASSWORD. Remove ADMIN_PASSWORD_RESET now; every start applies it again while it is set.`;
+  `ADMIN_PASSWORD_RESET is set: ${email} is an enabled admin again, signs in with ADMIN_PASSWORD, and has no passkeys. Remove ADMIN_PASSWORD_RESET now; every start applies it again while it is set.`;
 const EMAIL_NOT_STORED = (email: string) =>
   `ADMIN_EMAIL ${email} is not in the account registry. With a server store the environment only seeds an empty table; set ADMIN_PASSWORD_RESET=true and restart to create it.`;
 const PASSWORD_DRIFT = (email: string) =>
@@ -242,7 +330,9 @@ function resetRequested(): boolean {
 
 /**
  * The break-glass path: make ADMIN_EMAIL an enabled admin that signs in with ADMIN_PASSWORD (and
- * ADMIN_TOTP_SECRET, or no second factor), whatever the store holds. Every session it had ends.
+ * ADMIN_TOTP_SECRET, or no second factor) and has no passkeys, whatever the store holds. Every
+ * session it had ends. A conflicting write propagates: reconcileOnce forgets the failed attempt,
+ * so the next request applies the reset again.
  */
 async function applyEnvironmentAdmin(
   provider: ServerStorageProvider,
@@ -261,9 +351,9 @@ async function applyEnvironmentAdmin(
     createdAt: stored?.createdAt ?? now,
     updatedAt: now,
   };
-  if (stored) await provider.updateAccount(next);
+  if (stored) await provider.updateAccount(next, { expected: stored, clearPasskeys: true });
   else await provider.insertAccount(next);
-  audit("environment", "reset", next.email);
+  auditAccountChange("environment", "reset", next.email);
   logger.warn(RESET_APPLIED(next.email), { route: "accounts" });
 }
 
@@ -349,17 +439,161 @@ export async function rehashStoredPassword(email: string, password: string): Pro
     if (!provider) return;
     const account = await provider.getAccount(email);
     if (!account || !needsRehash(account.passwordHash)) return;
-    account.passwordHash = await hashPassword(password);
-    account.updatedAt = new Date().toISOString();
-    await provider.updateAccount(account);
+    const next = { ...account, passwordHash: await hashPassword(password), updatedAt: new Date().toISOString() };
+    // A conflict lands in the catch below: another change won, and the next login rehashes.
+    await provider.updateAccount(next, { expected: account });
   } catch (error) {
     logger.error("Failed to rehash account password", error, { route: "POST /api/auth/login" });
   }
 }
 
+/** The actor an account change made by a launch is recorded under, as "environment" is for the reset. */
+const LAUNCH_ACTOR = "launch";
+const LAUNCH_NOT_LINKED =
+  "This email belongs to a Studio account that a launch link cannot sign in to. Sign in with that account's password, or ask a Studio admin.";
+const LAUNCH_DISABLED = "This account is disabled in Studio. Ask a Studio admin to enable it.";
+const LAUNCH_LAST_ADMIN =
+  "Studio did not make this account a user, because it is the last enabled admin. Ask a Studio admin to make another account an admin first.";
+
+/** What a verified launch token asks for: an account, a role, and the platform identity it speaks for. */
+export interface LaunchIdentity {
+  email: string;
+  role: Role;
+  /** The token's `iss`, which the verifier matched to LAUNCH_TOKEN_ISSUER. */
+  issuer: string;
+  /** The token's `sub`, the person's id on that platform. */
+  subject: string;
+}
+
+/** Who a verified launch token signs in as. `sessionVersion` is set only for an account in the server store. */
+export interface LaunchAccount {
+  role: Role;
+  username: string;
+  sessionVersion?: number;
+}
+
+/**
+ * What the password_hash of an account a launch created holds: not a scrypt encoding, so no password ever
+ * matches it (passwordMatchesHash runs its placeholder KDF and answers false), but the issuer and subject the
+ * account is bound to, base64url-encoded so that neither can write the separator. The binding lives in that
+ * column because it means exactly "this account has no password": an admin who sets a password replaces it,
+ * and the account is from then on a password account that no launch reaches. Adding an authenticator or a
+ * passkey asks for the current password (confirmOwner), so a bound account gains neither while it is bound.
+ */
+function launchIdentityHash(issuer: string, subject: string): string {
+  const encode = (value: string) => Buffer.from(value).toString("base64url");
+  return `launch-identity$${encode(issuer)}$${encode(subject)}`;
+}
+
+/**
+ * A new account for a launched email, bound to the token's issuer and subject, with the token's role. Two
+ * launches racing to create the same email leave one row, and the loser goes on with the winner's, which
+ * provisionLaunchAccount then checks like any stored account.
+ */
+async function insertLaunchAccount(provider: ServerStorageProvider, launch: LaunchIdentity): Promise<StoredAccount> {
+  const now = new Date().toISOString();
+  const account: StoredAccount = {
+    email: launch.email,
+    passwordHash: launchIdentityHash(launch.issuer, launch.subject),
+    role: launch.role,
+    totpSecret: null,
+    totpPending: null,
+    disabled: false,
+    sessionVersion: initialSessionVersion(),
+    createdAt: now,
+    updatedAt: now,
+  };
+  try {
+    await provider.insertAccount(account);
+  } catch (error) {
+    const winner = isUniqueViolation(error) ? await provider.getAccount(launch.email) : null;
+    if (!winner) throw error;
+    return winner;
+  }
+  auditAccountChange(LAUNCH_ACTOR, "create", launch.email);
+  return account;
+}
+
+/**
+ * The account a verified launch token signs in (docs/LAUNCH.md).
+ *
+ * The ADMIN_EMAIL address is refused in both storage modes, even while its row is missing, so a launch never
+ * takes the break-glass address (contract A3.2). With STORAGE_PROVIDER=local there is no row to consult, as
+ * storedAccountAllows says, and the accounts getAuthUsers() lists are the ones that sign in with a password,
+ * so every one of their emails is refused: a launch session under one would share that account's transactions,
+ * agent runs and audit trail. Any other email gets a session that carries the token's email and role, and
+ * nothing is stored. OIDC is refused, as every account path refuses it, before the store is opened: the
+ * launch route already answers 503 in that mode (src/lib/launch/config.ts).
+ *
+ * In the server store every session must match a stored account, so the launch provides one, and it reaches
+ * only an account a launch created for the same platform identity. An email with no account gets one, bound
+ * to the token's issuer and subject. An existing account is matched without regard to case, as password login
+ * matches it, and is refused unless it carries that same binding and holds no authenticator and no passkey:
+ * matching by email alone would hand a launch any password account with that address, the seeded ADMIN_EMAIL
+ * included, and an email the platform reassigned would reach the previous owner's account. The binding is
+ * checked before the disabled flag, so a refusal tells nobody but the bound person whether an account is
+ * disabled. A bound account takes the token's role when it differs, which moves the session version on and
+ * ends its other sessions, exactly as an admin's role change does, and the store still refuses to remove the
+ * last enabled admin. A disabled account is refused and never revived: the platform says who the person is,
+ * and disabling is Studio's own decision about them.
+ *
+ * The registry is reconciled and seeded first, as on every other sign-in path, so a launch into an empty
+ * store can never take the place of the environment admin.
+ *
+ * @throws {AccountError} 403 for an account a launch cannot sign in to, 401 for a disabled account, 409 when
+ * the role change would leave no enabled admin or the account changed while it was read, and 409 under OIDC.
+ */
+export async function provisionLaunchAccount(launch: LaunchIdentity): Promise<LaunchAccount> {
+  if (process.env.NEXT_PUBLIC_AUTH_PROVIDER === "oidc") throw new AccountError(409, OIDC_MODE);
+  const environmentAccounts = getAuthUsers();
+  // The break-glass address (contract A3.2) is never a launch account, in either mode, even while its row is missing.
+  if (sameEmail(environmentAccounts[0].email, launch.email)) throw new AccountError(403, LAUNCH_NOT_LINKED);
+  const provider = await getStorageProvider();
+  if (!provider) {
+    if (environmentAccounts.some((account) => sameEmail(account.email, launch.email))) {
+      throw new AccountError(403, LAUNCH_NOT_LINKED);
+    }
+    return { role: launch.role, username: launch.email };
+  }
+  await reconcileOnce(provider);
+  await seedAccountsIfEmpty(provider);
+  const stored = (await provider.listAccounts()).find((account) => sameEmail(account.email, launch.email));
+  const current = stored ?? (await insertLaunchAccount(provider, launch));
+  const passkeys = (await provider.countPasskeys()).get(current.email) ?? 0;
+  if (
+    current.passwordHash !== launchIdentityHash(launch.issuer, launch.subject) ||
+    current.totpSecret !== null ||
+    passkeys > 0
+  ) {
+    throw new AccountError(403, LAUNCH_NOT_LINKED);
+  }
+  if (current.disabled) throw new AccountError(401, LAUNCH_DISABLED);
+  if (current.role === launch.role) {
+    return { role: current.role, username: current.email, sessionVersion: current.sessionVersion };
+  }
+  const next: StoredAccount = {
+    ...current,
+    role: launch.role,
+    sessionVersion: current.sessionVersion + 1,
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    await writeAccount(provider, next, {
+      expected: current,
+      keepEnabledAdmin: isEnabledAdmin(current) && !isEnabledAdmin(next),
+    });
+  } catch (error) {
+    if (error instanceof LastAdminError) throw new AccountError(409, LAUNCH_LAST_ADMIN);
+    throw error;
+  }
+  auditAccountChange(LAUNCH_ACTOR, "role", current.email);
+  return { role: next.role, username: current.email, sessionVersion: next.sessionVersion };
+}
+
 export async function listPublicAccounts(): Promise<PublicAccount[]> {
   const provider = await requireAccountStore();
-  return (await provider.listAccounts()).map(toPublic);
+  const counts = await provider.countPasskeys();
+  return (await provider.listAccounts()).map((account) => toPublic(account, counts.get(account.email) ?? 0));
 }
 
 async function createAccountOrRefuse(actor: string, body: unknown): Promise<PublicAccount> {
@@ -383,8 +617,8 @@ async function createAccountOrRefuse(actor: string, body: unknown): Promise<Publ
     updatedAt: now,
   };
   await provider.insertAccount(stored);
-  audit(actor, "create", stored.email);
-  return toPublic(stored);
+  auditAccountChange(actor, "create", stored.email);
+  return toPublic(stored, 0);
 }
 
 interface AccountPatch {
@@ -392,6 +626,8 @@ interface AccountPatch {
   disabled?: boolean;
   password?: string;
   clearTotp?: boolean;
+  clearPasskeys?: boolean;
+  keepPasskeys?: boolean;
 }
 
 function readPatch(body: unknown): AccountPatch {
@@ -407,7 +643,22 @@ function readPatch(body: unknown): AccountPatch {
     if (body.clearTotp !== true) throw new AccountError(400, CLEAR_TOTP_TYPE);
     patch.clearTotp = true;
   }
-  if (patch.role === undefined && patch.disabled === undefined && patch.password === undefined && !patch.clearTotp) {
+  if (body.clearPasskeys !== undefined) {
+    if (body.clearPasskeys !== true) throw new AccountError(400, CLEAR_PASSKEYS_TYPE);
+    patch.clearPasskeys = true;
+  }
+  if (body.keepPasskeys !== undefined) {
+    if (body.keepPasskeys !== true) throw new AccountError(400, KEEP_PASSKEYS_TYPE);
+    if (patch.password === undefined || patch.clearPasskeys) throw new AccountError(400, KEEP_PASSKEYS_ALONE);
+    patch.keepPasskeys = true;
+  }
+  if (
+    patch.role === undefined &&
+    patch.disabled === undefined &&
+    patch.password === undefined &&
+    !patch.clearTotp &&
+    !patch.clearPasskeys
+  ) {
     throw new AccountError(400, EMPTY_PATCH);
   }
   return patch;
@@ -421,9 +672,9 @@ function isEnabledAdmin(account: StoredAccount): boolean {
  * The store decides "an enabled admin remains" inside the write's own transaction, because a
  * read-then-write check here let two concurrent requests each remove one of the last two admins.
  */
-async function guardLastAdmin(write: () => Promise<void>): Promise<void> {
+async function guardLastAdmin<T>(write: () => Promise<T>): Promise<T> {
   try {
-    await write();
+    return await write();
   } catch (error) {
     if (error instanceof LastAdminError) throw new AccountError(409, LAST_ADMIN);
     throw error;
@@ -443,8 +694,11 @@ async function changeAccountOrRefuse(actor: string, email: string, body: unknown
   if (!current) throw new AccountError(404, ACCOUNT_NOT_FOUND);
   const role = patch.role ?? current.role;
   const disabled = patch.disabled ?? current.disabled;
+  // A password set is a recovery (docs/PASSKEYS.md, "Admin actions and recovery"): it removes passkeys unless the admin keeps them.
+  const clearsPasskeys = patch.clearPasskeys === true || (patch.password !== undefined && patch.keepPasskeys !== true);
   // Each of these changes what an existing session was issued for, so each ends it.
-  const endsSessions = role !== current.role || (disabled && !current.disabled) || patch.password !== undefined;
+  const endsSessions =
+    role !== current.role || (disabled && !current.disabled) || patch.password !== undefined || clearsPasskeys;
   const next: StoredAccount = {
     ...current,
     role,
@@ -455,16 +709,24 @@ async function changeAccountOrRefuse(actor: string, email: string, body: unknown
     sessionVersion: endsSessions ? current.sessionVersion + 1 : current.sessionVersion,
     updatedAt: new Date().toISOString(),
   };
-  await guardLastAdmin(() =>
-    provider.updateAccount(next, { keepEnabledAdmin: isEnabledAdmin(current) && !isEnabledAdmin(next) }),
+  // Read before the write, so a failing count refuses the change instead of failing a committed one. A count
+  // parses no row, so one unreadable passkey never blocks disabling the account.
+  const passkeys = clearsPasskeys ? 0 : ((await provider.countPasskeys()).get(current.email) ?? 0);
+  const removed = await guardLastAdmin(() =>
+    writeAccount(provider, next, {
+      expected: current,
+      keepEnabledAdmin: isEnabledAdmin(current) && !isEnabledAdmin(next),
+      ...(clearsPasskeys ? { clearPasskeys: true } : {}),
+    }),
   );
-  if (patch.role !== undefined && patch.role !== current.role) audit(actor, "role", current.email);
+  if (patch.role !== undefined && patch.role !== current.role) auditAccountChange(actor, "role", current.email);
   if (patch.disabled !== undefined && patch.disabled !== current.disabled) {
-    audit(actor, patch.disabled ? "disable" : "enable", current.email);
+    auditAccountChange(actor, patch.disabled ? "disable" : "enable", current.email);
   }
-  if (patch.password) audit(actor, "password", current.email);
-  if (patch.clearTotp) audit(actor, "totp_clear", current.email);
-  return { account: toPublic(next), sessionVersion: next.sessionVersion };
+  if (patch.password) auditAccountChange(actor, "password", current.email);
+  if (patch.clearTotp) auditAccountChange(actor, "totp_clear", current.email);
+  if (removed > 0) auditAccountChange(actor, "passkey_clear", current.email);
+  return { account: toPublic(next, passkeys), sessionVersion: next.sessionVersion };
 }
 
 async function removeAccountOrRefuse(actor: string, email: string): Promise<void> {
@@ -472,7 +734,7 @@ async function removeAccountOrRefuse(actor: string, email: string): Promise<void
   const current = await provider.getAccount(email);
   if (!current) throw new AccountError(404, ACCOUNT_NOT_FOUND);
   await guardLastAdmin(() => provider.deleteAccount(current.email, { keepEnabledAdmin: isEnabledAdmin(current) }));
-  audit(actor, "delete", current.email);
+  auditAccountChange(actor, "delete", current.email);
 }
 
 export type OwnFactorStatus = { available: false; reason: string } | { available: true; enabled: boolean };
@@ -535,16 +797,13 @@ export async function beginTotpEnrolment(
   email: string,
   body?: unknown,
 ): Promise<{ secret: string; otpauthUrl: string }> {
-  const provider = await requireAccountStore();
-  const current = await provider.getAccount(email);
-  if (!current) throw new AccountError(404, NOT_IN_STORE);
+  const { provider, current } = await requireOwnAccount(email);
   await confirmOwner(current, body, "totp_begin", false);
   if (current.totpSecret) throw new AccountError(409, FACTOR_ACTIVE);
   const secret = encodeBase32(randomBytes(20));
-  current.totpPending = secret;
-  current.updatedAt = new Date().toISOString();
-  await provider.updateAccount(current);
-  audit(email, "totp_begin", current.email);
+  const next = { ...current, totpPending: secret, updatedAt: new Date().toISOString() };
+  await writeAccount(provider, next, { expected: current });
+  auditAccountChange(email, "totp_begin", current.email);
   return { secret, otpauthUrl: otpauthUrl(email, secret) };
 }
 
@@ -554,21 +813,15 @@ export async function confirmTotpEnrolment(email: string, code: string): Promise
   if (!current?.totpPending) throw new AccountError(400, TOTP_MISSING);
   const step = verifyTotp(current.totpPending, code);
   if (step === null || !claimTotpStep(hmacHex(email.toLowerCase()), step)) throw new AccountError(400, TOTP_BAD);
-  current.totpSecret = current.totpPending;
-  current.totpPending = null;
-  current.updatedAt = new Date().toISOString();
-  await provider.updateAccount(current);
-  audit(email, "totp_enrol", current.email);
+  const next = { ...current, totpSecret: current.totpPending, totpPending: null, updatedAt: new Date().toISOString() };
+  await writeAccount(provider, next, { expected: current });
+  auditAccountChange(email, "totp_enrol", current.email);
 }
 
 export async function disableOwnTotp(email: string, body?: unknown): Promise<void> {
-  const provider = await requireAccountStore();
-  const current = await provider.getAccount(email);
-  if (!current) throw new AccountError(404, NOT_IN_STORE);
+  const { provider, current } = await requireOwnAccount(email);
   await confirmOwner(current, body, "totp_clear", current.totpSecret !== null);
-  current.totpSecret = null;
-  current.totpPending = null;
-  current.updatedAt = new Date().toISOString();
-  await provider.updateAccount(current);
-  audit(email, "totp_clear", current.email);
+  const next = { ...current, totpSecret: null, totpPending: null, updatedAt: new Date().toISOString() };
+  await writeAccount(provider, next, { expected: current });
+  auditAccountChange(email, "totp_clear", current.email);
 }

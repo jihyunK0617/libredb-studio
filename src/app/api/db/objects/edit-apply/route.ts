@@ -3,7 +3,7 @@ import {
   ObjectRouteError,
   handleObjectRequest,
   optionalStringArray,
-  readBoundedJson,
+  readObjectRouteBody,
   requireString,
 } from "@/lib/api/object-route";
 import { isObjectEditOutcomeShape, isObjectEditPlanShape } from "@/lib/api/object-edit-wire";
@@ -42,8 +42,9 @@ const ROUTE = "api/db/objects/edit-apply";
  * and is NOT wrapped in a try/catch, so any audit-sink failure propagates and the apply never
  * happens: the path fails closed on an unauditable write rather than performing it silently. That
  * is `src/lib/db/operations/execution.ts:11-20`'s rule for the agent path, applied here for the
- * same reason. The OUTCOME event is emitted after and IS wrapped, which is
- * `src/app/api/db/maintenance/route.ts:123-152`'s rule and its stated reason: the engine has
+ * same reason. The OUTCOME event is emitted after and IS wrapped, which is the rule of the
+ * completed-run audit row in `POST` of `src/app/api/db/maintenance/route.ts`, and its stated
+ * reason: the engine has
  * already acted, and a broken sink must never turn a completed apply into a 500 that invites a
  * retry that would be a SECOND DDL.
  *
@@ -187,7 +188,7 @@ export async function POST(req: NextRequest) {
 
       return outcome;
     },
-    { readBody: (request) => readBoundedJson(request, EDIT_BODY_BYTE_LIMIT) },
+    { readBody: (request) => readObjectRouteBody(request, EDIT_BODY_BYTE_LIMIT) },
   );
 }
 
