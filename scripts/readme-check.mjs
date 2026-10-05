@@ -60,8 +60,6 @@ const LOCALIZED = [
 
 /** The variable the quickstart warning must name. */
 const WARNING_VARIABLE = "AUTH_COOKIE_SECURE";
-/** The variable the quickstart warning must name. */
-const WARNING_VARIABLE = "AUTH_COOKIE_SECURE";
 
 /** Shared wording so the canonical and localized violations read identically. */
 const MISSING_WARNING = `no plain-HTTP login warning (expected a blockquote naming ${WARNING_VARIABLE} under the quickstart)`;
