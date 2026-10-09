@@ -17,6 +17,7 @@ It is off by default.
     On Milvus it lists the collection's declared fields, with the dynamic field as one `$meta` column and never a key inside it.
     On Qdrant it lists payload-index fields and vectors only, and says that other payload keys may exist: the keys Studio samples from points never reach an MCP client.
     On InfluxDB (InfluxQL) it lists measurements with their tag and field keys, and on InfluxDB 3 (SQL) tables with their columns; the `_internal` database and the `system.*` tables of a 3.x server are never returned.
+    On Databend it lists tables, views, materialized views and dynamic tables; on a Databend Cloud connection with a Warehouse set, a call resumes a suspended warehouse, which bills while it runs, as any statement does.
   - `run_read_query` runs one read-only statement: a `SELECT` (a `WITH` is fine), `VALUES`, `TABLE`, or `EXPLAIN` without `ANALYZE`.
     Runs on PostgreSQL, SQLite, DuckDB and SQL Server; other engines refuse it, so use inspect_schema there.
 - Read-only is the database's own enforcement, not a filter over SQL text: `run_read_query` takes the connection under Studio's agent read-only execution profile and runs through the provider's read-only statement path, which PostgreSQL enforces with a read-only transaction, SQLite and DuckDB with a read-only open, and SQL Server by verifying the principal cannot write.
@@ -100,7 +101,8 @@ An empty `list_connections` answer means no connection is opted in for your toke
 `run_read_query` refuses a PostgreSQL or SQL Server connection whose own login could do more than read, so an opted-in seed for those engines needs a least-privilege principal.
 On PostgreSQL the seed's role must not be a superuser and must not hold `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`.
 On SQL Server the login must hold no fixed server role, neither `CONTROL SERVER` nor `ADMINISTER BULK OPERATIONS`, and none of `db_owner`, `db_accessadmin`, `db_securityadmin`, `db_ddladmin`, `db_backupoperator` or `db_datawriter`, and it must be granted `SHOWPLAN`.
-A seed entry cannot carry a separate agent credential, so the fix is the seed's own login; `inspect_schema` has no such requirement.
+A seed entry cannot carry a separate agent credential, so the fix is the seed's own login.
+`inspect_schema` acquires its connection under the same read-only execution context as `run_read_query` (both verify the principal at open, not per statement), so the same least-privilege requirement applies there too: a superuser PostgreSQL role or a privileged SQL Server login refuses `inspect_schema` as well.
 
 ## Getting a token
 

@@ -1,9 +1,9 @@
 apiVersion: v2
 name: libredb-studio
-description: Web-based SQL IDE for cloud-native teams supporting twenty-six engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra, libSQL, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3 and Oxia
+description: Web-based SQL IDE for cloud-native teams supporting twenty-seven engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, libSQL, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3, Oxia and Databend
 type: application
-version: 0.1.77
-appVersion: "0.17.0"
+version: 0.1.80
+appVersion: "0.18.1"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -78,6 +78,9 @@ keywords:
   # One keyword, like kafka above: `oxia` is the type-id and the word an evaluator looking for an
   # Oxia client types, so there is no second spelling to catch.
   - oxia
+  # One keyword, like oxia above: `databend` is the type-id and the word an evaluator looking for
+  # a Databend client types, so there is no second spelling to catch.
+  - databend
   - web-ide
 maintainers:
   - name: cevheri
@@ -184,10 +187,32 @@ annotations:
   # description, the keywords and the README; no template, value or default moves.
   # False: 0.1.77 changes chart metadata only, naming Oxia in the description, the keywords and
   # the README; no template, value or default moves.
+  # True: 0.1.78 tracks app release 0.18.0, which carries three security fixes in the image. On a
+  # deployment with the OIDC_* variables set, whatever its auth provider, the oidc-state cookie that
+  # GET /api/auth/oidc/login hands any visitor was also accepted as the session cookie, so an
+  # unauthenticated visitor passed the session check outside /admin, from 0.7.0 through 0.17.0
+  # (GHSA-8gc9-2gm6-5c7f); a non-admin user's DuckDB connection could read, and in some cases write,
+  # any file the Studio process can reach; and SQLite, DuckDB and LibreDB connections now refuse
+  # Studio's own storage and credential files as their database path for every role, with SQLite
+  # opening only for an admin. An operator with the OIDC_* variables set, or offering DuckDB or
+  # SQLite to non-admin users, should read all three; no chart template or value moves for any of
+  # them, so the upgrade is the image. The chart's own edit is its description, which calls Trino by
+  # its own name (#1158).
+  # True: 0.1.79 tracks app release 0.18.1, which carries one security fix in the image. With
+  # server storage (config.storageProvider sqlite or postgres), an account that signed in on a
+  # browser profile another account had signed out of received that account's browser copy of
+  # the workspace: the connections it had added, with their saved credentials, and its query
+  # history, from 0.8.0 through 0.18.0 (GHSA-jwvh-6phv-j9jh). An operator running server storage where
+  # people share a browser profile should read it; no chart template or value moves, so the
+  # upgrade is the image. The chart's own edit names Databend in the description, the keywords
+  # and the README.
+  # False: 0.1.80 adds three values, extraVolumes, extraVolumeMounts and extraObjects (#1526),
+  # all empty by default, so every existing install renders exactly as before. They mount
+  # extra volumes into the app container and ship extra manifests with the release.
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.17.0
+      image: ghcr.io/libredb/libredb-studio:0.18.1
       platforms:
         - linux/amd64
         - linux/arm64
@@ -199,7 +224,7 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "The application image gains the Oxia provider; no template, value or default moves, and it acts once an application release moves appVersion."
+    - "Three optional values, extraVolumes, extraVolumeMounts and extraObjects, mount extra volumes into the app container (such as a private CA, trusted by pointing NODE_EXTRA_CA_CERTS at it through extraEnv) and ship extra Kubernetes manifests with the release; all empty by default, so nothing changes when unset"
 dependencies:
   - name: postgresql
     version: "16.x.x"

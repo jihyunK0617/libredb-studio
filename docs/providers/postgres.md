@@ -249,6 +249,37 @@ a rejected read leaves its panel absent and records the engine's own sentence un
 `errors`, while an empty array claims the engine answered "nothing" — a measurement it
 never made, and one that throws away the sentence saying why.
 
+A refused **size builtin** is not one of those cases, and since #1436 does not reject.
+`pg_table_size()`, `pg_indexes_size()` and `pg_total_relation_size()` are three columns of a
+read whose other columns the engine answers, so each is dropped on its own
+(`queryTableStats()`) and the rows arrive with that size absent — never as a `0`, which
+would be a measurement nobody made ([D105](../BACKLOG.md)). Measured on RisingWave 3.1.0,
+which binds neither `pg_size_pretty()` nor `pg_total_relation_size()` but answers
+`pg_table_size(relid)` and `pg_indexes_size(relid)`: the panel now lists the tables with
+their sizes, where the whole read used to fail.
+
+**The total is the one size that can be derived rather than dropped**, and
+`totalSizeBytes()` does. PostgreSQL defines `pg_total_relation_size()` as `pg_table_size()`
+plus `pg_indexes_size()`, so adding the two measured parts is the engine's own arithmetic and
+not this provider's guess. It has to be derived rather than left absent because
+`totalSizeBytes` is a **required** field: an absent total still has to carry a number, and the
+`N/A`-beside-`0` spelling the other providers use is only safe where nothing else on the row
+claims a size. The Tables tab's Size card and the Storage tab's share both gate on
+`tableSizeBytes` alone — until #1436 a measured table size always arrived with a measured
+total — so a row carrying one part and the placeholder got that `0` summed and drawn as a
+reading. Measured on RisingWave 3.1.0 on 2026-10-08, one table of two rows:
+`pg_table_size` 89, `pg_indexes_size` 0, `pg_total_relation_size` *function
+pg_total_relation_size(integer) does not exist*. The card read **0 B** over a table with
+bytes in it; it now reads **89 B**. Where a part is refused as well there is nothing to add
+up, and the row publishes no sizes at all, so those gates read the absence and answer `N/A`
+instead of summing the placeholder. No engine measured here does that — RisingWave refuses
+the total alone, CockroachDB answers NULL for all three — so that arm closes the shape rather
+than one seen.
+
+Materialize's outcome is unchanged, because its refusal is not the size call alone: it has
+no `pg_stat_user_tables` either, so the statement still has nothing to read FROM and the
+panel still carries that sentence.
+
 The distinction a reader needs is then drawn where the sentence is rendered.
 `describesAbsentObject()` ([monitoring-absence.ts](../../src/lib/monitoring-absence.ts))
 asks whether the message names a `pg_`-prefixed object that is not there, and
@@ -309,22 +340,61 @@ engines, PostgreSQL included, where it correctly returns nothing; the driver ser
 engines nobody here has run, so an engine without `pg_depend` or `pg_extension` drops the
 clause through `withoutExtensionOwnershipTest()` and keeps the fixed list.
 
+The object browser asks the same question one level down, per object (#1429). An extension
+can put its routines and relations into a user's own schema, where no schema filter reaches
+them: `CREATE EXTENSION pgcrypto` and `hstore` add 97 functions to `public`, and
+`pg_stat_statements` adds three functions and two views. `extensionMemberExclusion()` drops every routine
+(`pg_proc`) and relation (`pg_class`) with a `pg_depend` row of `deptype = 'e'` from the
+folder counts, the listings and `describeObjects()`, which is the same relation test the
+agent's catalog read carries, so the two agree. A user's own object never has such a row.
+Measured 2026-10-08 with user objects seeded next to the extensions:
+
+| Engine | Catalog in `public` | Object browser |
+|---|---|---|
+| PostgreSQL 18.6, pgcrypto + hstore + pg_stat_statements | 102 functions, 3 views | 2 functions, 1 view |
+| TimescaleDB on PG 18.6 | 90 functions, 13 procedures | 2 functions, 0 procedures |
+| OrioleDB beta 19 on PG 18.6 | 80 functions, 5 views | 2 functions, 1 view |
+| Percona PostgreSQL 18.6.1, pg_stat_monitor | 15 functions, 2 views | 2 functions, 1 view |
+| AlloyDB Omni 17.9, as the image ships | 150 functions, 50 views | 2 functions, 1 view |
+| YugabyteDB 2026.1.2 (PG 15.12), pgcrypto + hstore | 98 functions | 1 function |
+| CockroachDB 26.3.2 | 1 function, 1 view, 1 table | the same; `pg_depend` answers nothing |
+| Materialize 26.45.1 | 1 view, 1 table | the same; `pg_depend` answers nothing |
+| RisingWave 3.1.0 | 1 view, 1 table | the same; `pg_depend` answers nothing |
+
+All nine accept the clause. The listings and counts retry without it on an engine that
+refuses `pg_depend` or `pg_extension`, through `queryListing()` and `queryCounts()`, and
+`describeObjects()` already runs through the fallback chain that drops it.
+
+Three places read other catalogs and needed the same test on their own (#1599). The
+Overview's table and index counts read `information_schema.tables` and `pg_indexes`, which
+name a table instead of carrying its oid, so `extensionMemberTableExclusion()` asks by
+schema and name; an index is left out by asking about the table it sits on. The Triggers
+folder's count, listing and source read leave out a trigger whose table an extension created,
+since that table is already hidden. Measured 2026-10-08 on the `postgis/postgis:17-3.5`
+image as it ships (PostgreSQL 17.5, PostGIS 3.5.2, with topology and the tiger geocoder),
+plus `orders` with one trigger and a second trigger added to `spatial_ref_sys`: the Overview
+went from 38 tables and 76 indexes to 1 and 1, and the Triggers folder from 2 triggers to
+one. CockroachDB 26.3.2 answers the new statements with the same counts as before.
+
 The fixed list stays for schemas the *engine itself* builds in, which are not
 extension-owned: measured, CockroachDB's `crdb_internal` and Cloudberry's `pg_ext_aux`
 return nothing from `pg_depend`.
 
 Citations, by engine: Materialize's
 [system catalog](https://materialize.com/docs/sql/system-catalog/) (`mz_catalog`, `mz_internal`,
-`mz_introspection`); CockroachDB's
+`mz_introspection`). `mz_unsafe` and `mz_catalog_unstable` are not on that page; Materialize
+v26.44.1 listed both beside a user's own schemas, so they are excluded on that measurement.
+RisingWave's [`rw_catalog`](https://docs.risingwave.com/sql/system-catalogs/rw-catalog) holds its
+system tables; RisingWave 3.1.0 listed 74 of them as user objects. CockroachDB's
 [system catalogs](https://www.cockroachlabs.com/docs/stable/system-catalogs), which enumerates
 exactly four (`crdb_internal` and `pg_extension` are the two stock PostgreSQL lacks); TimescaleDB's
 own `sql/pre_install/schemas.sql`, which creates all seven; Cloudberry's
 [schema documentation](https://cloudberry.apache.org/docs/operate-with-data/operate-with-db-objects/create-and-manage-schemas/)
-for `gp_toolkit`, `pg_aoseg` and `pg_bitmapindex`. Two entries rest on measurement rather than a
-document, and are marked as such in the code: Cloudberry's `pg_ext_aux` (the PAX auxiliary tables),
-which its schema page does not list, and AlloyDB's `google_ml`, which Google's docs never name —
-traced through `pg_depend` to the `google_ml_integration` extension the Omni image enables by
-default.
+for `gp_toolkit`, `pg_aoseg` and `pg_bitmapindex`. Entries that rest on measurement rather than a
+document are marked as such in the code: Cloudberry's `pg_ext_aux` (the PAX auxiliary tables),
+which its schema page does not list; Materialize's `mz_unsafe` and `mz_catalog_unstable`; and
+AlloyDB's `google_ml`, which Google's docs never name — traced through `pg_depend` to the
+`google_ml_integration` extension the Omni image enables by default.
 
 ### 3.1.4 What the object surface declares, and which catalog answers for it
 
@@ -738,7 +808,10 @@ A PL/pgSQL body inside a `$function$` dollar-quoted string is highlighted as Pos
 
 ### 3.1.6 Object edit (#789)
 
-Two kinds accept an edited definition back, `function` and `procedure`, and both declare `acceptsSourceEdits: true`.
+Two kinds accept an edited definition back, `function` and `procedure`, and both declare `acceptsSourceEdits: true` on a server that runs the apply's guard.
+That is measured at connect (#1437), because the guard's two `DO` blocks need `PERFORM` and `pg_proc.xmin` and not every server on this type id has them: `probeRoutineGuard` sends `DO $probe$BEGIN PERFORM p.xmin FROM pg_catalog.pg_proc p WHERE false; END$probe$`, reads success or failure only, and is skipped under the read-only profile like the EXPLAIN probe.
+Measured 2026-10-08: PostgreSQL 18.6 answers `DO`; CockroachDB v26.3.2 runs an empty `DO $$ BEGIN END $$` but answers `0A000 at or near ";": syntax error: unimplemented: this syntax` for the probe and `42703 column "p.xmin" does not exist` for the column, so there neither kind declares the field, the Source read carries no `edit`, and a build is refused before anything is sent.
+Before this, CockroachDB was offered Edit and every apply answered that same `0A000` refusal.
 Everything below was measured on PostgreSQL 18.4 (Debian 18.4-1.pgdg13+1) through `pg`, against a container brought up on `docker/postgres-init/`.
 
 **The three kinds that are REFUSED, each with the engine fact behind it, and one that is deferred.**
@@ -987,6 +1060,7 @@ Closing that means either a seventh outcome arm or a narrowed sentence in `src/l
 **The limit every claim on this page carries (D62).**
 Every PostgreSQL row above is a claim about 18.4.
 This type id also serves CockroachDB and Materialize, and neither was probed for any of it.
+The one exception is whether the guard runs at all, which every server is now asked at connect (#1437, at the top of this section); CockroachDB v26.3.2 answers no, so none of these rows is reached there.
 That is why the classifier answers `definition` with THE ENGINE'S OWN SENTENCE for a code it does not recognise, rather than guessing at a class, and why a server answering no md5 gets an `unsupported` refusal rather than an unguarded write.
 
 **Reproducing all of it.**
@@ -1320,8 +1394,31 @@ acquires a pooled client, optionally records its backend PID for cancellation, r
 (optionally parameterized — `$1`, `$2`, …) statement, and returns the standard envelope:
 
 ```ts
-{ rows, fields: string[], rowCount, executionTime, columnTypes?, warnings? }
+{ rows, fields: string[], rowCount, executionTime, columnTypes?, warnings?, resultSets? }
 ```
+
+#### Result columns: every column keeps its own value
+
+`query()`, `queryInTransaction()` and `queryReadOnly()` ask `pg` for array rows (`rowMode: "array"`), name the columns with `uniqueFieldNames` ([result-fields.ts](../../src/lib/db/utils/result-fields.ts)) and key each row by those names by position.
+`pg`'s object rows key a value by its column's name and keep the last of two columns that share one, so before this a repeated name lost a value with no error.
+`rowMode` changes the row's shape and nothing else: the pool's type parsers (§5.5) read every value as before.
+`columnTypes` is keyed by the same names.
+A row whose value count is not the column count raises a `QueryError` rather than being read.
+
+Measured on PostgreSQL 16 through `pg` 8.23.1 on 2026-10-07, before and after:
+
+| Statement | Before | After |
+|---|---|---|
+| `SELECT 1 AS a, 2 AS a` | fields `["a","a"]`, row `{"a":2}` | fields `["a","a (2)"]`, row `{"a":1,"a (2)":2}` |
+| `SELECT 1, 2` (unnamed columns, which PostgreSQL calls `?column?`) | fields `["?column?","?column?"]`, row `{"?column?":2}` | fields `["?column?","?column? (2)"]`, row `{"?column?":1,"?column? (2)":2}` |
+| `SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id` | fields `["id","customer_id","item","id","name"]`, the customer's id under both `id` headers, the order's id gone | fields `["id","customer_id","item","id (2)","name"]`, the order's id under `id` and the customer's under `id (2)` |
+
+PostgreSQL never answers an empty column name: an unaliased expression is named by the server (`?column?`, `count`, `now`), so an unnamed column is only ever a repeated one here.
+
+A text of several statements sent as one simple query (`SELECT 1 AS a; SELECT 2 AS b, 3 AS b`) answers one result per statement.
+`rows`, `fields` and `columnTypes` are the first result set's, `rowCount` is the count of the statement that produced it (or of the first statement when none produced one), and `resultSets` lists every set when there are several; a statement that answers no column (an INSERT, a COMMIT, or a `SELECT` of no columns) is not a set.
+Measured the same day, that text answers `rows` `[{"a":1}]` and two `resultSets`, the second with fields `["b","b (2)"]`.
+Before, such a text answered no `rows` at all, because the list of answers was read as one answer.
 
 #### Server notices (#1401)
 
@@ -1682,7 +1779,7 @@ base) fans these out in parallel.
 | `getPerformanceMetrics()` | `pg_statio_user_tables`, `pg_stat_database`, `pg_stat_checkpointer` (17+) or `pg_stat_bgwriter` | cache-hit % (omitted when unmeasurable), deadlocks, checkpoint write time (`N/A` when unreadable); **no buffer-pool %** — see [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
 | `getSlowQueries()` | `pg_stat_statements` → fallback `pg_stat_activity` | detailed per-statement stats; fallback shows live active queries |
 | `getActiveSessions()` | `pg_stat_activity` | pid, user, state, query, wait events, duration; excludes own backend |
-| `getTableStats()` | `pg_stat_user_tables` + size functions | live/dead tuples, sizes, last (auto)vacuum/analyze, bloat ratio |
+| `getTableStats()` | `pg_stat_user_tables` + `pg_table_size`/`pg_indexes_size`/`pg_total_relation_size`, each on `relid` | live/dead tuples, sizes (absent per function the engine refuses, [§3.1.2](#312-two-kinds-of-absence-and-why-neither-is-an-empty-array)), last (auto)vacuum/analyze, bloat ratio |
 | `getIndexStats()` | `pg_stat_user_indexes`, `pg_index`, `pg_am` | type, columns, unique/primary, size, scan count, usage ratio |
 | `getStorageStats()` | `pg_tablespace`, WAL functions | per-tablespace size; WAL size (superuser-gated, swallowed if denied) |
 | `getPgStatActivity()` | `pg_stat_activity` | raw passthrough for advanced views |
@@ -1709,6 +1806,14 @@ zero and is still published as `0`/`"0 B"`, which is the shared helper's contrac
 state this engine produces: `pg_database_size()` is a function, not an aggregate, and measured on
 PostgreSQL 18 a freshly created database answers 7774735 bytes, never `NULL` and never zero. MySQL's
 `SUM()` over an empty schema is where that null row is real.
+
+**The table sizes are read the same way (#1436).** `getTableStats()` selects the three byte figures
+only and spells each with `formatBytes()`, so it selects no `pg_size_pretty()` column either — the
+shape `getOverview()` above and the object surface already use. That makes one spelling of a byte
+count across the provider instead of two, and it is visible: a 16384-byte table reads `16 KB` where
+`pg_size_pretty()` wrote `16 kB`. The bytes are unchanged, and it removes a builtin RisingWave does
+not bind. Each size is absent, never `0`, where its builtin is refused or answers `NULL` — which is
+what CockroachDB v26.3.2 does for a table it has.
 
 ### 7.1 When the cache hit ratio is not measurable
 
@@ -1987,6 +2092,7 @@ Overrides the SQL base defaults:
 | `supportsExternalQueryLimiting` | `true` |
 | `supportsCreateTable` | `true` |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core PostgreSQL DML |
+| `supportsTestDataGeneration` | `true` - the row menus offer Generate Test Data on tables, which writes one multi-row `INSERT INTO ... VALUES` |
 | `supportsResultPagination` | `true` — `LIMIT n OFFSET m` from the shared limiter (#816) |
 | `supportsTransactions` | `true`: `beginTransaction()` holds one pool client and runs `BEGIN` / `COMMIT` / `ROLLBACK` on it, so the editor's transaction trio and the auto-rolled-back SANDBOX toggle are offered here (#464). A relative whose `BEGIN` opens nothing (RisingWave) is refused at `beginTransaction()` rather than declared per type id ([§8.0](#80-a-begin-that-opens-nothing-and-a-statement-that-ends-the-transaction)) |
 | `implicitCommitStatements` | `END`, `PREPARE TRANSACTION`: the two statements besides COMMIT and ROLLBACK that end the transaction. No DDL is listed, because PostgreSQL's DDL is transactional; a relative that commits DDL anyway (CockroachDB's `autocommit_before_ddl`) is caught after the statement instead ([§8.0](#80-a-begin-that-opens-nothing-and-a-statement-that-ends-the-transaction)) |

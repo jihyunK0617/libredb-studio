@@ -34,6 +34,7 @@ import {
   FALLBACK_TABLE_NAME,
   resultExportFileName,
   type ResultExportFormat,
+  type ResultExportSource,
 } from "@/lib/export/result-export";
 import { downloadText } from "@/lib/export/download";
 import { writeToClipboard } from "@/components/copy-button";
@@ -46,6 +47,7 @@ import { useAgentArtifact } from "@/components/agent/use-agent-artifact";
 import { useAgentPrefill } from "@/components/agent/use-agent-prefill";
 import { useToast } from "@/hooks/use-toast";
 import { useProviderMetadata } from "@/hooks/use-provider-metadata";
+import { useConnectionPulse } from "@/hooks/use-connection-pulse";
 import { useConnectionOrder } from "@/hooks/use-connection-order";
 import { useConnectionGroups } from "@/hooks/use-connection-groups";
 import { useAuth } from "@/hooks/use-auth";
@@ -110,6 +112,12 @@ export default function Studio() {
   // 2. Connection Manager + Provider Metadata
   const conn = useConnectionManager(storageReady);
   const { metadata, error: metadataError, retry: retryMetadata } = useProviderMetadata(conn.activeConnection);
+  // After the metadata, because the declaration decides whether a health check may be sent at all.
+  const connectionPulse = useConnectionPulse(conn.activeConnection, metadata);
+  // A connection the page opened by itself reads nothing while every request to it can resume billed compute, until
+  // the person uses it (CL-CORE-2): the manager holds the inventory, and the tree is held here, with the declaration
+  // that decides when the tree is drawn at all, so it is held before its first read.
+  const billedComputeHold = conn.activeAwaitsUse && metadata?.capabilities.resumesBilledCompute === true;
   const { favoriteIds, toggleFavorite } = useFavoriteConnections(storageReady);
   const { order: connectionOrder, setOrder: setConnectionOrder } = useConnectionOrder(storageReady);
   const { groups: connectionGroups, ...groupActions } = useConnectionGroups(storageReady);
@@ -407,6 +415,7 @@ export default function Studio() {
     fetchSchema: conn.fetchSchema,
     onObjectsChanged: objectsChanged,
     onTransactionEnded: txn.markTransactionEnded,
+    onStatementSent: conn.markActiveUsed,
     queryEditorRef,
   });
   const { executeQuery, cancelQuery } = queryExec;
@@ -574,6 +583,15 @@ export default function Studio() {
   const openSaveQuery = useCallback(() => setIsSaveQueryModalOpen(true), []);
   const [savedKey, setSavedKey] = useState(0);
   const [activeMobileTab, setActiveMobileTab] = useState<"database" | "schema" | "editor">("editor");
+  // The Schema tab is the phone layout's object tree, so opening it uses the connection as loading the tree does.
+  const { markActiveUsed } = conn;
+  const changeMobileTab = useCallback(
+    (tab: "database" | "schema" | "editor") => {
+      if (tab === "schema") markActiveUsed();
+      setActiveMobileTab(tab);
+    },
+    [markActiveUsed],
+  );
   /** What the panel group may hold: below the breakpoint, only the body panel. */
   const isMobile = useIsMobile();
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -845,8 +863,8 @@ export default function Studio() {
    * `currentTab.result` wrote rows nobody was looking at. That is why the menu used to
    * be hidden over a hydrated view instead of retargeted.
    */
-  const buildResultFile = useCallback(
-    (format: ResultExportFormat, hydrated: AgentArtifactHydration | null, csvDelimiter?: CsvDelimiter) => {
+  const buildExportSource = useCallback(
+    (hydrated: AgentArtifactHydration | null): ResultExportSource | null => {
       const source = hydrated?.result ?? tabMgr.currentTab.result;
       if (!source) return null;
       // The columns the engine declared for THIS result. The writers read every row by
@@ -856,8 +874,7 @@ export default function Studio() {
       const fields = source.fields;
       const sensitiveColumns = detectSensitiveColumnsFromConfig(fields, maskingConfig);
       const rows = effectiveMasking ? applyMaskingToRows(source.rows, fields, sensitiveColumns) : source.rows;
-
-      return buildResultExport(format, {
+      return {
         rows,
         fields,
         // A run's rows did not come from this tab, so the SQL forms take the neutral
@@ -871,8 +888,7 @@ export default function Studio() {
         // The types the engine declared for THIS result, which is what the DDL form
         // writes when they are there — the only source for a computed column.
         columnTypes: source.columnTypes,
-        csvDelimiter,
-      });
+      };
     },
     [
       tabMgr.currentTab.result,
@@ -884,11 +900,21 @@ export default function Studio() {
     ],
   );
 
+  const buildResultFile = useCallback(
+    (format: ResultExportFormat, hydrated: AgentArtifactHydration | null, csvDelimiter?: CsvDelimiter) => {
+      const source = buildExportSource(hydrated);
+      if (source === null) return null;
+      return buildResultExport(format, { ...source, csvDelimiter });
+    },
+    [buildExportSource],
+  );
+
   const exportResults = useCallback(
     (format: ResultExportFormat, hydrated: AgentArtifactHydration | null = null, csvDelimiter?: CsvDelimiter) => {
+      const fileName = (extension: string) => resultExportFileName(extension, hydrated?.runId);
       const file = buildResultFile(format, hydrated, csvDelimiter);
       if (file === null) return;
-      downloadText(file.content, file.mimeType, resultExportFileName(file.extension, hydrated?.runId));
+      downloadText(file.content, file.mimeType, fileName(file.extension));
     },
     [buildResultFile],
   );
@@ -1121,9 +1147,11 @@ export default function Studio() {
     const updated = [...managedConns, ...userConns];
     conn.setConnections(updated);
     // Rebuilt from storage, `updated` still holds the connections the server refuses while custom
-    // connections are off, so the next selection is the first connection the lists show.
+    // connections are off, so the next selection is the first connection the lists show. The page
+    // chooses it, not the person, so it is not counted as used: one whose requests resume billed
+    // compute is held until the person uses it (CL-CORE-2).
     const listed = connectionsUnderPolicy(updated, { customConnections: conn.customConnections });
-    if (conn.activeConnection?.id === id) conn.setActiveConnection(listed[0] ?? null);
+    if (conn.activeConnection?.id === id) conn.activateFallback(listed[0] ?? null);
   };
 
   const confirmDeleteConnection = () => {
@@ -1234,9 +1262,11 @@ export default function Studio() {
                 metadata={metadata}
                 metadataError={metadataError}
                 onRetryMetadata={retryMetadata}
-                objectScanDeferred={conn.objectScanDeferred}
+                objectScanDeferred={conn.objectScanDeferred || billedComputeHold}
+                deferredForBilledCompute={billedComputeHold && !conn.objectScanDeferred}
                 onLoadObjects={conn.loadObjects}
                 objectRefreshToken={objectRefreshToken}
+                connectionPulse={connectionPulse}
               />
             </ResizablePanel>
             <ResizableHandle className="w-1 bg-transparent hover:bg-brand-tint/30 transition-colors" />
@@ -1247,7 +1277,7 @@ export default function Studio() {
             <StudioMobileHeader
               connections={conn.connections}
               activeConnection={conn.activeConnection}
-              connectionPulse={conn.connectionPulse}
+              connectionPulse={connectionPulse}
               user={user}
               isAdmin={isAdmin}
               activeMobileTab={activeMobileTab}
@@ -1275,7 +1305,7 @@ export default function Studio() {
 
             <StudioDesktopHeader
               activeConnection={conn.activeConnection}
-              connectionPulse={conn.connectionPulse}
+              connectionPulse={connectionPulse}
               user={user}
               isAdmin={isAdmin}
               onLogout={handleLogout}
@@ -1668,7 +1698,7 @@ export default function Studio() {
         onLogout={handleLogout}
         shortcutsDialogRef={shortcutsDialogRef}
         activeMobileTab={activeMobileTab}
-        onMobileTabChange={setActiveMobileTab}
+        onMobileTabChange={changeMobileTab}
         hasResult={!!tabMgr.currentTab.result}
         onOpenAgent={agentEnabled ? openAgentSheet : undefined}
       />

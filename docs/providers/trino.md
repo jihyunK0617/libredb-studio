@@ -320,6 +320,7 @@ What that produces, deliberately and consistently:
 | `ColumnSchema.isPrimary` | `false` | No key is declared for any column |
 | `declaresForeignKeys` | `false` | So the ER diagram draws boxes and no edges *as the engine's answer*, not as a schema that happens to be empty (#414) |
 | `supportsInlineRowEdit` | `false` | The inline editor builds `UPDATE … WHERE <pk> = <val>`. With no column that identifies one row, an edit would silently rewrite every row that matches, so the control is not offered |
+| `supportsTestDataGeneration` | `false` | The Generate Test Data dialog's `INSERT` was never measured against a connector, so the row menus do not offer it (#1468) |
 | `supportsResultPagination` | `true` | `OFFSET m LIMIT n` — Trino refuses the clauses in the other order, so this provider transposes what the shared limiter emitted ([§3.5](#35-offset-comes-before-limit)) (#816) |
 | `DatabaseOverview.indexCount` | `0` | — |
 
@@ -416,6 +417,11 @@ counter above 2^53 would arrive as a string and `numberField` would read it as a
 
 Column labels are taken from the page's declaration and **de-duplicated** — a second column called
 `x` becomes `x (2)` — because the seam promises `fieldNames` is exactly the key set of every row.
+A number never takes a name the statement itself declares, before or after the repeat:
+`SELECT 1 AS a, 2 AS a, 3 AS "a (2)"` reaches the grid as `a`, `a (3)`, `a (2)`, so the user's own
+`a (2)` keeps its value. Trino names an unaliased expression itself (`_col0`), so a declaration with
+no name is not something the engine sends; if one ever arrives it is shown as `(No column name)`.
+A row whose value count differs from the declaration is refused rather than padded with nulls or cut.
 
 ### 3.12 Statelessness is a warning, not a silent surprise
 
@@ -1663,6 +1669,7 @@ are undeclared.
 | `supportsExternalQueryLimiting` | `true` | `LIMIT` is injected by the shared limiter, transposed ([§3.5](#35-offset-comes-before-limit)) |
 | `supportsCreateTable` | `true` | In the grammar, live-verified on `memory` ([§5.5](#55-writes-belong-to-the-connector-not-to-the-engine)) |
 | `supportsInlineRowEdit` | `false` | No primary key exists to build a one-row `WHERE` ([§3.8](#38-no-keys-no-indexes--and-why-that-is-a-fact-about-the-engine)) |
+| `supportsTestDataGeneration` | `false` | Not measured against a connector, so the row menus do not offer Generate Test Data (#1468) |
 | `supportsResultPagination` | `true` | `OFFSET m LIMIT n`, transposed by this provider ([§3.5](#35-offset-comes-before-limit)); the results grid offers Load More (#816) |
 | `supportsTransactions` | `false` | Trino has `START TRANSACTION`, but a transaction lives in an HTTP session header this provider does not carry between statements, so the trio and SANDBOX are not offered (#464) |
 | `declaresForeignKeys` | `false` | Not in the model at all ([§3.8](#38-no-keys-no-indexes--and-why-that-is-a-fact-about-the-engine)) |

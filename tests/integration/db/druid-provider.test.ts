@@ -506,6 +506,7 @@ describe("DruidProvider metadata", () => {
       supportsExternalQueryLimiting: true,
       supportsCreateTable: false,
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
       // Druid SQL takes both clauses, emitted by the shared limiter (#816).
       supportsResultPagination: true,
       supportsTransactions: false,
@@ -826,6 +827,18 @@ describe("DruidProvider query", () => {
     expect(result.rowCount).toBe(1);
   });
 
+  test("numbers a repeat past a name the statement declares later", async () => {
+    // `SELECT 1 AS a, 2 AS a, 3 AS "a (2)"`: the third column is the user's own `a (2)`,
+    // so the repeat of `a` is numbered `a (3)` and every value stays under its own name.
+    const provider = await connectProvider();
+    replyFor = () => ok('[["a","a","a (2)"],["LONG","LONG","LONG"],["INTEGER","INTEGER","INTEGER"],[1,2,3]]');
+
+    const result = await provider.query('SELECT 1 AS a, 2 AS a, 3 AS "a (2)"');
+
+    expect(result.fields).toEqual(["a", "a (3)", "a (2)"]);
+    expect(result.rows).toEqual([{ a: 1, "a (3)": 2, "a (2)": 3 }]);
+  });
+
   test("delivers a 64-bit id exactly, as the string it has to become", async () => {
     // The value on the wire is the unquoted number 9007199254740993, which
     // JSON.parse turns into ...992 with no error at all. Druid has no
@@ -1013,6 +1026,29 @@ describe("DruidProvider error mapping", () => {
     await expect(provider.query(CONNECT_PROBE)).rejects.toBeInstanceOf(TimeoutError);
   });
 
+  test("a connection that never opened stays a ConnectionError naming the address (#1431)", async () => {
+    // Node's connect timeout. Its text says "timed out", which the shared message-based mapping
+    // reads as a slow query; the transport's failure kind keeps it a connection problem.
+    const provider = await connectProvider();
+    networkFailure = connectTimeout();
+
+    const failure = provider.query(CONNECT_PROBE);
+
+    await expect(failure).rejects.toBeInstanceOf(ConnectionError);
+    await expect(failure).rejects.toThrow("127.0.0.1:8888");
+  });
+
+  test("connect reports a connection that never opened without query advice (#1431)", async () => {
+    networkFailure = connectTimeout();
+    const provider = new DruidProvider(makeConnection());
+
+    const failure = provider.connect();
+
+    await expect(failure).rejects.toBeInstanceOf(ConnectionError);
+    await expect(failure).rejects.toThrow("127.0.0.1:8888");
+    await expect(failure).rejects.not.toThrow(/query timeout/i);
+  });
+
   test("a truncated response reports the incomplete answer it is", async () => {
     // Live-reproduced: a large streamed result cancelled mid-flight answers 200,
     // streams megabytes and then simply stops. Druid signals it by withholding a
@@ -1064,6 +1100,17 @@ describe("DruidProvider error mapping", () => {
     await expect(failure).rejects.toThrow(JSON.parse(envelope).errorMessage as string);
   });
 });
+
+/** What Node's fetch throws when the TCP connect itself times out: the code on the cause. */
+function connectTimeout(): Error {
+  const cause = Object.assign(
+    new Error("Connect Timeout Error (attempted address: 127.0.0.1:8888, timeout: 10000ms)"),
+    {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+    },
+  );
+  return new TypeError("fetch failed", { cause });
+}
 
 // ============================================================================
 // Query preparation (the OFFSET override)

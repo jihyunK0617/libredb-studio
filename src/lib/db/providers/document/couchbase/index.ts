@@ -62,7 +62,7 @@ import {
 import { formatCacheHitRatio } from "@/lib/monitoring-cache-ratio";
 import { formatBytes } from "@/lib/db/utils/pool-manager";
 import { applyQueryLimit, DEFAULT_QUERY_LIMIT, MAX_UNLIMITED_ROWS } from "@/lib/db/utils/query-limiter";
-import { unionFields } from "@/lib/db/utils/result-fields";
+import { unionFields, uniquelyKeyedRows } from "@/lib/db/utils/result-fields";
 import { CouchbaseHttpTransport } from "./http-transport";
 import { CATALOG_TIMEOUT_MS, inferColumns, inferColumnsEach } from "./introspect";
 import { COUCHBASE_DEFAULT_SCOPE, keyspaceFromDisplayName, keyspacePath, quoteIdentifier } from "./keyspace";
@@ -214,7 +214,6 @@ interface BucketPayload {
   basicStats?: {
     itemCount?: number;
     diskUsed?: number;
-    dataUsed?: number;
     quotaPercentUsed?: number;
   };
 }
@@ -346,6 +345,7 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
       // report success. Addressing a document needs `META(d).id` or `USE KEYS`, i.e.
       // per-dialect statement building, which is issue #279.
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
       // `LIMIT n OFFSET m`: SQL++ takes both, and this provider's `prepareQuery`
       // override routes through the same shared limiter to emit them.
       supportsResultPagination: true,
@@ -540,12 +540,14 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
    */
   private toQueryResult(result: CouchbaseQueryResult, measuredMs: number): QueryResult {
     const reportedMs = Math.round(result.executionTimeMs);
-    const rows = result.rows.map(normalizeRow);
+    const normalized = result.rows.map(normalizeRow);
+    // `SELECT *` nests whole documents under the keyspace name and advertises only a
+    // wildcard signature (`fieldNames` null), so the columns are the keys the rows carry.
+    // Either way an empty key is named, and the rows carrying it keyed under that name.
+    const { fields, rows } = uniquelyKeyedRows(result.fieldNames ?? unionFields(normalized), normalized);
     return {
       rows,
-      // `SELECT *` nests whole documents under the keyspace name and advertises only a
-      // wildcard signature (`fieldNames` null), so the columns are the keys the rows carry.
-      fields: result.fieldNames ?? unionFields(rows),
+      fields,
       // A mutation returns no rows; its row count is what it changed.
       rowCount: rows.length > 0 ? rows.length : result.mutationCount,
       executionTime: reportedMs > 0 ? reportedMs : measuredMs,
@@ -1168,7 +1170,6 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
     const stats = bucketInfo.basicStats;
     if (!stats) return [];
 
-    const dataUsed = stats.dataUsed ?? 0;
     const diskUsed = stats.diskUsed ?? 0;
 
     return [
@@ -1176,8 +1177,15 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
         schemaName: this.bucket,
         tableName: this.bucket,
         rowCount: stats.itemCount ?? 0,
-        tableSize: formatBytes(dataUsed),
-        tableSizeBytes: dataUsed,
+        // Both size fields carry `basicStats.diskUsed`, the on-disk measure `getOverview()`
+        // publishes as `databaseSizeBytes` and the Storage tab divides every share by.
+        // `basicStats.dataUsed` is a different measure, and putting it in `tableSizeBytes`
+        // made one bucket read two sizes at once: the Tables tab prints this row's
+        // `tableSize`, while the Storage tab divides its `totalSize` by the overview's
+        // database size (measured on Couchbase 8.0.2 CE: 1.57 MB against 16.86 MB, "100% of
+        // DB"). A bucket is one keyspace, so its own bytes are the whole total.
+        tableSize: formatBytes(diskUsed),
+        tableSizeBytes: diskUsed,
         totalSize: formatBytes(diskUsed),
         totalSizeBytes: diskUsed,
       },

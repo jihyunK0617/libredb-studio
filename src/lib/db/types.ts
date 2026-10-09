@@ -127,6 +127,17 @@ export interface MaintenanceResult {
   success: boolean;
   executionTime: number;
   message: string;
+  /**
+   * The table this operation produced, when its answer is something to read rather
+   * than only a sentence. `fields` is present whenever `rows` is.
+   *
+   * Redis `analyze` is `INFO`: each `key:value` line is one row and the section it sat
+   * under travels with it, so the count in the message is `rows.length` (#1453). Both
+   * are absent on every operation that only succeeded or failed.
+   */
+  rows?: Record<string, unknown>[];
+  /** Column order for `rows`. */
+  fields?: string[];
 }
 
 /**
@@ -584,7 +595,8 @@ export type ExplainFormat =
   | "clickhouse-json"
   | "druid-native"
   | "trino-json"
-  | "duckdb-json";
+  | "duckdb-json"
+  | "databend-text";
 
 /**
  * How deep an engine's container chain is, in the TYPE rather than only in a derivation.
@@ -879,6 +891,29 @@ export interface ProviderCapabilities {
    */
   inlineEditRefusedColumns?: { readonly type: string; readonly reason: string };
   /**
+   * Whether this provider can take the rows the Generate Test Data dialog writes
+   * (`src/components/TestDataGenerator.tsx`): one multi-row `INSERT INTO ... VALUES` for a
+   * SQL engine, one `insertMany` command for a JSON-language engine. False or absent keeps
+   * the item out of both row menus (`src/components/object-tree/row-actions.ts` and
+   * `src/components/schema-explorer/TableItem.tsx`).
+   *
+   * It is NOT `supportsInlineRowEdit`, which answers whether the results grid's
+   * `UPDATE ... SET` runs. The menus borrowed that flag until #1468, which made the
+   * generator unreachable on MongoDB: its collection takes the generator's `insertMany`,
+   * and its grid has no `UPDATE` to emit.
+   *
+   * The per-kind `acceptsRowWrites` still applies on top: `offersTestDataGeneration` in
+   * `src/lib/db/object-kinds.ts` conjoins the two, so a view is never offered it on an
+   * engine that declares this flag.
+   *
+   * Optional for the same published-interface reason as `supportsInlineRowEdit`
+   * (`src/exports/types.ts`): a required field added after the fact stops every external
+   * implementer compiling. Every provider in this repo declares it, and the menus gate on
+   * `=== true`, so an absent flag reads as not offered rather than inheriting a permissive
+   * default.
+   */
+  supportsTestDataGeneration?: boolean;
+  /**
    * Whether this provider can be asked for the page AFTER the first one — whether
    * `prepareQuery(sql, { limit, offset })` with a positive `offset` really applies it.
    *
@@ -1105,7 +1140,8 @@ export interface ProviderCapabilities {
    * opens its editor handle under that file-access posture: `false` closes every statement-level file
    * and network route outside the handle's private temp directory and its database's own file names
    * while the database stays writable, `true` keeps the full reach (DuckDB, the
-   * non-admin DuckDB file-access change). Only DuckDB does this today.
+   * non-admin DuckDB file-access change). SQLite also reads this posture and refuses to open a
+   * denied handle, since its drivers cannot confine statement-level file access.
    *
    * It is what tells `src/lib/db` that an editor handle of this engine must be split by posture: the
    * writable cache key carries the deny posture as a segment, and the single-writer borrow lends a
@@ -1122,6 +1158,24 @@ export interface ProviderCapabilities {
    * DuckDB.
    */
   readonly readsFileAccessPosture?: true;
+  /**
+   * True when a request to this connection can resume compute the engine bills for: a suspended
+   * Databend Cloud warehouse wakes on any statement and is charged until it suspends again.
+   *
+   * Studio then sends the connection no background request of its own, since each one would keep
+   * the compute awake: no connection pulse (the header shows "not checked") and no admin fleet
+   * health check (the row answers `not-checked`). The monitoring auto-refresh toggle carries a
+   * sentence saying each refresh keeps the billed compute running; auto-refresh stays off until the
+   * user starts it, as it does for every provider, and then polls on its timer. A request the user
+   * makes still runs and still resumes the compute.
+   * Read from an unconnected provider, so the declaration answers before any connect.
+   *
+   * Optional for the same published-interface reason as `enforcesReadOnly`: a required field added
+   * after the fact stops every external implementer compiling. Only the literal `true` is declared,
+   * so an absent flag reads as "a request costs nothing to send", the answer for every engine whose
+   * compute is not suspended and billed per resume.
+   */
+  readonly resumesBilledCompute?: true;
   supportsMaintenance: boolean;
   maintenanceOperations: MaintenanceOperation[];
   /**
@@ -1158,8 +1212,12 @@ export interface ProviderCapabilities {
    * `"double-always"` quotes every name. InfluxDB 3 declares it: its read policy
    * refuses a bare `$`, which the `"double"` rule lets through, so a generated Count
    * of a table named `a$b` was refused by Studio itself.
+   *
+   * `"backtick-always"` puts a backtick around every name, doubling one inside. Databend
+   * declares it: it folds an unquoted name to lower case, so a bare `MyTable` would name
+   * `mytable`, and a backtick quotes an identifier in every one of its `sql_dialect`s.
    */
-  identifierQuoting?: "double" | "backtick" | "double-always";
+  identifierQuoting?: "double" | "backtick" | "double-always" | "backtick-always";
   /**
    * Whether a statement this product runs may end with `;`.
    *
@@ -1183,9 +1241,12 @@ export interface ProviderCapabilities {
    * `SELECT * FROM app_customers FETCH FIRST 50 ROWS ONLY;` answers ORA-00933 "SQL command
    * not properly ended" and the same statement without the `;` returns the rows (#789).
    *
-   * This bounds the GENERATORS only. A user who types a `;` still has it stripped
-   * by the editor's statement reader before the statement is sent, and the raw API
-   * passes text through untouched - neither of those is this field's business.
+   * It bounds the generators, and it also tells the editor to read a one-statement
+   * SELECTION through the statement splitter, which drops its trailing `;` (#1414): a
+   * selection is otherwise sent exactly as selected, and a selected line ending in `;`
+   * answered that same `extraneous input ';'` on Elasticsearch 9.5.3. With the caret
+   * in a statement the editor reads it through the splitter on every engine, so that
+   * path does not consult this field. The raw API passes text through untouched.
    */
   statementTerminator?: "none";
   /**
@@ -2462,14 +2523,14 @@ export interface ObjectKindSpec {
    *
    * The engine-wide `supportsInlineRowEdit` stays, and it is a SEPARATE fact rather than
    * the other half of a conjunction. It gates the results grid's inline row editor
-   * (`canEditRows` in `src/components/Studio.tsx`), and the two row menus, which need both
-   * facts for Generate Test Data, conjoin it with this field at the call site. MongoDB,
+   * (`canEditRows` in `src/components/Studio.tsx`), and no row menu reads it. MongoDB,
    * Couchbase and Cassandra declare it false, and #789 declares a kind that accepts row
    * writes on each of those three, so requiring both would refuse an import all three
    * engines do support.
    * Read this field through `kindAcceptsRowWrites()` in `src/lib/db/object-kinds.ts`,
-   * whose name states that scope; a caller that needs the editor gate as well reads
-   * both.
+   * whose name states that scope. The two row menus ask `offersTestDataGeneration()`
+   * there for Generate Test Data, which conjoins this field with the engine-wide
+   * `supportsTestDataGeneration` rather than with `supportsInlineRowEdit` (#1468).
    */
   readonly acceptsRowWrites?: boolean;
   /**

@@ -139,7 +139,12 @@ export type DatabaseType =
   // own (`src/lib/db/providers/keyvalue/oxia/`). Its editor text is one `oxia client` read command. Read-only in
   // this version whatever `readOnly` says. The connection's Database field is the namespace and Password is a bearer
   // token; `dataServers` lists a cluster's data servers.
-  | "oxia";
+  | "oxia"
+  // Databend, a cloud data warehouse read and written over its HTTP query API (`POST /v1/query`) by a client of this
+  // repository's own (`src/lib/db/providers/sql/databend/`), extending `SQLBaseProvider`. Self-hosted Databend and
+  // Databend Cloud are the same id: a Cloud connection differs in host, TLS and the `warehouse` below. The
+  // connection's Database field is the session database, inside the `default` catalog.
+  | "databend";
 
 export type ConnectionEnvironment = "production" | "staging" | "development" | "local" | "other";
 
@@ -352,6 +357,13 @@ export interface DatabaseConnection {
    * other engine.
    */
   dataServers?: string;
+  /**
+   * Databend only: the warehouse every statement of this connection runs on, sent as the `X-DATABEND-WAREHOUSE`
+   * header. Databend Cloud requires one and resumes a suspended warehouse on the first statement, billing while it
+   * runs; self-hosted Databend leaves it empty. It picks compute, not the catalog, and it is not a secret. Absent and
+   * empty are one value. Read by no other engine.
+   */
+  warehouse?: string;
   /**
    * Read no catalog when this connection opens.
    *
@@ -589,6 +601,15 @@ export interface AgentChartSpec {
 
 export interface QueryResult {
   rows: Record<string, unknown>[];
+  /**
+   * The result's columns, in order. Every name is non-empty and no two are the same, and rows key their
+   * values by these names, so no two columns read one value.
+   * Providers keep the names apart in one of three ways. Most name the columns through `uniqueFieldNames`
+   * (`src/lib/db/utils/result-fields.ts`): a SQL provider reads its rows positionally and keys them by those
+   * names, and a document store renames an empty key (`uniquelyKeyedRows`). Oracle's driver numbers a repeat
+   * itself (`ID_1`). Cassandra refuses a result with a repeated name, because its driver has already kept
+   * only one of the values.
+   */
   fields: string[];
   rowCount: number;
   executionTime: number;
@@ -638,6 +659,7 @@ export interface QueryResult {
 /** One result set of a text that produced several (`QueryResult.resultSets`). */
 export interface QueryResultSet {
   rows: Record<string, unknown>[];
+  /** As `QueryResult.fields`: non-empty, unique, and the keys every row carries. */
   fields: string[];
   columnTypes?: Record<string, string>;
 }

@@ -22,7 +22,7 @@
  *   (`http-transport.ts:554-557`).
  * - `SELECT customer AS who` declares `{"name":"customer","alias":"who"}` here and
  *   `{"name":"who"}` on Elasticsearch, so reading `name` alone would put the WRONG
- *   label on the same statement's column (`http-transport.ts:724-727`).
+ *   label on the same statement's column (`http-transport.ts:719-731`).
  * - A missing index is HTTP **404** (`IndexNotFoundException`) where Elasticsearch
  *   answers HTTP 400 - the same typo, two statuses, which is why categorisation is
  *   body-driven (`http-transport.ts:35-42`).
@@ -784,6 +784,33 @@ describe("OpenSearch envelope", () => {
     expect(result.rows).toEqual([{ who: "acme" }]);
   });
 
+  // An alias that is present but not text would otherwise be passed over for `name`, which is
+  // the name the user aliased away: the wrong label above. It is refused, as a name that is
+  // not text is; an alias the engine sends as null is no alias, and the name stands.
+  test.each<[string, string]>([
+    ["an object", '{"first":"who"}'],
+    ["a number", "7"],
+  ])("refuses a column whose declared alias is %s", async (_label, alias) => {
+    replyFor = () =>
+      ok(
+        `{"schema":[{"name":"customer","alias":${alias},"type":"keyword"}],"datarows":[["acme"]],"total":1,"size":1,"status":200}`,
+      );
+
+    await expect(transport().query("SELECT customer AS who FROM probe_orders")).rejects.toThrow(
+      "OpenSearch declared a column whose alias is not text, so the result cannot be read",
+    );
+  });
+
+  test("names a column by its name when the alias is null", async () => {
+    replyFor = () =>
+      ok(
+        '{"schema":[{"name":"customer","alias":null,"type":"keyword"}],"datarows":[["acme"]],"total":1,"size":1,"status":200}',
+      );
+
+    const result = await transport().query("SELECT customer FROM probe_orders");
+    expect(result.fieldNames).toEqual(["customer"]);
+  });
+
   test("reports the total member as totalHits, which Elasticsearch sends no counterpart for", async () => {
     const result = await transport().query("SELECT id, customer, total FROM probe_orders");
 
@@ -924,7 +951,7 @@ describe("OpenSearch faults", () => {
 
   test("refuses duplicate output names instead of needing them disambiguated", async () => {
     // `SELECT 1 AS c, 2 AS c` answers HTTP 200 on Elasticsearch with TWO columns
-    // named `c`, which is what `disambiguate` upholds the seam's uniqueness
+    // named `c`, which is what `uniqueFieldNames` upholds the seam's uniqueness
     // invariant against. Here the engine refuses the statement outright, so that
     // code can never fire on this product - a fact about the engine, not dead code.
     overridePath(
@@ -1274,6 +1301,60 @@ describe("OpenSearchProvider monitoring", () => {
     // A cluster that publishes the figure keeps it, including a real measured 0: only an
     // unpublished size is absent.
     expect("databaseSizeBytes" in overview).toBe(true);
+  });
+
+  test("hides the security plugin's audit indices and keeps a user index of another name", async () => {
+    // OpenSearch 3.9.0 listed `security-auditlog-2026.10.04` as a table (#1428). The security
+    // plugin's default name is the rolling pattern security-auditlog-YYYY.MM.dd, so the rule is
+    // the prefix. `app-security-notes` shares none of it and stays; `security-auditlog` without
+    // the trailing hyphen-and-suffix is not the rolling pattern and stays too.
+    const provider = await connectProvider();
+    overridePath(
+      "/_cat/indices",
+      ok(
+        JSON.stringify([
+          {
+            health: "yellow",
+            status: "open",
+            index: "probe_orders",
+            "docs.count": "1",
+            "pri.store.size": "4807",
+          },
+          {
+            health: "green",
+            status: "open",
+            index: "security-auditlog-2026.10.04",
+            "docs.count": "40",
+            "pri.store.size": "9000",
+          },
+          {
+            health: "yellow",
+            status: "open",
+            index: "app-security-notes",
+            "docs.count": "3",
+            "pri.store.size": "100",
+          },
+          {
+            health: "yellow",
+            status: "open",
+            index: "security-auditlog",
+            "docs.count": "1",
+            "pri.store.size": "50",
+          },
+        ]),
+      ),
+    );
+
+    const stats = await provider.getTableStats();
+    const listed = (await provider.listObjects([], "index")).map((object) => object.name);
+
+    expect(stats.map((row) => row.tableName).sort()).toEqual([
+      "app-security-notes",
+      "probe_orders",
+      "security-auditlog",
+    ]);
+    expect(listed.sort()).toEqual(["app-security-notes", "probe_orders", "security-auditlog"]);
+    expect(stats.map((row) => row.tableName)).not.toContain("security-auditlog-2026.10.04");
   });
 
   test("excludes the same bookkeeping indices from the table stats", async () => {

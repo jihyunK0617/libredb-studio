@@ -562,10 +562,15 @@ operator — and a statement ending in a `#` run is returned unbounded rather th
 | Source field | `QueryResult` field | Notes |
 |--------------|---------------------|-------|
 | result rows | `rows` | JSON objects exactly as the cluster returned them, except that an integer past 2^53 arrives as its exact digits (see below) |
-| signature | `fields` | `null` for a wildcard signature, in which case columns are the union of the keys the rows carry, first seen first |
+| signature | `fields` | `null` for a wildcard signature, in which case columns are the union of the keys the rows carry, first seen first; an empty key, from either source, is named `(No column name)` and the rows carrying it are keyed under that name (see below) |
 | — | `rowCount` | `rows.length`, or the mutation count when a statement returned no rows |
 | metrics `executionTime` | `executionTime` | The cluster's own time (excludes network latency); falls back to the measured wall clock when the cluster reported none |
 | `warnings` | `warnings` | The notices the cluster attached to a statement it completed, each carrying its message and the cluster's own code **when it reported one** — an entry with no code arrives without one rather than with a substituted `0`, which is itself a legal code. **Absent** when the cluster reported no warnings at all — never an empty array, so the result UI decides from the field's presence alone (issue #273) |
+
+**An empty key is a column named `(No column name)`.**
+JSON carries an empty key, and the transport's `JSON.parse` keeps it, so a document `{"": 1}` or a signature `{"": "number"}` would otherwise answer a column `""`, which the grid cannot take.
+[`uniquelyKeyedRows`](../../src/lib/db/utils/result-fields.ts) names it through `uniqueFieldNames`, numbered past any key the rows already use, and keys every row carrying it under that name.
+Not measured on a live cluster; the rule is pinned by the provider's integration tests.
 
 **An integer past 2^53 is handed over as its digits.** The query service sends a document's number
 as the **unquoted** literal it was stored as, and `JSON.parse` rounds one past 2^53 with no error:
@@ -1101,7 +1106,7 @@ measures nothing, and a metric nobody measured is omitted rather than reported a
 | `getPerformanceMetrics()` | bucket stats | cache hit ratio is `100 - ep_cache_miss_rate` (clamped 0..100); `queriesPerSecond` is `cmd_get + cmd_set`; buffer-pool usage is `quotaPercentUsed` — each is **omitted when its source published nothing** ([§7.1](#71-an-unread-metric-is-absent-not-zero)) |
 | `getSlowQueries()` | `system:completed_requests` ordered by `elapsedTime` | one row per recorded request, so `calls` is always 1 — these are individual requests, not aggregates |
 | `getActiveSessions()` | `system:active_requests` | request id, statement, user, remote address, state, elapsed |
-| `getTableStats()` | `/pools/default/buckets/<bucket>` | **bucket level only** — per-collection item counts need a `COUNT(*)` per collection, too expensive for a monitoring poll |
+| `getTableStats()` | `/pools/default/buckets/<bucket>` | **bucket level only** — per-collection item counts need a `COUNT(*)` per collection, too expensive for a monitoring poll. The row's `tableSize` and `totalSize` are both `basicStats.diskUsed`, the on-disk measure `getOverview()` publishes and the Storage tab divides by ([§7.2](#72-one-size-measure-per-bucket)) |
 | `getIndexStats()` | `system:indexes` + `/pools/default/buckets/@index-<bucket>/stats` | index name, scope, collection, keys, type. Modern servers no longer publish per-index statistics there, so an unpublished size shows as `indexSize: "N/A"` with `indexSizeBytes` **omitted** (a `0 B` read as an empty index, and the Storage tab summed it); `scans` still falls back to `0`, because `IndexStats.scans` is a required field |
 | `getStorageStats()` | `/pools/default/buckets/<bucket>` | Data (`basicStats.diskUsed`) and RAM Quota (`quota.ram` with `quotaPercentUsed`) |
 | `getHealth()` | the four above, in parallel | connections, size, cache hit ratio (the string `N/A` when there is none — `formatCacheHitRatio` from `src/lib/monitoring-cache-ratio.ts`), top 5 slow queries, top 10 sessions |
@@ -1130,6 +1135,32 @@ cache fault the cluster never reported**. Reading the KV stats needs a role many
 lack ([§3.9](#39-monitoring-degrades-to-empty-never-throws)), so that was the ordinary case, not an
 edge one. Omitted, the same panels render `N/A` / "Not measured" and score the card as healthy
 (`OverviewTab.tsx`, `PerformanceTab.tsx`).
+
+### 7.2 One size measure per bucket
+
+`basicStats` carries two sizes of the same bucket, `dataUsed` and `diskUsed`, and this provider used
+to publish one of them per monitoring tab: `getTableStats()` put `dataUsed` in the row's
+`tableSizeBytes`, the row's `totalSizeBytes` was `diskUsed`, and `getOverview()` published `diskUsed`
+as the database size the Storage tab divides every share by. One bucket therefore read two sizes at
+once: 1.57 MB on the Tables tab against 16.86 MB, "100% of DB", on the Storage tab, measured on
+Couchbase 8.0.2 CE (#1455).
+
+Both fields of the row now carry `diskUsed`, the measure `getOverview()`'s `databaseSizeBytes` and
+`getStorageStats()`'s *Data* row already publish. The bucket reads one size across the two tabs, and
+the Storage tab's share divides the bucket's own bytes by themselves. The Tables tab's *Size* column
+is therefore the bucket's **on-disk** size; `dataUsed` is deliberately not published as a table size,
+because nothing in the monitoring surface reports that measure as a total, and a share whose
+numerator and denominator measure different things is not a share.
+
+The *Indexes* card reads `N/A` beside a bucket whose disk usage the cluster does publish, and the
+field it is missing belongs to the `TableStats` row rather than to the index listing:
+`getTableStats()` returns the one bucket row and that row carries no `indexSizeBytes`, while
+[`StorageTab.tsx`](../../src/components/monitoring/tabs/StorageTab.tsx):79-80 shows the card only
+when **every** table row carries one (`tables.every((t) => t.indexSizeBytes !== undefined)`).
+`getIndexStats()` omits `IndexStats.indexSizeBytes` for its own reason
+([§7.1](#71-an-unread-metric-is-absent-not-zero)), and that listing is not the one the card reads.
+A bucket is one keyspace with no separate index size to report, so the absent figure is real rather
+than a `0`.
 
 ---
 
@@ -1200,6 +1231,7 @@ stays absent, and that card never renders either.
 | `supportsExternalQueryLimiting` | `true` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — SQL++ has `UPDATE <keyspace> SET ... WHERE ...`, but the shared editor's `WHERE <pk> = <value>` would filter on `__id`, the key **projection alias**, which is not a document field ([§13](#13-known-limitations--future-work)) |
+| `supportsTestDataGeneration` | `false` - a collection takes a document write, but the Generate Test Data dialog's `INSERT INTO ... VALUES` was never measured against SQL++, so the row menus do not offer it (#1468) |
 | `supportsResultPagination` | `true` — SQL++ takes `LIMIT n OFFSET m`, and this provider's `prepareQuery` routes through the shared limiter to emit it (#816) |
 | `supportsTransactions` | `false` — the query service is reached over stateless HTTP and no session spans two requests, so the transaction trio and SANDBOX are not offered (#464) |
 | `declaresForeignKeys` | `false` — SQL++ has no referential constraint; collections are schemaless and the columns reported here are inferred from a document sample |

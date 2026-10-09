@@ -999,6 +999,7 @@ describe("ElasticsearchProvider metadata", () => {
       supportsExternalQueryLimiting: true,
       supportsCreateTable: false,
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
       // Elasticsearch SQL has no `OFFSET` clause: `prepareQuery` THROWS rather than
       // answer page two with page one, and this hides the control that would
       // provoke it. OpenSearch, the same implementation, declares true (#816).
@@ -1580,6 +1581,63 @@ describe("ElasticsearchProvider query", () => {
     expect(result.rows).toEqual([{ c: 1, "c (2)": 2, "c (3)": 3 }]);
     expect(result.columnTypes).toEqual({ c: "integer", "c (2)": "integer", "c (3)": "integer" });
     expect(result.rowCount).toBe(1);
+  });
+
+  test("numbers a repeat past a name the statement declares later", async () => {
+    // `SELECT 1 AS a, 2 AS a, 3 AS "a (2)"`: the third column is the user's own `a (2)`,
+    // so the repeat of `a` is numbered `a (3)` and every value stays under its own name.
+    const provider = await connectProvider();
+    overrideSql(
+      ok(
+        '{"columns":[{"name":"a","type":"integer"},{"name":"a","type":"long"},{"name":"a (2)","type":"integer"}],' +
+          '"rows":[[1,2,3]]}',
+      ),
+    );
+
+    const result = await provider.query('SELECT 1 AS a, 2 AS a, 3 AS "a (2)"');
+
+    expect(result.fields).toEqual(["a", "a (3)", "a (2)"]);
+    expect(result.rows).toEqual([{ a: 1, "a (3)": 2, "a (2)": 3 }]);
+    expect(result.columnTypes).toEqual({ a: "integer", "a (3)": "long", "a (2)": "integer" });
+  });
+
+  test("shows a column declared with no name, or an empty one, as an unnamed column", async () => {
+    // Measured never to happen: the engine names an unaliased expression with its own text.
+    // A declaration without one still gets a name the grid can key, never "undefined".
+    const provider = await connectProvider();
+    overrideSql(ok('{"columns":[{"type":"integer"},{"name":"","type":"long"}],"rows":[[1,2]]}'));
+
+    const result = await provider.query("SELECT 1, 2");
+
+    expect(result.fields).toEqual(["(No column name)", "(No column name) (2)"]);
+    expect(result.rows).toEqual([{ "(No column name)": 1, "(No column name) (2)": 2 }]);
+  });
+
+  // A name that is not text would be shown as its stringification ("[object Object]", "7"),
+  // a label the engine never sent, so the result is refused rather than named by guess.
+  test.each<[string, string]>([
+    ["an object", '{"first":"a"}'],
+    ["a number", "7"],
+  ])("refuses a column whose declared name is %s", async (_label, name) => {
+    const provider = await connectProvider();
+    overrideSql(ok(`{"columns":[{"name":${name},"type":"integer"}],"rows":[[1]]}`));
+
+    await expect(provider.query("SELECT 1")).rejects.toThrow(
+      "Elasticsearch declared a column whose name is not text, so the result cannot be read",
+    );
+  });
+
+  // A row whose value count differs from the declaration cannot be read by position:
+  // padding a short one invents nulls and cutting a long one drops values, both silently.
+  test.each<[string, string]>([
+    ["short", "[[1]]"],
+    ["long", "[[1,2,3]]"],
+    ["not an array", '["not-a-row"]'],
+  ])("refuses a row the engine sent %s", async (_label, rows) => {
+    const provider = await connectProvider();
+    overrideSql(ok(`{"columns":[{"name":"a","type":"integer"},{"name":"b","type":"integer"}],"rows":${rows}}`));
+
+    await expect(provider.query("SELECT a, b FROM probe_orders")).rejects.toThrow(/row with \d+ values? for 2 columns/);
   });
 
   test("shows the alias the user typed, which this product folds into the column name", async () => {

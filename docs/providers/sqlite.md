@@ -142,9 +142,9 @@ case "sqlite": {
 }
 ```
 
-`execution` is the server-injected [`ProviderExecutionContext`](../../src/lib/db/types.ts) — empty
-on the normal path, and carrying the read-only flag only when
-`acquireExecutionProfileProvider` builds an agent provider ([§12](#12-agent-read-only-execution-profile-328)).
+`execution` is the server-injected [`ProviderExecutionContext`](../../src/lib/db/types.ts).
+Every cached path passes the server-derived `allowExternalFileAccess` posture, and SQLite refuses to open when it is `false` (the last section of this page).
+`acquireExecutionProfileProvider` adds the read-only flag when it builds an agent provider ([§12](#12-agent-read-only-execution-profile-328)).
 
 ---
 
@@ -157,7 +157,7 @@ on the normal path, and carrying the read-only flag only when
 paths are `path.resolve()`-d to an absolute path and **rejected if they contain a NUL byte**. Parent
 directories are created on connect.
 
-> **NUL rejection is the only path validation — by design.** `../` segments are legal and simply
+> **NUL rejection and reserved server files are checked on connect.** `../` segments are legal and simply
 > resolve into the absolute path. This follows the feature's trust model: a connection's
 > `database`/`connectionString` path is set by whoever configures the connection (an
 > authenticated user of this Studio instance) — pointing Studio at an arbitrary server-side file is
@@ -204,7 +204,7 @@ used to leave the handle held, so the user could not delete or move the file the
 ### 3.3 Read vs write dispatch
 
 `query()` ([`sqlite.ts`](../../src/lib/db/providers/sql/sqlite.ts)) prepares the statement and
-branches on `stmt.returnsRows()`: a statement with result columns uses `stmt.all()` and returns rows;
+branches on `stmt.returnsRows()`: a statement with result columns uses `stmt.values()` and returns rows ([Result column names](#result-column-names));
 one without uses `stmt.run()` and returns `{ changes }`. `rowCount = rows.length || changes`. Both
 drivers are **synchronous**: the provider wraps them in the async signature but there is no real
 concurrency or cancellation.
@@ -217,8 +217,8 @@ method. So the branch does not depend on how the statement is spelled:
 
 | Statement | Branch | Result |
 |---|---|---|
-| `SELECT ...`, `WITH ... SELECT`, `WITH RECURSIVE ...`, `VALUES (1), (2)`, `EXPLAIN ...`, `PRAGMA journal_mode` | `all()` | the rows |
-| `INSERT` / `UPDATE` / `DELETE ... RETURNING ...` | `all()` | the returned rows, and the write is applied; `rowCount` is the number of rows returned |
+| `SELECT ...`, `WITH ... SELECT`, `WITH RECURSIVE ...`, `VALUES (1), (2)`, `EXPLAIN ...`, `PRAGMA journal_mode` | `values()` | the rows |
+| `INSERT` / `UPDATE` / `DELETE ... RETURNING ...` | `values()` | the returned rows, and the write is applied; `rowCount` is the number of rows returned |
 | plain `INSERT` / `UPDATE` / `DELETE` (CTE-led ones included), DDL, `BEGIN`, `PRAGMA user_version = 3` | `run()` | no rows, `rowCount` from `changes` |
 
 The router used to be the inherited `isReadOnlyQuery(sql)`, a leading-keyword set of `SELECT`,
@@ -305,7 +305,7 @@ spells the request its own way — bun `safeIntegers`, node `readBigInts` — bu
 row reaches the browser, refuses a `BigInt` outright. So both adapters set their own spelling and
 [`sqlite-driver.ts`](../../src/lib/db/providers/sql/sqlite-driver.ts) converts back at the one seam
 every row crosses — `prepare()`, the provider's only row-returning entry point (`exec()` returns
-nothing), wrapped by `withoutBigInts()` so `all()`, `get()` and `run()` are covered alike. Measured
+nothing), wrapped by `withoutBigInts()` so `all()`, `values()`, `get()` and `run()` are covered alike. Measured
 through both adapters in the same pass, with identical answers:
 
 | Value read | Answered as |
@@ -485,7 +485,7 @@ Homebrew). Each channel is browser-verified by
 
 ## 5. Query interface
 
-`query(sql, params?)` — positional params via the driver's `all()`/`run()`. There is no
+`query(sql, params?)`: positional params via the driver's `values()`/`run()`. There is no
 `prepareQuery()` override, so the inherited base injects a `LIMIT` into bare `SELECT`s
 (`DEFAULT_QUERY_LIMIT = 500`). No transactions, no cancellation ([§3.4](#34-no-transactions-api-no-cancellation-no-pool)).
 
@@ -569,6 +569,24 @@ A 64-bit id is where the two features meet: it leaves as the decimal string
 [§3.6](#36-a-64-bit-integer-survives-the-round-trip-in-both-directions) prints, and it is still
 declared `INTEGER`, so the export writes an `INTEGER` column rather than the `TEXT` a value-shaped
 guess would produce.
+
+### Result column names
+
+Every result column comes back under a name that is non-empty and that no other column of the result has, with its own value.
+The rows are read as arrays (bun:sqlite `values()`, node:sqlite `all()` after `setReturnArrays(true)`, bridged as one `values()` in [`sqlite-driver.ts`](../../src/lib/db/providers/sql/sqlite-driver.ts)) and keyed by position under `uniqueFieldNames` of the declared names ([`result-fields.ts`](../../src/lib/db/utils/result-fields.ts)).
+Measured 2026-10-07 on both drivers in-process (Bun 1.4.2), pinned in `tests/integration/db/sqlite-provider.test.ts`:
+
+| Statement | `fields` | Row |
+|---|---|---|
+| `SELECT 1 AS a, 2 AS a` | `a`, `a (2)` | `{ a: 1, "a (2)": 2 }` |
+| `SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id` | `id`, `customer_id`, `item`, `id (2)`, `name` | the order's id under `id`, the customer's under `id (2)` |
+| `SELECT 1 AS ""` | `(No column name)` | `{ "(No column name)": 1 }` |
+| `SELECT 4 + 5` | `4 + 5` | SQLite names an unaliased expression by its text, so only an empty alias is ever unnamed |
+
+Before this, `fields` was the keys of the first row object, so a repeated name was one column holding the last value and an empty alias was a column named `""`.
+A declared type is paired with its column by position, so `id (2)` above carries the customer table's `INTEGER`.
+An empty result names its columns too, because the names come from the statement and not from a first row.
+The agent's `queryReadOnly()` reads the same way.
 
 ### BLOB values
 
@@ -1203,6 +1221,7 @@ answers with nothing both while it is in flight and when it failed.
 | `supportsExternalQueryLimiting` | `true` (from base) |
 | `supportsCreateTable` | `true` (from base) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core SQLite DML |
+| `supportsTestDataGeneration` | `true` - the row menus offer Generate Test Data on tables, which writes one multi-row `INSERT INTO ... VALUES` |
 | `supportsResultPagination` | `true` — `LIMIT n OFFSET m` from the shared limiter (#816) |
 | `supportsTransactions` | **`false`** — SQLite HAS `BEGIN`, but this provider holds no session across two requests, so `POST /api/db/transaction` refuses the call. The flag describes the provider's surface, not the engine, and the trio and SANDBOX toggle are withheld rather than offered and then failed (#464) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; `PRAGMA foreign_key_list` reads them whether or not enforcement is on |
@@ -1326,7 +1345,7 @@ bun run test:coverage                                    # CI coverage workflow
 ## 12. Agent read-only execution profile (#328)
 
 The agent programme (epic #325) never talks to the shared, writable provider. It acquires a
-**dedicated provider keyed by (connection id, execution profile)** via
+**dedicated provider keyed by (connection id, execution profile)**, plus the requester's file-access posture, via
 `acquireExecutionProfileProvider` ([factory.ts](../../src/lib/db/factory.ts)) and runs every
 statement through `queryReadOnly()`. See [postgres.md §12](./postgres.md#12-agent-read-only-execution-profile-328)
 for the acquisition/caching rules, which are provider-independent; this section is the SQLite half.
@@ -1525,8 +1544,7 @@ not apply to SQLite ([§3.4](#34-no-transactions-api-no-cancellation-no-pool)).
   repairs the INTEGER case only).
 - **`:memory:` is ephemeral** — data is lost on disconnect; intended for trials/tests.
 - **Single schema (`main`)** — `ATTACH`ed databases are not surfaced.
-- **No path sandboxing (by design).** `getDatabasePath()` validates only that the path contains
-  no NUL byte; the resolved absolute path — `..` segments included — is used as-is. This grants an
+- **No path sandboxing (by design).** `getDatabasePath()` rejects NUL bytes and reserved server files; the resolved absolute path — `..` segments included — is used as-is. This grants an
   *unauthenticated* client no access: the path comes from an authenticated user's connection config,
   and reading arbitrary server-side files by path is the feature. The distinction that matters for
   multi-user installs is the next one down: **authenticated does not imply trusted with the host
@@ -1555,3 +1573,17 @@ not apply to SQLite ([§3.4](#34-no-transactions-api-no-cancellation-no-pool)).
 - Tests: [`tests/integration/db/sqlite-provider.test.ts`](../../tests/integration/db/sqlite-provider.test.ts)
 - API contract: [`docs/API_DOCS.md`](../API_DOCS.md)
 - Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [Trino](./trino.md) · [Redis](./redis.md)
+
+
+Connection targets reserve Studio's storage database, its WAL/SHM files and bootstrap
+credentials (including backups and temporary files). This applies to every role.
+Checks normalize paths, resolve symbolic links and compare existing file identities
+so hard links cannot alias reserved files. Other user database files beside them remain usable.
+
+SQLite connections are refused when the server-derived file-access posture is denied,
+including agent handles. HTTP and MCP derive that posture from the verified role and
+managed connection: non-admin callers and seeds shared with non-admin roles are denied.
+SQLite's adapters cannot confine statement-level file access, so a denied connection
+cannot be opened safely. Administrators retain SQLite access on private connections.
+Embedded callers using the cached factory must explicitly pass `{ allowExternalFileAccess: true }`
+for trusted SQLite access. Direct providers without an execution context retain trusted behavior.

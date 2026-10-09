@@ -5,6 +5,8 @@ import { mockRouterPush } from "../helpers/mock-navigation";
 import { describe, test, expect, afterEach, beforeEach, mock } from "bun:test";
 import { render, cleanup, act, fireEvent, waitFor, within } from "@testing-library/react";
 import React from "react";
+// What `lazyRetry` throws when a split view's chunk never arrives, so the fixtures below fail the way production does.
+import { ChunkLoadError } from "@/lib/lazy";
 import { setupMonacoMock, setupRechartssMock, setupXYFlowMock, setupFramerMotionMock } from "../helpers/mock-monaco";
 
 // Setup heavy library mocks before any component imports
@@ -23,6 +25,7 @@ let capturedSaveQueryModalProps: Record<string, unknown> = {};
 let capturedCommandPaletteProps: Record<string, unknown> = {};
 let capturedSafetyDialogProps: Record<string, unknown> = {};
 let capturedMobileHeaderProps: Record<string, unknown> = {};
+let capturedDesktopHeaderProps: Record<string, unknown> = {};
 let capturedTabBarProps: Record<string, unknown> = {};
 let capturedSchemaExplorerProps: Record<string, unknown> = {};
 let capturedConnectionsListProps: Record<string, unknown> = {};
@@ -47,6 +50,8 @@ const mockSetActiveConnection = mock(() => {});
 const mockSetSchema = mock(() => {});
 const mockFetchSchema = mock(() => {});
 const mockLoadObjects = mock(() => {});
+const mockMarkActiveUsed = mock(() => {});
+const mockActivateFallback = mock(() => {});
 // Tab Manager
 const mockSetTabs = mock(() => {});
 const mockSetActiveTabId = mock(() => {});
@@ -136,13 +141,15 @@ mock.module("@/hooks/use-connection-manager", () => ({
     schema: EMPTY_SCHEMA,
     schemaContext: "[]",
     isLoadingSchema: false,
-    connectionPulse: "none",
     setConnections: mockSetConnections,
     setActiveConnection: mockSetActiveConnection,
     setSchema: mockSetSchema,
     fetchSchema: mockFetchSchema,
     objectScanDeferred: false,
     loadObjects: mockLoadObjects,
+    activeAwaitsUse: false,
+    markActiveUsed: mockMarkActiveUsed,
+    activateFallback: mockActivateFallback,
     customConnections: true,
     ...connMgrOverride,
   })),
@@ -172,6 +179,11 @@ mock.module("@/hooks/use-provider-metadata", () => ({
     ...metadataOverride,
   })),
 }));
+
+// The pulse's own behaviour is pinned in tests/hooks/use-connection-pulse.test.ts; here only what
+// Studio hands it and what Studio does with its answer.
+const mockUseConnectionPulse = mock((_connection: unknown, _metadata: unknown) => "not-checked");
+mock.module("@/hooks/use-connection-pulse", () => ({ useConnectionPulse: mockUseConnectionPulse }));
 
 mock.module("@/hooks/use-tab-manager", () => ({
   useTabManager: mock(() => ({
@@ -317,7 +329,7 @@ mock.module("@/components/schema-explorer", () => {
   const React = require("react");
   return {
     SchemaExplorer: (props: Record<string, unknown>) => {
-      if (failingSplitViews.has("schema-explorer")) throw new Error("Loading chunk 9 failed");
+      if (failingSplitViews.has("schema-explorer")) throw new ChunkLoadError("Loading chunk 9 failed");
       capturedSchemaExplorerProps = props;
       return React.createElement("div", { "data-testid": "schema-explorer" }, "SchemaExplorer");
     },
@@ -326,7 +338,7 @@ mock.module("@/components/schema-explorer", () => {
 
 mock.module("@/components/ConnectionModal", () => ({
   ConnectionModal: (props: Record<string, unknown>) => {
-    if (failingSplitViews.has("connection-dialog")) throw new Error("Loading chunk 8 failed");
+    if (failingSplitViews.has("connection-dialog")) throw new ChunkLoadError("Loading chunk 8 failed");
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const React = require("react");
     capturedConnectionModalProps = props;
@@ -356,7 +368,10 @@ mock.module("@/components/studio/index", () => {
       capturedMobileHeaderProps = props;
       return React.createElement("div", { "data-testid": "mobile-header" }, "MobileHeader");
     },
-    StudioDesktopHeader: () => React.createElement("div", { "data-testid": "desktop-header" }, "DesktopHeader"),
+    StudioDesktopHeader: (props: Record<string, unknown>) => {
+      capturedDesktopHeaderProps = props;
+      return React.createElement("div", { "data-testid": "desktop-header" }, "DesktopHeader");
+    },
     StudioTabBar: (props: Record<string, unknown>) => {
       capturedTabBarProps = props;
       return React.createElement("div", { "data-testid": "tab-bar" }, "TabBar");
@@ -384,7 +399,7 @@ mock.module("@/components/CommandPalette", () => ({
 
 mock.module("@/components/SchemaDiagram", () => ({
   SchemaDiagram: () => {
-    if (failingSplitViews.has("diagram")) throw new Error("Loading chunk 7 failed");
+    if (failingSplitViews.has("diagram")) throw new ChunkLoadError("Loading chunk 7 failed");
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const React = require("react");
     return React.createElement("div", { "data-testid": "schemadiagram" }, "SchemaDiagram");
@@ -570,6 +585,7 @@ describe("Studio", () => {
     capturedCommandPaletteProps = {};
     capturedSafetyDialogProps = {};
     capturedMobileHeaderProps = {};
+    capturedDesktopHeaderProps = {};
     capturedTabBarProps = {};
     capturedSchemaExplorerProps = {};
     capturedConnectionsListProps = {};
@@ -593,6 +609,9 @@ describe("Studio", () => {
     // Clear trackable mocks
     mockHandleLogout.mockClear();
     mockSetConnections.mockClear();
+    mockUseConnectionPulse.mockClear();
+    mockMarkActiveUsed.mockClear();
+    mockActivateFallback.mockClear();
     mockSetActiveConnection.mockClear();
     mockSetSchema.mockClear();
     mockFetchSchema.mockClear();
@@ -887,8 +906,24 @@ describe("Studio", () => {
     fireEvent.click(dialog.getByText("Delete"));
     expect(mockStorageDeleteConnection).toHaveBeenCalledWith("c1");
     expect(mockSetConnections).toHaveBeenCalledWith(remaining);
-    expect(mockSetActiveConnection).toHaveBeenCalledWith(remaining[0]);
+    expect(mockActivateFallback).toHaveBeenCalledWith(remaining[0]);
     expect(dialog.queryByText("Delete connection?")).toBeNull();
+  });
+
+  // CL-CORE-2: the connection a delete leaves active is the page's choice, not the person's, so it is made active
+  // through the fallback, which does not count as using it; the person's setter would read a connection whose requests
+  // resume billed compute with no click.
+  test("deleting the open connection makes the first one left active as a fallback, never as a pick", () => {
+    const remaining = [{ id: "c2", type: "databend", name: "Cloud" }];
+    mockStorageGetConnections.mockReturnValue(remaining);
+    connMgrOverride = { activeConnection: pgConn, connections: [pgConn, remaining[0]] };
+    render(<Studio />);
+
+    act(() => (capturedSidebarProps.onDeleteConnection as (id: string) => void)("c1"));
+    fireEvent.click(within(document.body as HTMLElement).getByText("Delete"));
+
+    expect(mockActivateFallback).toHaveBeenCalledWith(remaining[0]);
+    expect(mockSetActiveConnection).not.toHaveBeenCalled();
   });
 
   /**
@@ -1292,6 +1327,64 @@ describe("Studio", () => {
     render(<Studio />);
     expect(capturedSidebarProps.objectScanDeferred).toBe(true);
     expect(capturedSidebarProps.onLoadObjects).toBe(mockLoadObjects);
+    expect(capturedSidebarProps.deferredForBilledCompute).toBe(false);
+  });
+
+  // CL-CORE-2: the manager holds the inventory of a connection the page opened by itself whose requests resume billed
+  // compute; the tree reads the same declaration here, so it is held before its first read.
+  describe("a connection the page opened by itself, whose requests resume billed compute", () => {
+    test("reaches the tree held, with its reason and the load action", () => {
+      connMgrOverride = { activeConnection: pgConn, activeAwaitsUse: true };
+      capabilitiesOverride = { resumesBilledCompute: true };
+      render(<Studio />);
+
+      expect(capturedSidebarProps.objectScanDeferred).toBe(true);
+      expect(capturedSidebarProps.deferredForBilledCompute).toBe(true);
+      expect(capturedSidebarProps.onLoadObjects).toBe(mockLoadObjects);
+    });
+
+    test("control: once used, or where requests bill nothing, the tree is not held", () => {
+      connMgrOverride = { activeConnection: pgConn, activeAwaitsUse: false };
+      capabilitiesOverride = { resumesBilledCompute: true };
+      const used = render(<Studio />);
+      expect(capturedSidebarProps.objectScanDeferred).toBe(false);
+      expect(capturedSidebarProps.deferredForBilledCompute).toBe(false);
+      used.unmount();
+
+      connMgrOverride = { activeConnection: pgConn, activeAwaitsUse: true };
+      capabilitiesOverride = {};
+      render(<Studio />);
+      expect(capturedSidebarProps.objectScanDeferred).toBe(false);
+      expect(capturedSidebarProps.deferredForBilledCompute).toBe(false);
+    });
+
+    test("a connection that defers its own scan as well keeps that sentence", () => {
+      connMgrOverride = { activeConnection: pgConn, activeAwaitsUse: true, objectScanDeferred: true };
+      capabilitiesOverride = { resumesBilledCompute: true };
+      render(<Studio />);
+
+      expect(capturedSidebarProps.objectScanDeferred).toBe(true);
+      expect(capturedSidebarProps.deferredForBilledCompute).toBe(false);
+    });
+
+    test("a statement the person runs uses the connection", () => {
+      connMgrOverride = { activeConnection: pgConn };
+      render(<Studio />);
+
+      expect(capturedQueryExecParams.onStatementSent).toBe(mockMarkActiveUsed);
+    });
+
+    test("opening the mobile Schema tab, the tree of the phone layout, uses the connection, and no other tab does", () => {
+      connMgrOverride = { activeConnection: pgConn };
+      render(<Studio />);
+      const onTabChange = capturedMobileNavProps.onTabChange as (tab: string) => void;
+
+      act(() => onTabChange("database"));
+      act(() => onTabChange("editor"));
+      expect(mockMarkActiveUsed).not.toHaveBeenCalled();
+      act(() => onTabChange("schema"));
+      expect(mockMarkActiveUsed).toHaveBeenCalledTimes(1);
+    });
   });
 
   // --- onEditConnection ---
@@ -2031,6 +2124,25 @@ describe("Studio", () => {
   });
 
   // --- Inline-edit capability gate (#269) ---
+  test("asks the connection pulse about the active connection once its metadata answers, and shows its answer in both headers", () => {
+    connMgrOverride = { activeConnection: pgConn };
+    render(<Studio />);
+
+    const [connection, metadata] = mockUseConnectionPulse.mock.calls.at(-1)!;
+    expect(connection).toBe(pgConn);
+    expect((metadata as { capabilities: { queryLanguage: string } }).capabilities.queryLanguage).toBe("sql");
+    expect(capturedMobileHeaderProps.connectionPulse).toBe("not-checked");
+    expect(capturedDesktopHeaderProps.connectionPulse).toBe("not-checked");
+  });
+
+  // CL-CORE-4: the sidebar footer drew a pulsing "Connected" under a header that read "Not checked".
+  test("hands the sidebar the pulse both headers read, so its footer claims no more than they do", () => {
+    connMgrOverride = { activeConnection: pgConn };
+    render(<Studio />);
+
+    expect(capturedSidebarProps.connectionPulse).toBe("not-checked");
+  });
+
   test("withholds every editing affordance when supportsInlineRowEdit is false", () => {
     capabilitiesOverride = { supportsInlineRowEdit: false };
     // Even with editing already switched on in the hook, no editable cell wiring
@@ -2571,8 +2683,8 @@ describe("Studio", () => {
 
     expect(mockStorageDeleteConnection).toHaveBeenCalledWith("seed:sandbox");
     expect(mockSetConnections).toHaveBeenCalledWith([own, reports]);
-    expect(mockSetActiveConnection).toHaveBeenCalledWith(reports);
-    expect(mockSetActiveConnection).not.toHaveBeenCalledWith(own);
+    expect(mockActivateFallback).toHaveBeenCalledWith(reports);
+    expect(mockActivateFallback).not.toHaveBeenCalledWith(own);
   });
 
   test("mobile database tab Add button opens connection modal", () => {

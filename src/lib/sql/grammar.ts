@@ -169,6 +169,24 @@ export interface SqlGrammar {
    */
   readonly doubleSlashComment: boolean;
   /**
+   * Whether a backslash ALWAYS escapes the next character inside `'…'` and `"…"`.
+   *
+   * Where it does, `\x` is one escaped pair and `'it\'s'` is a terminated literal, except
+   * that a backslash before a line feed is no pair and leaves the literal unterminated:
+   * Databend's string token (`token.rs`) escapes with `\\.`, whose `.` excludes a line
+   * feed but matches a carriage return. Where
+   * this is false the span reader keeps its dialect-independent answer: a closing quote
+   * behind an odd backslash run is undeterminable, because some dialects escape there and
+   * others close the literal, and guessing moves the end of every construct after it.
+   * Backtick and bracket runs never take the escape.
+   *
+   * True on Databend's row alone, whose lexer escapes with a backslash in both quotes under
+   * every dialect setting. MySQL is the dialect that escapes by default, and it is still
+   * false there: `NO_BACKSLASH_ESCAPES` in `sql_mode` turns the escape off per session, so
+   * no row can state it for every connection (BACKLOG S2).
+   */
+  readonly backslashAlwaysEscapes: boolean;
+  /**
    * How a script is cut into the units the engine receives (E2E pass of 2026-10-03/04,
    * #1312). Before this fact existed every code `;` was a boundary in every dialect, so a
    * PL/SQL procedure, a SQLite trigger and a T-SQL batch were each cut at their inner `;`
@@ -176,6 +194,31 @@ export interface SqlGrammar {
    * while the route reported its first fragment `success`.
    */
   readonly script: ScriptGrammar;
+  /**
+   * Clauses that must FOLLOW the row bound on this dialect (#1398).
+   *
+   * Each entry is a pattern that matches ONE such clause at the very END of a
+   * statement - leading whitespace, the clause's own words, `\s*` to the end - and
+   * the shared limiter does two things with them: it places the bound BEFORE the
+   * run it matches, re-attaching the matched text verbatim, and it reads an
+   * existing bound followed by such a run as the bound it is. Without the
+   * declaration the limiter appends, so on the dialects that have one of these
+   * clauses every bounded read was refused outright: Materialize
+   * `Expected end of statement, found LIMIT`, ScyllaDB `line 1:38 : Syntax error`.
+   *
+   * The patterns accept word-runs alone, and where the clause carries an argument
+   * (Materialize's timestamp, ScyllaDB's duration) it is a number, a single-quoted
+   * literal or one bracket-free token - never a free expression - so a closing
+   * quote or a `)` after it always ends the match. That is what keeps a
+   * clause-shaped run inside a literal (`… WHERE note = 'BYPASS CACHE'`), an alias
+   * followed by statement text (`SELECT a AS of FROM t`) and a clause written
+   * inside a subquery (`… (SELECT … AS OF 123) t`) from reading as the clause.
+   *
+   * Empty everywhere but the two rows that carry it. A dialect without a clause
+   * keeps today's answer for its words: the limiter appends after them and the
+   * engine refuses the statement, which it refused before the bound was there too.
+   */
+  readonly trailingLimitClauses: readonly RegExp[];
 }
 
 /**
@@ -195,7 +238,9 @@ export const DEFAULT_SQL_GRAMMAR: SqlGrammar = {
   blockComment: "flat",
   alternateQuoting: false,
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   script: { blocks: "none", separatorLine: null, unit: "statement" },
+  trailingLimitClauses: [],
 };
 
 /**
@@ -213,10 +258,14 @@ const MYSQL_GRAMMAR: SqlGrammar = {
   // Probed 2026-08-25 on 26.7.0: `SELECT 1 AS a // note` is ERROR 1064, "check the
   // manual … near '// note'". Nothing on that line is hidden.
   doubleSlashComment: false,
+  // False although MySQL escapes with a backslash by default: `NO_BACKSLASH_ESCAPES` in
+  // `sql_mode` turns that off per session, so the escape is not a fact of the dialect.
+  backslashAlwaysEscapes: false,
   // NOT established. MySQL has compound statements (`CREATE PROCEDURE … BEGIN … END`), which
   // its own client cuts with `DELIMITER`, and no reading of them was measured here, so the
   // default stays and the gap is BACKLOG S7.
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 const CLICKHOUSE_GRAMMAR: SqlGrammar = {
   hash: "comment",
@@ -239,7 +288,9 @@ const CLICKHOUSE_GRAMMAR: SqlGrammar = {
   // the exact shape #280 exists to prevent. With the fact carried it emits
   // `… LIMIT 5 // note` and returns 5 (both measured).
   doubleSlashComment: true,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 const POSTGRES_GRAMMAR: SqlGrammar = {
   hash: "code",
@@ -251,9 +302,20 @@ const POSTGRES_GRAMMAR: SqlGrammar = {
   // merely has no implementation for those argument types - not a comment and not a
   // syntax error. `SELECT 1 AS a // note` is "syntax error at or near \"//\"".
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   // Established, and equal to the default: a routine body is a literal (`$$ … $$` or
   // `'…'`), which the span reader already holds whole, so no `;` inside one is code.
   script: DEFAULT_SQL_GRAMMAR.script,
+  // Materialize's `AS OF [AT LEAST] <t>`, which shares this type-id route (E2E pass
+  // of 2026-10-03/04, #1398): `SELECT * FROM ui_mv AS OF AT LEAST 0` sent with the
+  // bound appended is `Expected end of statement, found LIMIT`, and with the bound
+  // before the clause it returns rows. The timestamp is a number or a single-quoted
+  // literal - the forms the clause's own grammar documents - so `AS of` as an alias
+  // (its next word is a name, not a literal) and an `AS OF` inside a subquery (a
+  // `)` follows the timestamp) never match. Real PostgreSQL and RisingWave share
+  // this row and have no such clause: a statement of theirs ending in these words
+  // is one the server refuses bound or unbound, so the reading costs neither.
+  trailingLimitClauses: [/\s+AS\s+OF\s+(?:AT\s+LEAST\s+)?(?:\d+|'[^']*')\s*$/i],
 };
 /**
  * DuckDB, every fact measured on v1.5.5 through `@duckdb/node-api` 1.5.5-r.4.
@@ -282,7 +344,9 @@ const DUCKDB_GRAMMAR: SqlGrammar = {
   alternateQuoting: false,
   // `SELECT 1 AS a // note` is `Parser Error: syntax error at or near "//"`.
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 const ORACLE_GRAMMAR: SqlGrammar = {
   hash: "code",
@@ -293,10 +357,12 @@ const ORACLE_GRAMMAR: SqlGrammar = {
   // dual` is ORA-00923, "FROM keyword not found where expected", with the caret under
   // the slashes. Nothing on that line is hidden.
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   // PL/SQL units and SQL*Plus's `/` line. Measured on 26ai Free 23.26.3 before the fact
   // existed: the procedure cut at its inner `;` was stored INVALID with PLS-00103, and the
   // unit is refused without the `;` after its `END`, so the splitter keeps that one.
   script: { blocks: "pl-sql", separatorLine: "/", unit: "statement" },
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 /**
  * Db2 LUW, every fact probed 2026-10-03 on DB2/LINUXX8664 12.1.0.0 through db2-node 1.0.22, the
@@ -319,7 +385,9 @@ const DB2_GRAMMAR: SqlGrammar = {
   alternateQuoting: false,
   // `SELECT 1 AS a FROM SYSIBM.SYSDUMMY1 // note` is SQLCODE -104.
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 const MSSQL_GRAMMAR: SqlGrammar = {
   hash: "code",
@@ -329,11 +397,13 @@ const MSSQL_GRAMMAR: SqlGrammar = {
   // Probed 2026-08-25 on 2022 through sqlcmd: `SELECT 1 AS a // note` is Msg 102,
   // "Incorrect syntax near '/'".
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   // The batch is the unit, cut at `GO` lines, and `blocks` stays `none` because a batch
   // already holds every body it contains: `CREATE PROCEDURE` runs to the end of its batch.
   // Measured on 2025 RTM-CU9: `DECLARE @x INT = 5; SELECT @x * 2` sent as two requests is
   // `Must declare the scalar variable "@x"`, and as one batch answers 10.
   script: { blocks: "none", separatorLine: "GO", unit: "batch" },
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 const SQLITE_GRAMMAR: SqlGrammar = {
   hash: "code",
@@ -344,10 +414,12 @@ const SQLITE_GRAMMAR: SqlGrammar = {
   // `SELECT 1 // 2` are both 'near "/": syntax error'. The amalgamation's tokenizer
   // agrees - `case CC_SLASH` opens a run only on `/*`.
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   // `CREATE TRIGGER … BEGIN … END` is the one statement with a body. Measured through
   // node:sqlite 3.50.4 before the fact existed: the trigger cut at its inner `;` was
   // `incomplete input`.
   script: { blocks: "trigger-body", separatorLine: null, unit: "statement" },
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 
 /**
@@ -387,7 +459,9 @@ const ELASTICSEARCH_GRAMMAR: SqlGrammar = {
   // costs is worth stating: if `//` DOES open a comment here, this dialect's splitter
   // over-splits exactly as `cassandra`'s did.
   doubleSlashComment: DEFAULT_SQL_GRAMMAR.doubleSlashComment,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 const OPENSEARCH_GRAMMAR: SqlGrammar = {
   // `#` really is a line comment, and this is where the fork's SQL plugin parts
@@ -412,7 +486,9 @@ const OPENSEARCH_GRAMMAR: SqlGrammar = {
   alternateQuoting: false,
   // NOT established, same reason and same stated cost as the Elasticsearch row above.
   doubleSlashComment: DEFAULT_SQL_GRAMMAR.doubleSlashComment,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 /**
  * Established the same way and for the same reason as the two search rows: the engine
@@ -448,7 +524,9 @@ const TRINO_GRAMMAR: SqlGrammar = {
   // error at the same offset - so the slashes are refused where they stand rather
   // than hiding what follows.
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 
 /**
@@ -484,7 +562,9 @@ const DATAFUSION_GRAMMAR: SqlGrammar = {
   // Line: 1, Column: 15")`, so the slashes are refused where they stand rather than hiding what
   // follows.
   doubleSlashComment: false,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  trailingLimitClauses: DEFAULT_SQL_GRAMMAR.trailingLimitClauses,
 };
 
 /**
@@ -563,7 +643,63 @@ const CASSANDRA_GRAMMAR: SqlGrammar = {
   //     -> "line 2:0 mismatched input 'DROP' expecting EOF", so the run ended at the
   //        newline: a LINE comment, not a to-end-of-input one.
   doubleSlashComment: true,
+  backslashAlwaysEscapes: false,
   script: DEFAULT_SQL_GRAMMAR.script,
+  // Clauses that must follow the row bound (#1398), measured on ScyllaDB 2026.3.2
+  // (E2E pass of 2026-10-03/04), which shares this type-id:
+  //   `SELECT * FROM t BYPASS CACHE` -> rows; with the bound appended after it,
+  //     `line 1:38 : Syntax error`.
+  //   `SELECT * FROM t USING TIMEOUT 5s` -> rows; appended, `line 1:42`.
+  //   `SELECT * FROM t LIMIT 10 BYPASS CACHE` -> rows: the bound keeps its place
+  //     before the clause.
+  // `ALLOW FILTERING` is the one this row already knew (`… LIMIT 3 ALLOW FILTERING`
+  // returns rows, `… ALLOW FILTERING LIMIT 3` is "mismatched input 'LIMIT'"), which
+  // the Cassandra provider used to transpose after the fact; all three now come from
+  // this one declaration. `USING TIMEOUT` and `BYPASS CACHE` are ScyllaDB's, not
+  // Apache Cassandra 5.0's (measured there: `USING TIMEOUT 1ms` is `mismatched input
+  // 'USING' expecting EOF`), and the cost of declaring them on this shared row is
+  // none: a 5.0 statement ending in either is refused bound or unbound. The duration
+  // token excludes brackets, so a `)` after it ends the match: a `USING TIMEOUT` run
+  // followed by a closing parenthesis - a subquery's tail on a dialect that has one,
+  // or text the engine will refuse - is never read as the statement's own clause.
+  trailingLimitClauses: [/\s+ALLOW\s+FILTERING\s*$/i, /\s+BYPASS\s+CACHE\s*$/i, /\s+USING\s+TIMEOUT\s+[^()\s]+\s*$/i],
+};
+
+/**
+ * Databend, every fact read off the server's own lexer (`src/query/ast/src/parser/token.rs`) and parser rather than
+ * a neighbouring dialect: there is no driver package to ask, and the lexer is what the server runs. The one fact a
+ * source could not settle, the trailing `FORMAT` clause, was measured on the pinned image over `POST /v1/query`.
+ *
+ * Five readings of Databend's differ from the span reader's and are refused by the provider's statement guard
+ * (`providers/sql/databend/sql-text.ts`) rather than carried here. A `--` comment ends at a form feed. An `@` stage
+ * token runs to the first white space, comma, semicolon, quote or parenthesis and takes `\'`, `--`, `/*`, a dollar run
+ * and `[` into the name where the span reader opens a quote, a comment, a dollar string or an array, so the guard
+ * refuses a stage token that holds a backslash or any run the span reader opens; an `@` that ends a `<@` operator,
+ * which the lexer takes as one token, opens no stage token. The body of a `/*+` hint is tokenized, so the hint ends at
+ * the first closing star-slash TOKEN, which a quote or comment inside the body can move past the one the span reader
+ * stops at. A `$tag$…$tag$` run is a dollar string to the span reader while Databend lexes `$tag$` as a variable and
+ * reads the text between two tags as code. And a `$$` straight after an identifier character is part of that
+ * identifier to Databend, whose identifier tail takes `$`, while the span reader opens a dollar string there.
+ */
+const DATABEND_GRAMMAR: SqlGrammar = {
+  // CODE: the lexer has `#`, `#>`, `#>>` and `#-` as operator tokens, and its only comment forms are `--` and the
+  // block form.
+  hash: "code",
+  // A SUBSCRIPT and an array literal: `[` and `]` are plain tokens, and names are quoted with `"` or a backtick.
+  bracket: "subscript",
+  // FLAT: `lex_comment_block` scans for the first `*/` with no depth count.
+  blockComment: "flat",
+  alternateQuoting: false,
+  // CODE: `//` is an operator token.
+  doubleSlashComment: false,
+  // The string token is `'([^'\\]|\\.|'')*'` and its `"` twin, and no setting turns the escape off, so `'it\'s'`
+  // is one terminated literal and a backslash before a line feed leaves one unterminated.
+  backslashAlwaysEscapes: true,
+  // A body is a `$$` literal (`EXECUTE IMMEDIATE $$ … $$`, a procedure), which the span reader holds whole.
+  script: DEFAULT_SQL_GRAMMAR.script,
+  // Measured on the pinned image: `SELECT 1 FORMAT JSON LIMIT 5` is 1005 "unexpected `LIMIT`", and
+  // `SELECT 1 LIMIT 5 FORMAT JSON` succeeds. The format is one bracket-free word, so a `)` after it ends the match.
+  trailingLimitClauses: [/\s+FORMAT\s+\w+\s*$/i],
 };
 
 /**
@@ -724,6 +860,7 @@ const SQL_GRAMMARS: Partial<Record<DatabaseType, SqlGrammar>> = {
   trino: TRINO_GRAMMAR,
   cassandra: CASSANDRA_GRAMMAR,
   influxdb3: DATAFUSION_GRAMMAR,
+  databend: DATABEND_GRAMMAR,
 };
 
 /**

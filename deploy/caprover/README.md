@@ -17,17 +17,17 @@ The first two files are submitted as a PR to
 (`public/v4/apps/libredb-studio.yml` + `public/v4/logos/libredb-studio.png`) —
 the official listing, merged and live.
 
-The auto-connect variant goes upstream the same way, as `public/v4/apps/libredb-studio-autoconnect.yml` and `public/v4/logos/libredb-studio-autoconnect.png`, and only once the Studio release it needs exists (see [Auto-connect variant](#auto-connect-variant)).
-Once Studio 0.18.0 is published, and until the variant is listed there, install it through the manual template path below, pasting `libredb-studio-autoconnect.yml`.
+The auto-connect variant went upstream the same way, as `public/v4/apps/libredb-studio-autoconnect.yml` and `public/v4/logos/libredb-studio-autoconnect.png` ([caprover/one-click-apps#1346](https://github.com/caprover/one-click-apps/pull/1346)), and is listed there too (see [Auto-connect variant](#auto-connect-variant)).
 
 ## Install (official one-click apps catalog)
 
 CapRover dashboard → **Apps → One-Click Apps/Databases** → search **LibreDB Studio**.
+The search lists two LibreDB entries: **LibreDB Studio**, and **LibreDB Studio (auto-connect)**, which also connects Studio to the databases on the server.
 No third-party repo to add.
 
-The LibreDB 3rd-party repo that served this app while the official submission was
-in review is now retired. Source for that repo:
-<https://github.com/libredb/caprover-one-click-apps>.
+The LibreDB 3rd-party repo that served this app while the official submission was in review is retired.
+Its address, `https://libredb.org/caprover-one-click-apps`, no longer serves a list, so a CapRover that still has it under 3rd party repositories gets no app from it.
+The repo is archived as [`libredb/caprover-one-click-apps-legacy`](https://github.com/libredb/caprover-one-click-apps-legacy), and its old name now belongs to the catalog fork in [Releasing to the official catalog](#releasing-to-the-official-catalog).
 
 ## Install (manual template, for a version the catalog has not caught up to)
 
@@ -57,6 +57,11 @@ It needs LibreDB Studio 0.18.0 or later, the first release that ships the export
 With an older tag the `-discovery` app cannot start, because its command names a file that image does not have.
 CapRover upgrades each app on its own, so when you upgrade, deploy the same version to both apps, the Studio app first: a Studio older than the exporter can refuse its export file, and then it withdraws every discovered connection.
 
+Pick an app name of at most 39 characters that starts with a letter: the second app is named `<app>-discovery`, CapRover refuses an app name of 50 characters or more, and the project the install groups both apps in takes the app name and must start with a letter.
+CapRover checks each name only when it creates that app or project, one at a time, and removes nothing when a later step fails.
+A name of 40 to 49 characters therefore stops the install at `<app>-discovery` with "App Name is not allowed" and leaves the project and a Studio app without discovery; delete both before you install again under a shorter name.
+For the same reason the template has CapRover create the Studio app first, so an install that stops early never leaves the app that holds the Docker socket running on its own.
+
 What it adds to the plain template:
 
 - **The `-discovery` companion.**
@@ -76,7 +81,7 @@ What it adds to the plain template:
   Discovered connections are listed for the admin login only.
   The standard login cannot read the export file through a DuckDB connection: a non-admin DuckDB handle opens with statement-level file access closed (section 3.16 of [`docs/providers/duckdb.md`](../../docs/providers/duckdb.md), control 3.17 in [`docs/SECURITY.md`](../../docs/SECURITY.md)), and the export is JSON, which DuckDB refuses to open as a database.
   The admin login can read it, so treat that login as holding every discovered database's password.
-  Still give the standard login only to someone you trust: it reaches each connection's own database as the connection's DB user, and a connection that names a database file on the server is not limited to a directory (section 14 of [`docs/providers/sqlite.md`](../../docs/providers/sqlite.md#14-known-limitations--future-work), issue [#125](https://github.com/libredb/libredb-studio/issues/125)).
+  Still give the standard login only to someone you trust: it reaches each connection's own database as the connection's DB user, and a connection that names a database file on the server is not limited to a directory (section 14.3 of [`docs/providers/duckdb.md`](../../docs/providers/duckdb.md#143-the-file-path-is-a-trust-boundary-for-every-role-and-statement-reach-is-the-admins), issue [#125](https://github.com/libredb/libredb-studio/issues/125)).
 - **Apps to skip.**
   The optional "Apps to skip" field becomes `DISCOVERY_EXCLUDE` of the companion: comma-separated CapRover app names whose databases Studio must not connect to.
   The exporter writes only the names of those apps to the export, and Studio's discovery status lists each one as skipped with the reason "listed in Apps to skip".
@@ -100,6 +105,7 @@ Below, `studio` stands for its app name.
    To list only the CapRover databases, as the template does, also add `LIBREDB_EMBEDDED_SAMPLE=false` and `SQLITE_EMBEDDED_SAMPLE=false`; without them the two built-in sample connections stay listed.
    Click **Save & Restart**.
 2. Create an app named `studio-discovery` with **Has Persistent Data** checked.
+   If `studio-discovery` would have 50 characters or more, any shorter name works: nothing reads this app's name.
 3. In `studio-discovery`, under **HTTP Settings**, check **Do not expose as web-app externally** and click **Save & Restart**.
 4. In `studio-discovery`, under **App Configs**:
    - add a persistent directory with **Path in App** `/app/discovery` and **Label** `studio-discovered`, the same label as in step 1;
@@ -132,44 +138,50 @@ Set these under the app's **App Configs** tab to extend the deployment:
 
 ## Maintaining this template
 
-When a new Studio version is released, bump the version in `libredb-studio.yml`
-and submit an update PR to the official repo. The version appears **twice** in
-that file — the `defaultValue` of `$$cap_version` and the example inside its
-`description` — and both must move together. Validate locally with the CapRover
-repo's tooling:
+The release bump keeps both templates on the release version.
+`bun run chart:bump` moves `libredb-studio.yml` and `libredb-studio-autoconnect.yml` with `package.json`, in the two places each file carries the version: the `defaultValue` of `$$cap_version` and the example inside its `description`.
+`bun run chart:check`, which runs in the required `Lint, Typecheck and Build` check, fails a commit whose templates do not match `package.json`, so a release tag always holds the templates for that release and this copy can no longer fall behind unnoticed, the gap [#268](https://github.com/libredb/libredb-studio/issues/268) described.
+`libredb-studio-autoconnect.yml` never goes below 0.18.0, the first release with the exporter.
+`tests/unit/caprover-template.test.ts` checks the rest of both files: it fails when the plain-HTTP cookie override is missing or stops saying what it costs, when an em dash or a pictograph creeps back in, and when the auto-connect variant breaks its own rules (the socket only in the companion, the shared volume, the disclosure that opens the install text).
+
+### Releasing to the official catalog
+
+The catalog's maintainer keeps version bumps manual: "When someone sends a PR we know that version works" ([caprover/one-click-apps#1334](https://github.com/caprover/one-click-apps/pull/1334#issuecomment-5717266315)).
+So a workflow prepares the branch, and a member tests it and opens the pull request.
+
+1. After each stable release, [`caprover-fork.yml`](../../.github/workflows/caprover-fork.yml) stages both templates and their logos, byte for byte from the release tag, on [`libredb/caprover-one-click-apps`](https://github.com/libredb/caprover-one-click-apps) as the branch `libredb-studio-<version>`.
+   `docker-build-push.yml` starts it once the release images passed their channel E2E; a prerelease is never staged, and its templates stay on the last stable version.
+   It runs `tests/unit/caprover-template.test.ts` on the tag first, which encodes the catalog validator's rules, and never opens a pull request.
+   It runs none of the catalog's own npm checks: that would execute another repository's code on the release tag, whose Actions cache later release runs restore.
+   The catalog's CI runs them on the pull request, and a member can run them first in a clone of the catalog: `npm ci && npm run validate_apps && npm run formatter`.
+2. A member installs both staged templates on a CapRover: **Apps → One-Click Apps/Databases** → **`>> TEMPLATE <<`**, paste the raw file from the branch, and keep the default version.
+3. The member opens the pull request from the link in the run's summary, ticks the catalog's checklist from that test, and says what was tested.
+   The summary lists every file the branch changes, so a change beside the version, such as a new logo, goes into the pull request's text too.
+
+`caprover-official` in [`distribution/channels.yaml`](../../distribution/channels.yaml) decides what the workflow may do, under `update.fork`:
+
+| Setting | Value | Effect |
+|---|---|---|
+| `mode` | `update` | The fork must exist. Its default branch is fast-forwarded to the catalog's before the push; a fork carrying commits the catalog lacks stops the run with nothing written to it. |
+| `mode` | `create_or_update` | A missing fork is created in the libredb org first. |
+| `push` | `auto` | The release run pushes the branch. |
+| `push` | `manual` | The release run only validates. A member pushes by running **CapRover Catalog Fork** by hand on the release tag: **Run workflow**, then **Use workflow from** the tag. |
+
+The push needs the `CAPROVER_CATALOG_TOKEN` secret, because the workflow's own token cannot write to another repository.
+For `mode: update` a fine-grained personal access token is enough: resource owner `libredb`, repository access to `libredb/caprover-one-click-apps` only, and **Contents** read and write.
+GitHub lists the sync call (`merge-upstream`) under Contents write, and every token can read public repositories such as the catalog.
+`mode: create_or_update` also calls GitHub's fork endpoint, which GitHub lists under **Administration** write and Contents read, so that token needs access to the libredb org's repositories rather than to one fork.
+Without the secret the workflow validates and pushes nothing, by hand or not.
+
+It never pushes over a branch whose templates differ from the release's, for example after a fix made during review: delete the branch to stage it again.
+The staged commit is authored as the project owner, like the operator catalog submissions, and its message names the run and who started it.
+If a release's run did not stage the branch, run **CapRover Catalog Fork** by hand on the tag: a branch that already holds the same templates is left alone, so a second run is harmless.
+
+A change between releases, such as a description fix, still goes upstream by hand: merge it here first, then send the same bytes in a pull request.
+Compare against the live template before you do.
+This folder leads and the catalog follows, but that order has been broken twice: [caprover/one-click-apps#1315](https://github.com/caprover/one-click-apps/pull/1315) bumped the catalog to 0.9.59 directly, and [#1335](https://github.com/caprover/one-click-apps/pull/1335) put the `AUTH_COOKIE_SECURE` override and other fixes straight into the catalog, none of which came back here until 0.17.0.
 
 ```bash
-npm ci && npm run validate_apps && npm run formatter
+curl -s https://raw.githubusercontent.com/caprover/one-click-apps/master/public/v4/apps/libredb-studio.yml \
+  | diff -u libredb-studio.yml -
 ```
-
-A release bumps both templates, `libredb-studio.yml` and `libredb-studio-autoconnect.yml`, in the same post-release pull request, and each carries the version in the same two places.
-`libredb-studio-autoconnect.yml` never goes below 0.18.0, the first release with the exporter.
-`tests/unit/caprover-template.test.ts` runs the same checks over both files, plus the auto-connect variant's own: the socket only in the companion, the shared volume, the disclosure that opens the install text.
-
-Two things to know before you bump:
-
-- **`bun run distribution:check` does not verify this file.** It pins
-  `caprover-official` with `remote_file` against the catalog, which is
-  deliberate: that pin must measure what upstream actually serves, so it can
-  never tell you whether this copy kept up. Nothing measures that, which is the
-  gap [#268](https://github.com/libredb/libredb-studio/issues/268) describes and
-  the reason to read the next bullet before every bump.
-  `tests/unit/caprover-template.test.ts` covers what can be checked without
-  leaving the file: it fails when the two places the version appears disagree,
-  when the plain-HTTP cookie override is missing or stops saying what it costs,
-  and when an em dash or a pictograph creeps back in.
-- **Check upstream first.** This folder leads and the catalog follows, but that
-  order has been broken twice, and the second time by us.
-  [caprover/one-click-apps#1315](https://github.com/caprover/one-click-apps/pull/1315)
-  bumped the catalog to 0.9.59 directly, leaving this file on 0.9.14 until it
-  was resynced. Then
-  [#1335](https://github.com/caprover/one-click-apps/pull/1335) ("fix login over
-  plain HTTP", merged 2026-09-22) put the `AUTH_COOKIE_SECURE` override, the
-  em dash and icon cleanup and the comment rewording straight into the catalog,
-  and none of it came back here until 0.17.0. Compare against the live template
-  before assuming this copy is ahead:
-
-  ```bash
-  curl -s https://raw.githubusercontent.com/caprover/one-click-apps/master/public/v4/apps/libredb-studio.yml \
-    | diff -u libredb-studio.yml -
-  ```

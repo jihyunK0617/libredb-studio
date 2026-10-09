@@ -10,7 +10,7 @@ import { join } from "node:path";
 import type { ColumnSchema, DatabaseConnection } from "@/lib/types";
 import type { DatabaseProvider, MaintenanceOperation, ObjectKindSpec } from "@/lib/db/types";
 import { maintenanceControl } from "@/lib/db/types";
-import { DatabaseConfigError, NO_TRANSACTION_OPENED, TRANSACTION_STATE_UNREPORTED } from "@/lib/db/errors";
+import { DatabaseConfigError, NO_TRANSACTION_OPENED, QueryError, TRANSACTION_STATE_UNREPORTED } from "@/lib/db/errors";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 import { asBytes, binaryText } from "@/lib/export/binary";
 import { mysqlJsonStrategy } from "@/lib/explain/mysql-json";
@@ -108,10 +108,57 @@ function methodFor(fragment: string): string | undefined {
   return protocolCalls.find((c) => c.sql.toLowerCase().includes(fragment.toLowerCase()))?.method;
 }
 
+/** A mysql2 options object asking for array rows, which `query()` and `queryInTransaction()` send. */
+type MockStatement = string | { sql: string; rowsAsArray?: boolean };
+
+type MockField = { name: string };
+
+/** One result set's rows as mysql2 answers them under `rowsAsArray`: each row its values in column order. */
+function arrayRowsOf(rows: unknown[], declared: MockField[] | undefined): { rows: unknown[]; fields: MockField[] } {
+  const fields =
+    (declared ?? []).length > 0 || rows.length === 0 || Array.isArray(rows[0])
+      ? (declared ?? [])
+      : Object.keys(rows[0] as object).map((name) => ({ name }));
+  return {
+    rows: rows.map((row) => (Array.isArray(row) ? row : fields.map((f) => (row as Record<string, unknown>)[f.name]))),
+    fields,
+  };
+}
+
+/**
+ * What mysql2 answers under `rowsAsArray: true`. A fixture written with object rows is read in the
+ * order its fields declare, or its first row's key order when it declares none, as a real column
+ * definition would have said. A fixture that answers array rows is handed on unchanged, which is the
+ * only way to model two columns of one name. A header (no result set) and a CALL's list of result
+ * sets keep their shape, each set read the same way.
+ */
+function asRowsAsArray([rows, fields]: [unknown, unknown[] | undefined]): [unknown, unknown[] | undefined] {
+  if (!Array.isArray(rows)) return [rows, fields];
+  if (fields !== undefined && fields.some((set) => set === undefined || Array.isArray(set))) {
+    const sets = rows.map((set, index) =>
+      Array.isArray(set) ? arrayRowsOf(set, fields[index] as MockField[]).rows : set,
+    );
+    return [sets, fields];
+  }
+  const read = arrayRowsOf(rows, fields as MockField[] | undefined);
+  return [read.rows, fields === undefined ? fields : read.fields];
+}
+
+/** The statement's text for the fixtures, and its answer in the row shape the provider asked for. */
+function answerStatement(
+  method: "query" | "execute",
+  statement: MockStatement,
+  params?: unknown[],
+): Promise<[unknown, unknown[] | undefined]> {
+  if (typeof statement === "string") return recordCall(method, statement, params);
+  const answered = recordCall(method, statement.sql, params);
+  return statement.rowsAsArray === true ? answered.then(asRowsAsArray) : answered;
+}
+
 const mockConnection = {
   threadId: 42,
-  query: (sql: string, params?: unknown[]) => recordCall("query", sql, params),
-  execute: (sql: string, params?: unknown[]) => recordCall("execute", sql, params),
+  query: (sql: MockStatement, params?: unknown[]) => answerStatement("query", sql, params),
+  execute: (sql: MockStatement, params?: unknown[]) => answerStatement("execute", sql, params),
   release: () => {},
   beginTransaction: async () => {},
   commit: async () => {},
@@ -121,8 +168,8 @@ const mockConnection = {
 const mockPool = {
   getConnection: async () => mockConnection,
   end: async () => {},
-  query: (sql: string, params?: unknown[]) => recordCall("query", sql, params),
-  execute: (sql: string, params?: unknown[]) => recordCall("execute", sql, params),
+  query: (sql: MockStatement, params?: unknown[]) => answerStatement("query", sql, params),
+  execute: (sql: MockStatement, params?: unknown[]) => answerStatement("execute", sql, params),
 };
 
 /**
@@ -428,9 +475,9 @@ function defaultMockExecute(sql: string): Promise<[unknown[], unknown[]]> {
 
   // information_schema.STATISTICS (indexes)
   if (normalized.includes("information_schema.statistics")) {
-    // Count query for overview
+    // Count query for overview (#1441: index_count only, table_count was unread)
     if (normalized.includes("count(distinct")) {
-      return Promise.resolve([[{ table_count: "2", index_count: "3" }], []]);
+      return Promise.resolve([[{ index_count: "3" }], []]);
     }
     // Index stats query
     if (normalized.includes("index_type") || normalized.includes("group_concat")) {
@@ -971,6 +1018,7 @@ describe("MySQLProvider", () => {
       // `UPDATE t SET c = v WHERE pk = v` is core MySQL DML — the shape the inline
       // row editor builds (#269).
       expect(caps.supportsInlineRowEdit).toBe(true);
+      expect(caps.supportsTestDataGeneration).toBe(true);
       // `LIMIT n OFFSET m` from the shared limiter (#816).
       expect(caps.supportsResultPagination).toBe(true);
       // One held connection carries the transaction, so the trio is offered (#464).
@@ -1894,7 +1942,13 @@ describe("MySQLProvider", () => {
       let callStatus = 3;
       mockExecuteFn = (sql: string) => {
         if (sql.startsWith("BEGIN")) return Promise.resolve([header(16387), undefined]);
-        if (sql.startsWith("CALL")) return Promise.resolve([[[{ id: 1 }], header(callStatus)], undefined]);
+        // `fields` holds one list per result set and `undefined` for the header, as mysql2 answers a CALL.
+        if (sql.startsWith("CALL")) {
+          return Promise.resolve([
+            [[{ id: 1 }], header(callStatus)],
+            [[{ name: "id" }], undefined],
+          ]);
+        }
         return defaultMockExecute(sql) as Promise<[unknown, unknown[] | undefined]>;
       };
       provider = new MySQLProvider(makeMySQLConfig());
@@ -2013,6 +2067,32 @@ describe("MySQLProvider", () => {
       expect(typeof overview.indexCount).toBe("number");
       expect(overview.indexCount).toBe(3);
       expect(overview.startTime).toBeInstanceOf(Date);
+    });
+
+    // #1441: INDEX_NAME is unique per table only, so a database-wide
+    // COUNT(DISTINCT INDEX_NAME) collapses every table's PRIMARY (and any other
+    // index name two tables share) into one. The query must count distinct
+    // (TABLE_NAME, INDEX_NAME) pairs instead, so two tables each with a PRIMARY
+    // count as two indexes, not one.
+    test("the index count query counts per-table index names, not index names alone", async () => {
+      const executedStatements: string[] = [];
+      mockExecuteFn = (sql: string) => {
+        executedStatements.push(sql);
+        return defaultMockExecute(sql);
+      };
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      executedStatements.length = 0;
+      await provider.getOverview();
+
+      const indexCountSql = executedStatements.find(
+        (s) => s.toLowerCase().includes("information_schema.statistics") && s.toLowerCase().includes("index_count"),
+      );
+      expect(indexCountSql).toBeDefined();
+      expect(indexCountSql).toContain("COUNT(DISTINCT TABLE_NAME, INDEX_NAME)");
+      // The unused table_count column (#1441) is gone, not just unread.
+      expect(indexCountSql).not.toContain("table_count");
     });
 
     test("a size result without the expected column leaves overview size absent", async () => {
@@ -2182,6 +2262,30 @@ describe("MySQLProvider", () => {
 
       expect(overview.version).toBe("MySQL 8.0.35");
     });
+
+    // #1444. Measured against percona/percona-server:latest 8.4.11-11: VERSION() is a bare
+    // MySQL-style number and only @@version_comment names Percona.
+    for (const [label, version, comment, expected] of [
+      ["Percona Server", "8.4.11-11", "Percona Server (GPL), Release 11", "Percona Server 8.4.11-11"],
+      ["stock MySQL", "8.0.35", "MySQL Community Server - GPL", "MySQL 8.0.35"],
+      ["MariaDB", "12.3.2-MariaDB-ubu2404", "mariadb.org binary distribution", "12.3.2-MariaDB-ubu2404"],
+    ] as const) {
+      test(`labels ${label} from VERSION() and @@version_comment as ${expected}`, async () => {
+        mockExecuteFn = (sql: string) =>
+          sql.trim().toLowerCase().includes("version()")
+            ? Promise.resolve([
+                [{ version, version_comment: comment }],
+                [{ name: "version" }, { name: "version_comment" }],
+              ])
+            : defaultMockExecute(sql);
+
+        provider = new MySQLProvider(makeMySQLConfig());
+        await provider.connect();
+        const overview = await provider.getOverview();
+
+        expect(overview.version).toBe(expected);
+      });
+    }
 
     test("formats uptime correctly", async () => {
       provider = new MySQLProvider(makeMySQLConfig());
@@ -3263,6 +3367,234 @@ describe("MySQLProvider declared column types", () => {
   });
 });
 
+/**
+ * Every column keeps its own value (D3). mysql2's object rows key a value by its column's name, so of
+ * two columns one name declares, the row keeps only the last: measured 2026-10-07 on MySQL 8.4, the
+ * join below answered the customer's id under both `id` headers and the order's id nowhere. The
+ * provider asks for array rows and keys them by `uniqueFieldNames`, so a repeat is `id (2)`. The
+ * fixtures answer the array rows that run measured, so the mock cannot drop a value the driver kept.
+ */
+describe("MySQLProvider result columns", () => {
+  const int = { columnType: 3, characterSet: 63, columnLength: 11, decimals: 0, flags: 0 };
+  const text = { columnType: 252, characterSet: 255, columnLength: 262140, decimals: 0, flags: 16 };
+  const JOIN_SQL = "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id";
+  const join: [unknown, unknown[]] = [
+    [
+      [1, 100, "widget", 100, "Acme"],
+      [2, 200, "gadget", 200, "Globex"],
+    ],
+    [
+      { name: "id", ...int },
+      { name: "customer_id", ...int },
+      { name: "item", ...text },
+      { name: "id", ...int },
+      { name: "name", ...text },
+    ],
+  ];
+  const joinFields = ["id", "customer_id", "item", "id (2)", "name"];
+  const joinRows = [
+    { id: 1, customer_id: 100, item: "widget", "id (2)": 100, name: "Acme" },
+    { id: 2, customer_id: 200, item: "gadget", "id (2)": 200, name: "Globex" },
+  ];
+
+  async function connected() {
+    const provider = new MySQLProvider(makeMySQLConfig());
+    await provider.connect();
+    return provider;
+  }
+
+  test("query() asks mysql2 for array rows and keeps both values of a repeated name", async () => {
+    const query = spyOn(mockConnection, "query");
+    mockExecuteFn = () =>
+      Promise.resolve([
+        [[1, 2]],
+        [
+          { name: "a", ...int },
+          { name: "a", ...text },
+        ],
+      ]);
+    try {
+      const provider = await connected();
+      const result = await provider.query("SELECT 1 AS a, 2 AS a");
+      expect(query.mock.calls.at(-1)).toEqual([{ sql: "SELECT 1 AS a, 2 AS a", rowsAsArray: true }]);
+      expect(result.fields).toEqual(["a", "a (2)"]);
+      expect(result.rows).toEqual([{ a: 1, "a (2)": 2 }]);
+      expect(result.columnTypes).toEqual({ a: "int", "a (2)": "text" });
+      expect(result.rowCount).toBe(1);
+      await provider.disconnect();
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  test("query() names an empty column name, which MySQL answers for SELECT '', and keeps both values", async () => {
+    // Measured on MySQL 8.4: `SELECT '', ''` declares two columns named "" and, read as object
+    // rows, kept one value under the key "".
+    mockExecuteFn = () =>
+      Promise.resolve([
+        [["", ""]],
+        [
+          { name: "", ...text },
+          { name: "", ...text },
+        ],
+      ]);
+    const provider = await connected();
+    const result = await provider.query("SELECT '', ''");
+    expect(result.fields).toEqual(["(No column name)", "(No column name) (2)"]);
+    expect(result.rows).toEqual([{ "(No column name)": "", "(No column name) (2)": "" }]);
+    expect(result.columnTypes).toEqual({ "(No column name)": "text", "(No column name) (2)": "text" });
+    await provider.disconnect();
+  });
+
+  test("query() keeps the order's id and the customer's id of a join apart, over the prepared protocol too", async () => {
+    const execute = spyOn(mockConnection, "execute");
+    mockExecuteFn = () => Promise.resolve(join);
+    try {
+      const provider = await connected();
+      for (const params of [undefined, [1]]) {
+        const result = await provider.query(JOIN_SQL, params);
+        expect(result.fields).toEqual(joinFields);
+        expect(result.rows).toEqual(joinRows);
+        expect(result.columnTypes).toEqual({
+          id: "int",
+          customer_id: "int",
+          item: "text",
+          "id (2)": "int",
+          name: "text",
+        });
+      }
+      expect(execute.mock.calls.at(-1)).toEqual([{ sql: JOIN_SQL, rowsAsArray: true }, [1]]);
+      await provider.disconnect();
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  test("query() numbers the repeated name MySQL gives two unaliased literals", async () => {
+    mockExecuteFn = () =>
+      Promise.resolve([
+        [[1, 1]],
+        [
+          { name: "1", ...int },
+          { name: "1", ...int },
+        ],
+      ]);
+    const provider = await connected();
+    const result = await provider.query("SELECT 1, 1");
+    expect(result.fields).toEqual(["1", "1 (2)"]);
+    expect(result.rows).toEqual([{ "1": 1, "1 (2)": 1 }]);
+    await provider.disconnect();
+  });
+
+  test("queryInTransaction() reads the same way", async () => {
+    mockExecuteFn = (sql) =>
+      Promise.resolve(sql === JOIN_SQL ? join : [{ affectedRows: 0, serverStatus: 3 }, undefined]);
+    const provider = await connected();
+    await provider.beginTransaction();
+    const result = await provider.queryInTransaction(JOIN_SQL);
+    expect(result.fields).toEqual(joinFields);
+    expect(result.rows).toEqual(joinRows);
+    expect(provider.isInTransaction()).toBe(true);
+    await provider.rollbackTransaction();
+    await provider.disconnect();
+  });
+
+  /**
+   * A CALL answers one result set per SELECT the procedure ran and the call's own OK packet last.
+   * Measured 2026-10-07 on MySQL 8.4 with `CALL sys.ps_setup_show_enabled(FALSE, FALSE)`: four sets
+   * and a header, with `fields` one list per set and `undefined` for the header. Before, the list of
+   * sets was read as one set's rows, so the grid had a row per set and a column with no name.
+   */
+  test("a CALL answers its first result set, and every set when it has several", async () => {
+    mockExecuteFn = () =>
+      Promise.resolve([
+        [[[1]], [["EVENT", "%.%"]], { affectedRows: 0, serverStatus: 2 }],
+        [
+          [{ name: "performance_schema_enabled", ...int }],
+          [
+            { name: "object_type", ...text },
+            { name: "objects", ...text },
+          ],
+          undefined,
+        ],
+      ]);
+    const provider = await connected();
+    const result = await provider.query("CALL sys.ps_setup_show_enabled(FALSE, FALSE)");
+    expect(result.fields).toEqual(["performance_schema_enabled"]);
+    expect(result.rows).toEqual([{ performance_schema_enabled: 1 }]);
+    expect(result.rowCount).toBe(1);
+    expect(result.columnTypes).toEqual({ performance_schema_enabled: "int" });
+    expect(result.resultSets).toEqual([
+      {
+        rows: [{ performance_schema_enabled: 1 }],
+        fields: ["performance_schema_enabled"],
+        columnTypes: { performance_schema_enabled: "int" },
+      },
+      {
+        rows: [{ object_type: "EVENT", objects: "%.%" }],
+        fields: ["object_type", "objects"],
+        columnTypes: { object_type: "text", objects: "text" },
+      },
+    ]);
+    await provider.disconnect();
+  });
+
+  test("a CALL with one result set answers it alone, its repeated names numbered", async () => {
+    mockExecuteFn = () =>
+      Promise.resolve([
+        [[[1, 2]], { affectedRows: 0, serverStatus: 2 }],
+        [
+          [
+            { name: "a", ...int },
+            { name: "a", ...int },
+          ],
+          undefined,
+        ],
+      ]);
+    const provider = await connected();
+    const result = await provider.query("CALL two_a()");
+    expect(result.fields).toEqual(["a", "a (2)"]);
+    expect(result.rows).toEqual([{ a: 1, "a (2)": 2 }]);
+    expect(Object.hasOwn(result, "resultSets")).toBe(false);
+    await provider.disconnect();
+  });
+
+  test("several statements that return no result set answer the first one's count", async () => {
+    // Only a connection string that opted into `multipleStatements=true` sends such a text whole.
+    mockExecuteFn = () =>
+      Promise.resolve([
+        [
+          { affectedRows: 3, serverStatus: 2 },
+          { affectedRows: 5, serverStatus: 2 },
+        ],
+        [undefined, undefined],
+      ]);
+    const provider = await connected();
+    const result = await provider.query("INSERT INTO t VALUES (1), (2), (3); DELETE FROM u");
+    expect(result.rows).toEqual([]);
+    expect(result.fields).toEqual([]);
+    expect(result.rowCount).toBe(3);
+    await provider.disconnect();
+  });
+
+  test("a row whose value count differs from the column count is an error, not a guess", async () => {
+    mockExecuteFn = () =>
+      Promise.resolve([
+        [[1]],
+        [
+          { name: "a", ...int },
+          { name: "b", ...int },
+        ],
+      ]);
+    const provider = await connected();
+    const refused = await provider.query("SELECT a, b FROM t").catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(QueryError);
+    expect((refused as QueryError).message).toBe("Row 1 carries 1 values for 2 result columns");
+    expect((refused as QueryError).query).toBe("SELECT a, b FROM t");
+    await provider.disconnect();
+  });
+});
+
 // ============================================================================
 // Non-SELECT statements (the ResultSetHeader shape)
 // ============================================================================
@@ -3820,6 +4152,130 @@ describe("MySQLProvider EXPLAIN grammar probe", () => {
 
     expect(explainProbeCalls()).toEqual([]);
     expect(provider.getCapabilities().explainFormat).toBe("mysql-json");
+  });
+
+  /**
+   * Vitess 25.0.0-SNAPSHOT (`vitess/vttestserver:mysql84`, built 2026-10-08) refuses to explain
+   * a statement that names no table, in both grammars, and explains both against a table of the
+   * keyspace (#1393). Measured 2026-10-09 through vtgate, keyspace `e2e`.
+   */
+  describe("a server that refuses to explain SELECT 1 (#1393)", () => {
+    const TABLE_LOOKUP =
+      "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' LIMIT 1";
+    const vitessKeyspaceRefusal = () =>
+      explainRefusal("VT03031: EXPLAIN is only supported for single keyspace", 1105, "ER_UNKNOWN_ERROR", "HY000");
+
+    /**
+     * Vitess 25's answers: both `SELECT 1` forms refused, the lookup answering `tables`, and any
+     * statement named in `refusals` refused as well.
+     */
+    function keyspaceServer(
+      tables: Record<string, unknown>[] | (() => Error),
+      refusals: Record<string, () => Error> = {},
+    ): (sql: string) => Promise<[unknown[], unknown[]]> {
+      const rest = refusing({
+        "explain format=json select 1": vitessKeyspaceRefusal,
+        "explain select 1": vitessKeyspaceRefusal,
+        ...refusals,
+      });
+      return (sql: string) => {
+        if (sql !== TABLE_LOOKUP) return rest(sql);
+        return typeof tables === "function" ? Promise.reject(tables()) : Promise.resolve([tables, []]);
+      };
+    }
+
+    const lookups = () => protocolCalls.filter((c) => c.sql === TABLE_LOOKUP);
+
+    test("it explains a table of the session's database instead, and keeps mysql-json", async () => {
+      mockExecuteFn = keyspaceServer([{ name: "customers" }]);
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const caps = provider.getCapabilities();
+
+      expect(caps.explainFormat).toBe("mysql-json");
+      expect(caps.supportsExplain).toBe(true);
+      expect(explainProbeCalls().map((c) => c.sql)).toEqual([
+        "EXPLAIN FORMAT=JSON SELECT 1",
+        "EXPLAIN SELECT 1",
+        "EXPLAIN FORMAT=JSON SELECT * FROM `customers` LIMIT 0",
+      ]);
+      expect(lookups()).toHaveLength(1);
+      expect(explainProbeCalls().every((c) => c.method === "query")).toBe(true);
+    });
+
+    test("the table is asked in the same order, so a JSON refusal there lands on mysql-text", async () => {
+      mockExecuteFn = keyspaceServer([{ name: "customers" }], {
+        "explain format=json select * from `customers` limit 0": dorisExplainRefusal,
+      });
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+
+      expect(provider.getCapabilities().explainFormat).toBe("mysql-text");
+      expect(
+        explainProbeCalls()
+          .map((c) => c.sql)
+          .slice(2),
+      ).toEqual(["EXPLAIN FORMAT=JSON SELECT * FROM `customers` LIMIT 0", "EXPLAIN SELECT * FROM `customers` LIMIT 0"]);
+    });
+
+    test("the table's name is quoted as an identifier", async () => {
+      mockExecuteFn = keyspaceServer([{ name: "odd`name" }]);
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+
+      expect(explainProbeCalls().map((c) => c.sql)[2]).toBe("EXPLAIN FORMAT=JSON SELECT * FROM `odd``name` LIMIT 0");
+    });
+
+    test("a database with no base table keeps no Explain and still connects", async () => {
+      mockExecuteFn = keyspaceServer([]);
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const caps = provider.getCapabilities();
+
+      expect(provider.isConnected()).toBe(true);
+      expect(caps.supportsExplain).toBe(false);
+      expect("explainFormat" in caps).toBe(false);
+      expect(explainProbeCalls().map((c) => c.sql)).toEqual(["EXPLAIN FORMAT=JSON SELECT 1", "EXPLAIN SELECT 1"]);
+    });
+
+    test("a lookup the server refuses keeps no Explain and still connects", async () => {
+      mockExecuteFn = keyspaceServer(parseErrorExplainRefusal);
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+
+      expect(provider.isConnected()).toBe(true);
+      expect(provider.getCapabilities().supportsExplain).toBe(false);
+      expect(explainProbeCalls()).toHaveLength(2);
+    });
+
+    test("a server that refuses the table form too keeps no Explain and still connects", async () => {
+      mockExecuteFn = keyspaceServer([{ name: "customers" }], {
+        "explain format=json select * from `customers` limit 0": vitessKeyspaceRefusal,
+        "explain select * from `customers` limit 0": vitessKeyspaceRefusal,
+      });
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+
+      expect(provider.isConnected()).toBe(true);
+      expect(provider.getCapabilities().supportsExplain).toBe(false);
+      expect(explainProbeCalls()).toHaveLength(4);
+    });
+
+    test("a server that explains SELECT 1 is never asked for a table", async () => {
+      mockExecuteFn = refusing({ "explain format=json select 1": dorisExplainRefusal });
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+
+      expect(provider.getCapabilities().explainFormat).toBe("mysql-text");
+      expect(lookups()).toEqual([]);
+    });
   });
 });
 
@@ -4985,41 +5441,118 @@ describe("object surface", () => {
     await provider.disconnect();
   });
 
-  test("the containers are ordered by code point, and TiDB's upper-case schemas are kept as before", async () => {
-    // TiDB 8.5.8 (`pingcap/tidb:v8.5.8`), measured 2026-10-04: SHOW DATABASES answers its own
-    // schemas in upper case, and SCHEMATA's `SCHEMA_NAME` is `utf8mb4_bin` there, so the
-    // former `NOT IN ('information_schema', ...)` never matched them and the tree showed
-    // INFORMATION_SCHEMA, METRICS_SCHEMA and PERFORMANCE_SCHEMA. The filter here is the same
-    // exact-case comparison, so that tree is unchanged, and so is the order: a binary
-    // collation and a code-point sort put upper case first.
+  // What `SHOW DATABASES` answers on a server where a person also created every name some
+  // OTHER engine in the family owns. Measured 2026-10-09 on mysql:8.4 with
+  // lower_case_table_names=0: `CREATE DATABASE` accepts MYSQL, SYS, cluster, memsql, oceanbase
+  // and METRICS_SCHEMA, and refuses INFORMATION_SCHEMA and Performance_Schema (1044).
+  const ENGINE_OWNED_NAMES = [
+    "shop",
+    "INFORMATION_SCHEMA",
+    "information_schema",
+    "METRICS_SCHEMA",
+    "PERFORMANCE_SCHEMA",
+    "performance_schema",
+    "oceanbase",
+    "cluster",
+    "memsql",
+    "clusters",
+    "e2e",
+    "mysql",
+    "MYSQL",
+    "sys",
+    "SYS",
+    "Analytics",
+  ];
+
+  async function containersOn(version: string, versionComment: string): Promise<string[]> {
     mockExecuteFn = async (sql: string) => {
       const normalized = sql.trim().toLowerCase();
-      if (normalized.includes("version()")) return [[{ version: "8.0.11-TiDB-v8.5.8" }], []];
-      if (normalized === "show databases") {
-        return [
-          ["test", "INFORMATION_SCHEMA", "METRICS_SCHEMA", "PERFORMANCE_SCHEMA", "e2e", "mysql", "sys"].map((name) => ({
-            Database: name,
-          })),
-          [],
-        ];
-      }
+      if (normalized.includes("@@version_comment")) return [[{ version_comment: versionComment }], []];
+      if (normalized.includes("version()")) return [[{ version }], []];
+      if (normalized === "show databases") return [ENGINE_OWNED_NAMES.map((name) => ({ Database: name })), []];
       if (normalized.startsWith("select database()")) return [[{ name: "e2e" }], []];
       return [[], []];
     };
     const provider = new MySQLProvider(makeMySQLConfig({ database: "e2e" }));
     await provider.connect();
-
     const containers = await provider.listContainers();
-
-    expect(containers.map((c) => c.name)).toEqual([
-      "INFORMATION_SCHEMA",
-      "METRICS_SCHEMA",
-      "PERFORMANCE_SCHEMA",
-      "e2e",
-      "test",
-    ]);
-    expect(containers.filter((c) => c.isSessionDefault).map((c) => c.name)).toEqual(["e2e"]);
     await provider.disconnect();
+    return containers.map((c) => c.name);
+  }
+
+  // Ordered by code point, so upper case sorts before lower case and `Analytics` leads.
+  test("on stock MySQL, hides only the reserved schemas and keeps every other engine's names as user databases", async () => {
+    expect(await containersOn("8.4.6", "MySQL Community Server - GPL")).toEqual([
+      "Analytics",
+      "METRICS_SCHEMA",
+      "MYSQL",
+      "SYS",
+      "cluster",
+      "clusters",
+      "e2e",
+      "memsql",
+      "oceanbase",
+      "shop",
+    ]);
+  });
+
+  test("on TiDB, hides the upper-case INFORMATION_SCHEMA, PERFORMANCE_SCHEMA and METRICS_SCHEMA (#1428)", async () => {
+    // Measured on TiDB v8.5.1 and v8.5.8: all three are answered in upper case.
+    expect(
+      await containersOn(
+        "8.0.11-TiDB-v8.5.1",
+        "TiDB Server (Apache License 2.0) Community Edition, MySQL 8.0 compatible",
+      ),
+    ).toEqual(["Analytics", "MYSQL", "SYS", "cluster", "clusters", "e2e", "memsql", "oceanbase", "shop"]);
+  });
+
+  test("on OceanBase, hides its own oceanbase database (#1428)", async () => {
+    expect(await containersOn("5.7.25-OceanBase_CE-v4.4.2.1", "OceanBase_CE 4.4.2.1")).toEqual([
+      "Analytics",
+      "METRICS_SCHEMA",
+      "MYSQL",
+      "SYS",
+      "cluster",
+      "clusters",
+      "e2e",
+      "memsql",
+      "shop",
+    ]);
+  });
+
+  for (const [label, reply] of [
+    ["refused", "refuse"],
+    ["NULL", null],
+  ] as const) {
+    test(`a ${label} @@version_comment leaves the engine unmeasured, so cluster and memsql stay listed`, async () => {
+      mockExecuteFn = async (sql: string) => {
+        const normalized = sql.trim().toLowerCase();
+        if (normalized.includes("@@version_comment")) {
+          if (reply === "refuse") throw Object.assign(new Error("Unknown system variable"), { errno: 1193 });
+          return [[{ version_comment: reply }], []];
+        }
+        if (normalized.includes("version()")) return [[{ version: "5.7.32" }], []];
+        if (normalized === "show databases")
+          return [["cluster", "memsql", "e2e"].map((name) => ({ Database: name })), []];
+        if (normalized.startsWith("select database()")) return [[{ name: "e2e" }], []];
+        return [[], []];
+      };
+      const provider = new MySQLProvider(makeMySQLConfig({ database: "e2e" }));
+      await provider.connect();
+      expect((await provider.listContainers()).map((c) => c.name)).toEqual(["cluster", "e2e", "memsql"]);
+      await provider.disconnect();
+    });
+  }
+
+  test("on SingleStore, recognised by @@version_comment, hides cluster and memsql (#1428)", async () => {
+    // Measured on singlestoredb-dev 0.2.82 (SingleStore 9.1.1): VERSION() is a plain 5.7.32,
+    // so the comment is the only thing naming the engine.
+    expect(
+      await containersOn(
+        "5.7.32",
+        "SingleStoreDB source distribution (compatible; MySQL Enterprise & MySQL Commercial)",
+      ),
+    ).toEqual(["Analytics", "METRICS_SCHEMA", "MYSQL", "SYS", "clusters", "e2e", "oceanbase", "shop"]);
   });
 
   test("nothing nests under a database", async () => {

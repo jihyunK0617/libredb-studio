@@ -181,10 +181,12 @@ with no `;`, which is the half of that measurement the engine cares about. The O
 was removed with the bound, because once there is no `FETCH FIRST` to spell it did nothing the
 shared return does not already do.
 
-It bounds the GENERATORS only. A `;` a user types after a plain statement is still stripped by the
-editor's statement reader before the statement is sent, and the raw API passes text through untouched.
-The one `;` the reader keeps is the one after a PL/SQL unit's `END`, which is part of the unit
-([§5.1](#51-execution)).
+It bounds the generators, and it also tells the editor to read a one-statement selection through
+the statement reader (#1414). A `;` a user types after a plain statement is stripped by that reader
+before the statement is sent: with the caret in the statement on every engine, and, because of this
+declaration, also when the statement is selected; a multi-statement selection is still sent as
+selected. The raw API passes text through untouched. The one `;` the reader keeps is the one after a
+PL/SQL unit's `END`, which is part of the unit ([§5.1](#51-execution)).
 
 ### 3.3 Schema introspection reads the `ALL_*` views, and is not owner-scoped
 
@@ -506,6 +508,23 @@ and returns:
 ```ts
 { rows, fields: metaData.map(m => m.name), rowCount: rows.length, executionTime, columnTypes? }
 ```
+
+**Column names.** Every column reaches the grid named, and under a name no other column of the result has, by the driver's own doing.
+An unaliased expression is named by its text (`SELECT 1+1 FROM dual` answers `1+1`), and an empty alias is refused by the server (`SELECT 1 AS "" FROM dual` fails with `ORA-01741: illegal zero-length identifier`).
+A repeated name is numbered by node-oracledb itself, in `metaData` and before any row is keyed (`_setup` in `oracledb/lib/impl/resultset.js`, 6.10.0): the first column keeps the name, a repeat takes `NAME_1`, `NAME_2`, and a number skips a name the statement declares.
+Measured on 2026-10-07 against Oracle XE with that driver, the same in `OUT_FORMAT_OBJECT` and `OUT_FORMAT_ARRAY`:
+
+| statement | names | row |
+|---|---|---|
+| `SELECT 1 AS a, 2 AS a FROM dual` | `A`, `A_1` | `{ A: 1, A_1: 2 }` |
+| `SELECT 1 AS a, 2 AS a, 3 AS a_1 FROM dual` | `A`, `A_2`, `A_1` | `{ A: 1, A_2: 2, A_1: 3 }` |
+| a join projecting `user_id` from both sides of `all_users` | `USER_ID`, `USER_ID_1` | both values |
+| `SELECT 1+1, 1+1 FROM dual` | `1+1`, `1+1_1` | both values |
+
+So no value is lost, and the provider keys rows by the names the driver gives rather than through `uniqueFieldNames`.
+The declared names are not gone: the driver hands each column to the call's `fetchTypeHandler` under its declared name before it renames it, though only for a statement it does not serve from its statement cache.
+Rebuilding the shared `name (2)` form from them was tried and left out: it would take a statement-cache miss on every editor statement, and a `CURSOR(...)` column read as arrays loses the names of its nested columns.
+So a repeat reads `NAME_1`, which data masking and the inline-edit refusal do not read as a repeat of `NAME`.
 
 A `SELECT` answers with a `rows` array and `rowCount` is `rows.length`. A non-`SELECT`
 (INSERT/UPDATE/DELETE/DDL/PL/SQL) carries **no `rows` array at all**, and that absence is what
@@ -914,6 +933,7 @@ about which fields of the `Date` are the value:
 | `TIMESTAMP WITH TIME ZONE`, `TIMESTAMP WITH LOCAL TIME ZONE` | `FROM_TZ(TO_TIMESTAMP('2026-08-24 17:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC')` — the **UTC** instant |
 | `DATE`, holding the provider's text (#1131) | `TO_DATE('2026-09-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')`, the **text** itself |
 | `TIMESTAMP` or `TIMESTAMP(n)`, holding the provider's text (#1131) | `TO_TIMESTAMP('2026-09-01 10:30:00.345', 'YYYY-MM-DD HH24:MI:SS.FF')`, the **text** itself, `.FF` only when it has a fraction |
+| `TIMESTAMP[(n)] WITH [LOCAL] TIME ZONE`, holding a `Date`'s ISO text, as over HTTP (#1224) | `FROM_TZ(TO_TIMESTAMP('2026-08-24 17:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC')`, the **same literal** the `Date` of that instant gets |
 
 - **The provider's own text for a naive column (#1131).** The provider reads a `DATE` and a `TIMESTAMP`
   as their wall clock ([§5.3](#a-date-and-a-timestamp-read-as-the-stored-wall-clock-in-every-server-time-zone-1131)),
@@ -926,7 +946,29 @@ about which fields of the `Date` are the value:
     text, and converting it would store the NLS rendering of a timestamp in its place.
   - A value not in that form, a `DATE` text with a fraction included.
 
-  So the `Date` rows above now apply only to a host that builds its rows itself.
+  So the naive `Date` rows above now apply only to a host that builds its rows itself.
+- **A zoned column's ISO text, over HTTP (#1224).** The provider leaves `TIMESTAMP WITH TIME ZONE` and
+  `WITH LOCAL TIME ZONE` as the driver's `Date`, so in-process the export gets the zoned `Date` row
+  above. Over HTTP the row has been through JSON (`POST /api/db/query`), and the cell is that `Date`'s
+  `toISOString` text, `2026-09-01T07:30:00.000Z`. Quoted, Oracle reads it through the session's
+  `NLS_TIMESTAMP_TZ_FORMAT` and refuses it: `ORA-01843: An invalid month was specified`. So for a
+  column declared `TIMESTAMP[(n)] WITH [LOCAL] TIME ZONE`, text in exactly that form
+  (`YYYY-MM-DDTHH:MM:SS.sssZ`) is parsed back to its `Date` and written by the same code as the `Date`,
+  but only when that `Date` writes the same text back. The literal is built from the parsed fields,
+  never from the text. The live script ([§12.4](#124-optional-verifying-against-a-live-oracle)) replays
+  both zoned types this way under `Europe/Istanbul`, and the server calls every row equal. Three things
+  stay quoted as text:
+  - The same text in a column not declared a zoned timestamp: `TIMESTAMP`, `DATE`, `VARCHAR2`, or no
+    declared type.
+  - Other text in a zoned column: `+00:00` in place of `Z`, no fraction or more than three digits of
+    one, a space in place of `T`, and text that has the form but is not what `toISOString` writes for
+    any instant, such as `2026-02-30T00:00:00.000Z` or `T24:00:00.000Z`.
+  - A year outside 0000–9999, which `toISOString` writes with a sign and six digits
+    (`-000044-03-15T10:30:00.000Z`, `+012026-…`). Oracle has no year after 9999, and a BC instant does
+    not replay through the `Date` path either: measured, its literal is
+    `FROM_TZ(TO_TIMESTAMP('0-44-03-15 10:30:00.000', …), 'UTC')`, refused with `ORA-01843`. So that
+    text stays quoted, and Oracle still refuses it (`ORA-01847`), rather than take a literal the `Date`
+    of the same instant does not get.
 - **Local fields for a naive column**, because that is the inverse of what the driver did: it built
   the `Date` by reading the stored wall clock in the *Node process's* zone. Measured above, a `DATE`
   holding `2026-08-24 10:11:12` arrives as `2026-08-24T07:11:12.000Z` from a process at `+03:00`, so
@@ -2136,6 +2178,7 @@ is what lets the Operations tab render those words and send an operation Oracle 
 | `supportsExternalQueryLimiting` | `true` (from base) |
 | `supportsCreateTable` | `true` (from base) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core Oracle DML |
+| `supportsTestDataGeneration` | `true` - the row menus offer Generate Test Data on tables, which writes one multi-row `INSERT INTO ... VALUES` |
 | `supportsResultPagination` | `true` — `OFFSET m ROWS FETCH NEXT n ROWS ONLY` from this provider's own `prepareQuery` override; page one is `FETCH FIRST n ROWS ONLY` (#816) |
 | `supportsTransactions` | `true` — Oracle is always in a transaction and the held connection commits or rolls back, so the trio and the SANDBOX toggle are offered (#464) |
 | `implicitCommitStatements` | `ALTER`, `ANALYZE`, `ASSOCIATE`, `AUDIT`, `COMMENT`, `CREATE`, `DISASSOCIATE`, `DROP`, `FLASHBACK`, `GRANT`, `NOAUDIT`, `PURGE`, `RENAME`, `REVOKE`, `TRUNCATE`: Oracle's DDL, which "implicitly commits the current transaction before and after every DDL statement" (SQL Language Reference, "Types of SQL Statements"). Plus `BEGIN`, `DECLARE` and `CALL`: a PL/SQL block or a procedure can commit through `EXECUTE IMMEDIATE` or its own `COMMIT`. SANDBOX refuses all of these before sending, because a `ROLLBACK` after one answers success and can undo nothing, and this provider reads no transaction state back from the server to notice afterwards, so the declaration is the only guard here. `COMMIT`, `ROLLBACK` and `ABORT` are refused on every engine |
@@ -2276,7 +2319,8 @@ the `DATE`/`TIMESTAMP` reading against the server itself. It reads a throwaway t
 provider under `UTC`, `Europe/Istanbul` and `America/Los_Angeles` AND as the server's own `TO_CHAR`,
 and requires the two to agree. It also checks that `TIMESTAMP WITH TIME ZONE` stays an instant, that
 the raw driver value is still the shifted `Date` the conversion compensates for, and that the SQL
-INSERT export of the read replays to values the server calls equal. Supply the password configured on
+INSERT export of the read, put through JSON as over HTTP, replays to values the server calls equal,
+`TIMESTAMP WITH TIME ZONE` and `WITH LOCAL TIME ZONE` included (#1224). Supply the password configured on
 the container:
 
 ```bash

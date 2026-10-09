@@ -384,7 +384,13 @@ an IPv6 address that refuses every connection, and the install notes warn about 
 
 `operator/` packages the published Helm chart as a codeless helm-operator
 (operator-sdk helm plugin): a `LibreDBStudio` custom resource whose spec mirrors
-the chart values. Publishing works in two stages:
+the chart values.
+
+The one value the spec does not mirror is `extraObjects`, which the CRD refuses with a CEL rule (#1526).
+The operator applies the release with its own cluster-wide service account, so a manifest listed there would be created with the operator's permissions instead of those of whoever wrote the resource, and the editor role is meant to grant no RBAC.
+Plain Helm applies a release with the installer's own credentials, and Argo CD within the limits of its AppProject, so the chart offers the value there.
+
+Publishing works in two stages:
 
 - **Controller image** — `.github/workflows/operator-release.yml` builds and
   pushes `ghcr.io/libredb/libredb-studio-operator:<version>` (amd64+arm64) on
@@ -1185,8 +1191,8 @@ They are documented here rather than under `deploy/<provider>/` because neither 
 this repo: the Sealos template lives upstream in
 [`labring-actions/templates`](https://github.com/labring-actions/templates) and the Unraid template
 in [`libredb/unraid-templates`](https://github.com/libredb/unraid-templates), and neither has a
-`deploy/<provider>/` folder here at all. They are two of the eight catalog channels with no such
-folder - the others are TrueNAS SCALE, CasaOS, the three open submissions (Umbrel, Easypanel,
+`deploy/<provider>/` folder here at all. They are two of the nine catalog channels with no such
+folder - the others are TrueNAS SCALE, CasaOS, the [Dokku plugin](#dokku-plugin), the three open submissions (Umbrel, Easypanel,
 Portainer) and Google Cloud Marketplace, whose artefacts live in Google's Producer Portal. The
 catalog channels that DO keep a folder keep their notes in `deploy/<provider>/README.md` - CapRover and Railway alongside the source
 descriptor itself, Dokploy, Kubero and Cosmos as notes only, since those three descriptors are also
@@ -1243,6 +1249,24 @@ provisions compute, networking, storage and ingress, so there is nothing to inst
 - Bumps go in as a template PR to `labring-actions/templates`. That repo's default branch is
   **`kb-0.9`**, not `main` or `master`, which is what both the drift-check pin URL and any bump PR
   must target.
+
+## Dokku plugin
+
+Listed on Dokku's [community plugins page](https://dokku.com/docs/community/plugins/) since 2026-10-08 ([dokku/dokku#9116](https://github.com/dokku/dokku/pull/9116)).
+Dokku has no application catalog, so the channel is a Dokku plugin, [`libredb/dokku-libredb-studio`](https://github.com/libredb/dokku-libredb-studio), rather than a template.
+On the Dokku host:
+
+```bash
+sudo dokku plugin:install https://github.com/libredb/dokku-libredb-studio.git
+dokku libredb-studio:install
+dokku letsencrypt:enable libredb-studio
+```
+
+`libredb-studio:install` creates the `libredb-studio` app, deploys a pinned image tag, connects Studio to every `postgres`, `mysql`, `mariadb`, `mongo` and `redis` service on the host, and prints the admin login.
+Services created or destroyed later are added to or removed from Studio by the plugin, through the [seed connection file](SEED_CONNECTIONS.md) Studio re-reads, with no restart.
+The login cookie is Secure, hence the `letsencrypt` step; flags, the network model and password recovery are in the plugin's README.
+
+The plugin is LibreDB-owned, so a version bump is a commit and a release in that repo, not a PR here or upstream.
 
 ## Google Cloud Marketplace
 
@@ -1455,6 +1479,7 @@ setups still publish the rest:
 | `OPERATOR_CATALOG_TOKEN` | The `submit-catalogs` job in `operator-release.yml`: bundle PRs to `k8s-operatorhub/community-operators` and `redhat-openshift-ecosystem/community-operators-prod`. Classic PAT with `public_repo` on an account in the operator's upstream `ci.yaml` reviewers list, because that login is what upstream authorizes | Catalog submission skipped with a notice |
 | `AUR_SSH_PRIVATE_KEY` | The aur job: render, build and `git push` of `libredb-studio-bin` to `ssh://aur@aur.archlinux.org/libredb-studio-bin.git`. The private half of the SSH key registered on the project's AUR account (`channels@libredb.org`). Runs only while the `aur` channel is `live` | AUR push skipped |
 | `WINGETCREATE_GITHUB_TOKEN` | The winget job: `wingetcreate update --submit` PRs to `microsoft/winget-pkgs`. Classic PAT with `public_repo` scope — wingetcreate does not support fine-grained PATs | winget submission skipped |
+| `CAPROVER_CATALOG_TOKEN` | `caprover-fork.yml`: fast-forwarding the `libredb/caprover-one-click-apps` fork, creating it first when `update.fork.mode` is `create_or_update`, and pushing the `libredb-studio-<version>` branch a member opens the CapRover catalog PR from. For `mode: update`, a fine-grained PAT with access to `libredb/caprover-one-click-apps` only and Contents read and write; `create_or_update` also needs GitHub's fork endpoint (Administration write on the org's repositories). See [Staging an upstream catalog change on a fork](#staging-an-upstream-catalog-change-on-a-fork) | The workflow validates the templates and pushes nothing |
 
 The chocolatey and winget jobs run strictly **after** `publish-release`: both channels download
 the zip from the release URL, which is public only once the release is published. A failure there
@@ -1760,20 +1785,20 @@ instead keep whatever they own under `deploy/<provider>/`, because the consumabl
 an external catalog. Only **CapRover** and **Railway** own a source descriptor there
 (`deploy/caprover/libredb-studio.yml`, `deploy/railway/template.json`): the in-repo file is the
 source that gets pushed or PR'd upstream, which is why Railway is pinned `local_file`. CapRover is
-pinned `remote_file` even so - that pin must measure what the catalog actually serves, which leaves
-its in-repo descriptor unmeasured by any gate
-([#268](https://github.com/libredb/libredb-studio/issues/268)); it fell 45 patch versions behind the
-catalog before anyone noticed. **Dokploy**, **Kubero** and **Cosmos** keep only a README there -
+pinned `remote_file` even so - that pin must measure what the catalog actually serves - and its two
+in-repo templates are held to `package.json` by `chart:check` instead: they once fell 45 patch
+versions behind the catalog before anyone noticed
+([#268](https://github.com/libredb/libredb-studio/issues/268)), and `chart:bump` now moves them with
+every release. **Dokploy**, **Kubero** and **Cosmos** keep only a README there -
 their descriptors are authored in the upstream catalog repo, so all three are pinned `remote_file`
-and a bump is an upstream PR with nothing to change here. **Eight catalog channels keep no
+and a bump is an upstream PR with nothing to change here. **Several catalog channels keep no
 descriptor here at all.** Two of them are pinned `remote_file` against the repository that does
 hold it — the Sealos template in `labring-actions/templates`, the Unraid CA template in
 `libredb/unraid-templates` — and both are documented under
 [App catalogs](#app-catalogs-unraid-sealos); TrueNAS SCALE is pinned the same way against
 `truenas/apps`, and CasaOS against `IceWhaleTech/CasaOS-AppStore`. The three open submissions (Umbrel, Easypanel, Portainer) have nothing to
 pin until their upstream PR merges, and each entry's note names the pin to add on that day.
-[Google Cloud Marketplace](#google-cloud-marketplace) is the one with nothing to pin even in
-principle: its artefacts are held in Google's Producer Portal and a private Artifact Registry.
+[Google Cloud Marketplace](#google-cloud-marketplace) and [Railyard](https://railyard.run/templates/libredb-studio) have nothing to pin even in principle: Google holds the artefacts in its Producer Portal and a private Artifact Registry, and Railyard keeps the template on its own side and says it builds `main` at deploy time.
 Neither Fly.io nor
 Render has a marketplace or template gallery to publish into, which is why the repo file itself is the
 deliverable (`pin.strategy: local_file` for the version-pinned `fly.toml`; `none` for
@@ -1786,6 +1811,29 @@ report without blocking a release. Snapshot builds and Vendor Portal updates
 stay manual and on demand; every successful `publish-release` job adds a
 versioned build, test, submit and verify checklist to its summary. See the
 [DigitalOcean build guide](../deploy/digitalocean/README.md).
+
+#### Staging an upstream catalog change on a fork
+
+Some catalogs take a version bump only as a pull request that a person tested, so release CI prepares the change and stops short of the pull request.
+`update.fork` in `channels.yaml` holds what the workflow may do for such a channel.
+The set of channels that carry it is `FORK_STAGED_CHANNEL_IDS` in [`scripts/distribution-check.mjs`](../scripts/distribution-check.mjs), and like `ci_enabled` the field is required there and rejected everywhere else.
+
+```yaml
+  - id: caprover-official
+    update:
+      method: upstream_pr
+      sla: on_demand
+      fork:
+        mode: update   # or create_or_update: create a missing fork in the libredb org first
+        push: auto     # or manual: a release run validates only, and a member pushes by hand
+```
+
+CapRover is the one such channel.
+Its catalog's maintainer keeps bumps manual ([caprover/one-click-apps#1334](https://github.com/caprover/one-click-apps/pull/1334#issuecomment-5717266315)), so [`caprover-fork.yml`](../.github/workflows/caprover-fork.yml) stages both templates on `libredb/caprover-one-click-apps` after each release, and a member opens the pull request after testing them; [deploy/caprover/README.md](../deploy/caprover/README.md#releasing-to-the-official-catalog) has the steps.
+`docker-build-push.yml` dispatches it once the release images passed their channel E2E.
+The workflow reads the settings with `distribution-check.mjs --fork-outputs caprover-official`, pushes only for a `live` channel, and needs the `CAPROVER_CATALOG_TOKEN` secret; without it a run validates and pushes nothing.
+It stages the release tag's templates unchanged, because `chart:bump` moves their version with `package.json` and `chart:check` holds every commit to it.
+A prerelease is never staged: while `package.json` carries one, `chart:bump` leaves the templates on the last stable version, and the dispatch skips a tag with a suffix.
 
 ### Manual steps still open
 

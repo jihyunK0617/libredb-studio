@@ -34,18 +34,18 @@ channel count.
 
 ## Coverage snapshot
 
-**42 channels · 34 live · 7 pending · 1 deprecated**
+**45 channels · 38 live · 6 pending · 1 deprecated**
 
-Live channels by platform: **Linux 9 · macOS 3 · Windows 5 · Container 6 · Kubernetes 4 · Cloud 13**
+Live channels by platform: **Linux 9 · macOS 3 · Windows 5 · Container 6 · Kubernetes 5 · Cloud 16**
 
 | Category | Live | Pending | Deprecated |
 | --- | ---: | ---: | ---: |
 | Registries & releases | 2 | 0 | 0 |
 | Containers | 2 | 0 | 0 |
-| Kubernetes & operators | 3 | 1 | 0 |
+| Kubernetes & operators | 4 | 0 | 0 |
 | Package managers | 6 | 1 | 1 |
 | OS / desktop packages | 3 | 0 | 0 |
-| PaaS catalogs (listed) | 11 | 3 | 0 |
+| PaaS catalogs (listed) | 14 | 3 | 0 |
 | Deploy recipes | 3 | 0 | 0 |
 | Cloud marketplaces | 4 | 2 | 0 |
 
@@ -64,7 +64,7 @@ Live channels by platform: **Linux 9 · macOS 3 · Windows 5 · Container 6 · K
 | [Helm chart](https://artifacthub.io/packages/helm/libredb-studio/libredb-studio) | Kubernetes & operators | Kubernetes | live | Automated, every release | [HELM_CHART.md](HELM_CHART.md) |
 | [OperatorHub / OpenShift](https://operatorhub.io/operator/libredb-studio-operator) | Kubernetes & operators | Kubernetes | live | Automated PR, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Rancher Partner Charts](https://www.suse.com/pcsc/viewVersionPage?versionID=26969) | Kubernetes & operators | Kubernetes | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
-| [ZopDev Helm Charts](https://github.com/zopdev/helm-charts) | Kubernetes & operators | Kubernetes | pending | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [ZopDev Helm Charts](https://helm.zop.dev) | Kubernetes & operators | Kubernetes | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Chocolatey](https://community.chocolatey.org/packages/libredb-studio) | Package managers | Windows | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [FlatPark (Flatpak)](https://flatpark.org/) | Package managers | Linux | live | Manual, every release | [packaging/flatpark/README.md](../packaging/flatpark/README.md) |
 | [Homebrew tap](https://github.com/libredb/homebrew-tap) | Package managers | Linux, macOS | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
@@ -76,13 +76,16 @@ Live channels by platform: **Linux 9 · macOS 3 · Windows 5 · Container 6 · K
 | [Desktop app (AppImage, .deb)](https://github.com/libredb/libredb-studio/releases/latest) | OS / desktop packages | Linux | live | Automated, every release | [desktop/README.md](../desktop/README.md) |
 | [AppImageHub](https://github.com/libredb/libredb-studio/releases/latest) | OS / desktop packages | Linux | live | Manual, on demand | [desktop/README.md](../desktop/README.md) |
 | [Linux .deb / .rpm](https://github.com/libredb/libredb-studio/releases/latest) | OS / desktop packages | Linux | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [CapRover auto-connect](https://github.com/caprover/one-click-apps) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/caprover/README.md](../deploy/caprover/README.md) |
 | [CapRover official](https://github.com/caprover/one-click-apps) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/caprover/README.md](../deploy/caprover/README.md) |
 | [CasaOS App Store](https://github.com/IceWhaleTech/CasaOS-AppStore) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Cosmos servapp marketplace](https://github.com/azukaar/cosmos-servapps-official) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/cosmos/README.md](../deploy/cosmos/README.md) |
+| [Dokku plugin](https://dokku.com/docs/community/plugins/) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Dokploy template catalog](https://templates.dokploy.com) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/dokploy/README.md](../deploy/dokploy/README.md) |
 | [Kubero template catalog](https://www.kubero.dev/templates) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/kubero/README.md](../deploy/kubero/README.md) |
 | [1Panel community store](https://github.com/okxlin/appstore/tree/localApps/apps/libredb-studio) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Railway one-click template](https://railway.com/deploy/libredb-studio) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/railway/PUBLISH.md](../deploy/railway/PUBLISH.md) |
+| [Railyard template catalog](https://railyard.run/templates/libredb-studio) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Sealos App Store template](https://sealos.io/products/app-store/libredb-studio) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [TrueNAS SCALE apps](https://apps.truenas.com/catalog/libredb-studio_community/) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Unraid Community Apps](https://ca.unraid.net/apps/libredb-studio-0a5x41a1cy1kay) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
@@ -110,7 +113,6 @@ requests with `bun run distribution:matrix --check`.
 
 Not counted here, and why. **Alibaba Cloud** is not being pursued. **Coolify**
 declined the submission: its maintainers accept service templates only from
-projects above 1000 GitHub stars. **Dokku** has no application catalog to apply
-to. A row appears above as soon as there is something to track — a submission,
-or a descriptor in this repo that a workflow reads — and stays `pending` until
-the product can be installed from that channel, when it becomes `live`.
+projects above 1000 GitHub stars. A row appears above as soon as there is
+something to track — a submission, or a descriptor in this repo that a workflow
+reads — and stays `pending` until the product can be installed from that channel, when it becomes `live`.

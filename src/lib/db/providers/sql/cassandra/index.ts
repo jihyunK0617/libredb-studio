@@ -23,8 +23,10 @@
  *   after the first can be requested, and asking is REFUSED rather than answered
  *   with page one.
  * - `ALLOW FILTERING` IS THE LAST CLAUSE. `… LIMIT 3 ALLOW FILTERING` returns rows;
- *   `… ALLOW FILTERING LIMIT 3` is a syntax error. The shared limiter appends, so the
- *   two clauses are transposed.
+ *   `… ALLOW FILTERING LIMIT 3` is a syntax error. The clause is declared in the
+ *   grammar as one that must FOLLOW the row bound, so the shared limiter places the
+ *   bound before it (#1398); ScyllaDB's `BYPASS CACHE` and `USING TIMEOUT`, which
+ *   share this type-id, come from the same declaration.
  * - A LINE COMMENT NEEDS A NEWLINE TO CLOSE IT. `SELECT … LIMIT 3 -- note` with
  *   nothing after it is "line 1:45 mismatched character '<EOF>' expecting set null",
  *   and `-- note\n` returns rows. `sql.trim()` inside the shared limiter drops that
@@ -104,6 +106,7 @@ import {
   describeObjects as readObjectDetails,
   readObjectSource as readSource,
   listContainers as readContainers,
+  readEngineKeyspaces,
   listObjects as readObjects,
 } from "./objects";
 import { CassandraTransportError, type CassandraTransport } from "./transport";
@@ -120,18 +123,6 @@ import { CassandraTransportError, type CassandraTransport } from "./transport";
  * catalog after one is a cost for nothing. `INSERT` is absent for the same reason.
  */
 const SCHEMA_REFRESH_PATTERN = "\\b(CREATE|DROP|ALTER)\\b";
-
-/**
- * `ALLOW FILTERING` at the very end of a statement, followed by the bound the shared
- * limiter just appended.
- *
- * The inner whitespace is captured rather than normalised, so transposing the two
- * clauses does not silently reformat the user's own statement. This only ever runs on
- * a statement the limiter REWROTE, so the `LIMIT n` it matches is always the appended
- * one: a statement carrying its own bound is returned untouched before this is
- * reached, and CQL has no subquery for a second `ALLOW FILTERING` to hide in.
- */
-const APPENDED_AFTER_ALLOW_FILTERING = /\bALLOW(\s+)FILTERING\s+(LIMIT\s+\d+)/i;
 
 // ============================================================================
 // Pure helpers
@@ -202,6 +193,7 @@ export class CassandraProvider extends SQLBaseProvider {
    * connection object never carries the previous server's answer.
    */
   private facts: CassandraServerFacts | null;
+  private engineKeyspaces: readonly string[] = [];
 
   /**
    * The transport is injectable, and this is the only production-visible seam: the
@@ -255,6 +247,7 @@ export class CassandraProvider extends SQLBaseProvider {
       // real table - is "Some partition key parts are missing: id". Editing a key
       // column is refused outright ("PRIMARY KEY part id found in SET part").
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
       // CQL has no `OFFSET` clause. `prepareQuery` below THROWS on any positive offset
       // rather than answering a page request with page one, and this flag is what keeps
       // the editor from provoking that refusal in the first place (#816).
@@ -348,8 +341,13 @@ export class CassandraProvider extends SQLBaseProvider {
    *    the editor appends it to what it already shows - duplicate rows presented as
    *    new ones, which is a wrong ANSWER. `search/index.ts` refuses Elasticsearch's
    *    identical gap the same way.
-   * 2. `ALLOW FILTERING` must stay the last clause, so the appended bound is moved in
-   *    front of it. Measured both ways: `… LIMIT 3 ALLOW FILTERING` returns rows,
+   * 2. `ALLOW FILTERING` - like ScyllaDB's `BYPASS CACHE` and `USING TIMEOUT` - is
+   *    declared in the grammar as a clause that must FOLLOW the row bound, and the
+   *    shared limiter places the bound before it (#1398). This provider used to
+   *    transpose the two clauses itself after the fact, which also failed to read
+   *    `… LIMIT 3 ALLOW FILTERING` as an existing bound and emitted
+   *    `LIMIT 3 LIMIT 500 ALLOW FILTERING`; both halves now come from the one
+   *    declaration. Measured both ways: `… LIMIT 3 ALLOW FILTERING` returns rows,
    *    `… ALLOW FILTERING LIMIT 3` is "line 1:60 mismatched input 'LIMIT' expecting
    *    EOF".
    * 3. A statement that would END inside a line comment is left alone. The limiter
@@ -387,10 +385,7 @@ export class CassandraProvider extends SQLBaseProvider {
     const grammar = resolveSqlGrammar(this.type);
     if (endsInsideLineComment(prepared.query, grammar)) return { ...prepared, query, wasLimited: false };
 
-    return {
-      ...prepared,
-      query: prepared.query.replace(APPENDED_AFTER_ALLOW_FILTERING, "$2 ALLOW$1FILTERING"),
-    };
+    return prepared;
   }
 
   // ==========================================================================
@@ -443,6 +438,9 @@ export class CassandraProvider extends SQLBaseProvider {
       // reads key their degradation on instead of the wording of a refusal. It never
       // throws, so it cannot turn a working connection into a failed one.
       this.facts = await readServerFacts(transport);
+      // Which keyspaces this engine owns beyond Cassandra's, which the keyspace tree hides
+      // (#1428). One more statement per connection, and a refusal answers none.
+      this.engineKeyspaces = await readEngineKeyspaces(transport);
     } catch (error) {
       // `connect()` opens a pool with sockets and reconnection timers behind it, and
       // the identity read runs AFTER that - so a probe that fails leaks the pool
@@ -462,6 +460,7 @@ export class CassandraProvider extends SQLBaseProvider {
     const transport = this.transport;
     this.transport = null;
     this.facts = null;
+    this.engineKeyspaces = [];
     if (transport !== null) await transport.close();
     this.setConnected(false);
   }
@@ -672,7 +671,7 @@ export class CassandraProvider extends SQLBaseProvider {
    */
   public async listContainers(parent?: readonly string[]): Promise<Container[]> {
     const transport = this.requireTransport();
-    return this.guarded(() => readContainers(transport, this.config.database ?? "", parent));
+    return this.guarded(() => readContainers(transport, this.config.database ?? "", this.engineKeyspaces, parent));
   }
 
   public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {

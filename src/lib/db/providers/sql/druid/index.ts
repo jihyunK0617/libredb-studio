@@ -222,6 +222,7 @@ export class DruidProvider extends SQLBaseProvider {
       // rejected with `Unsupported SQL statement [UPDATE]`. Druid SQL has no
       // row-level DML at all - a datasource changes through ingestion.
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
       // `LIMIT n OFFSET m` from the shared limiter; Druid SQL accepts both clauses.
       supportsResultPagination: true,
       // Druid SQL has no DML at all, so nothing to wrap.
@@ -443,6 +444,12 @@ export class DruidProvider extends SQLBaseProvider {
    * server named no exception code.
    */
   private mapDruidError(error: unknown, sql?: string): Error {
+    // A connection that never opened is a connection problem. Its message says
+    // "timed out", which the shared message-based mapping would read as a slow
+    // query and answer with query advice, so the transport's kind decides first.
+    if (error instanceof DruidTransportError && error.failure === "timed-out") {
+      return new ConnectionError(error.message, this.type, this.config.host, this.config.port);
+    }
     if (!(error instanceof DruidTransportError) || error.category === DRUID_TRANSPORT_FAILURE) {
       return this.mapError(error, sql);
     }

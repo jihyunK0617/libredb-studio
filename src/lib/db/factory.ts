@@ -37,8 +37,8 @@ import * as path from "path";
  *   provider pass the editor file-access posture `editorExecutionContext` derived from
  *   the verified session and the resolved connection. Providers whose read-only boundary
  *   is established at OPEN time read `readOnly` (SQLite); DuckDB additionally reads
- *   `allowExternalFileAccess` on its editor handle; the rest establish theirs per
- *   statement and ignore both. ABSENT MEANS DENY: called without a context, as an
+ *   `allowExternalFileAccess` on its editor handle, and SQLite refuses to open at all when it is
+ *   `false`, a profiled handle included; the rest establish theirs per statement and ignore both. ABSENT MEANS DENY: called without a context, as an
  *   embedder that predates the posture calls it, a DuckDB handle opens with
  *   `enable_external_access: 'false'`, so `read_csv`, `COPY`, `ATTACH` of a file and
  *   `INSTALL` are refused outside its private temp directory and its database's own file
@@ -86,6 +86,25 @@ import * as path from "path";
  * as part of the line.
  */
 const sanitize = (v: string) => v.replace(/[\r\n]/g, " ").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+
+/**
+ * Refuse a connection with no id, before the cache key is computed (#1539).
+ *
+ * The provider's own `validate()` raises `DatabaseConfigError("Connection ID is required")` for this
+ * record, but `getOrCreateProvider` and `acquireExecutionProfileProvider` compute their cache key
+ * first, and `providerCacheKey` length-frames `connection.id`: a missing id crashed there with a
+ * `TypeError`, which `createErrorResponse` answered as a 500 `INTERNAL_ERROR` on every route that
+ * opens a cached provider (query, health and multi-query were measured). The same record reaching the
+ * provider through `createDatabaseProvider`, as `POST /api/db/test-connection` builds it, was already
+ * refused with a 400 `CONFIG_ERROR`. The refusal is raised here instead, as the same
+ * `DatabaseConfigError` the provider would have raised, so the key never sees a record the provider
+ * would refuse, and no fallback key is invented for a missing id.
+ */
+function assertConnectionIdPresent(connection: DatabaseConnection): void {
+  if (!connection.id) {
+    throw new DatabaseConfigError("Connection ID is required", connection.type);
+  }
+}
 
 /**
  * Refuse a `readOnly` this connection's engine cannot keep, before anything is built or dialled (#1089).
@@ -198,6 +217,13 @@ export async function createDatabaseProvider(
       // cannot trace into a chunk.
       const { TrinoProvider } = await import("./providers/sql/trino/index");
       return new TrinoProvider(connection, options);
+    }
+
+    case "databend": {
+      // The explicit /index specifier keeps this dynamic import statically analysable. The constructor validates
+      // nothing and opens nothing; the connection's rules run in connect(), before any socket.
+      const { DatabendProvider } = await import("./providers/sql/databend/index");
+      return new DatabendProvider(connection, options);
     }
 
     case "cassandra": {
@@ -323,7 +349,7 @@ export async function createDatabaseProvider(
         // This list is NOT type-checked against the union - a new case above with no
         // entry here is silent - so it is kept in the same order as the cases and
         // tests/isolated/factory.test.ts pins individual names in it by regex.
-        `Unknown database type: ${connection.type}. Supported types: postgres, mysql, sqlite, duckdb, libsql, oracle, db2, mssql, clickhouse, druid, trino, cassandra, elasticsearch, opensearch, mongodb, couchbase, redis, etcd, oxia, prometheus, influxdb, influxdb3, kafka, neo4j, milvus, qdrant, libredb`,
+        `Unknown database type: ${connection.type}. Supported types: postgres, mysql, sqlite, duckdb, libsql, oracle, db2, mssql, clickhouse, druid, trino, databend, cassandra, elasticsearch, opensearch, mongodb, couchbase, redis, etcd, oxia, prometheus, influxdb, influxdb3, kafka, neo4j, milvus, qdrant, libredb`,
         connection.type,
       );
   }
@@ -548,7 +574,8 @@ export function findOpenSingleWriterProvider(
     if (entry.singleWriterFile !== identity || !entry.provider.isConnected()) continue;
     // A handle of an engine that opens under a file-access posture is borrowable only by a caller of
     // its own posture (the non-admin DuckDB file-access change). `READS_FILE_ACCESS_POSTURE` answers
-    // which engines, so this is not a `connection.type` branch (CLAUDE.md); today only DuckDB does.
+    // which engines, so this is not a `connection.type` branch (CLAUDE.md); today DuckDB and SQLite do, and
+    // of the two only DuckDB is a single-writer engine.
     if (READS_FILE_ACCESS_POSTURE[connection.type] && (entry.allowExternalFileAccess === true) !== wantAccess) {
       continue;
     }
@@ -582,7 +609,7 @@ export function isSingleWriterFileOpen(connection: DatabaseConnection): boolean 
 // ----------------------------------------------------------------------------
 // Physically separate from providerCache on purpose: an agent acquisition must
 // be able to prove it never read from nor wrote to the shared writable cache.
-// Keyed by (connection id, execution profile).
+// Keyed by (connection id, execution profile), plus the requester's posture for SQLite and DuckDB.
 // ============================================================================
 
 type ProfiledCachedProvider = CachedProvider;
@@ -598,11 +625,19 @@ const profiledProviderCache = new Map<string, ProfiledCachedProvider>();
  * The profile stays in the key because the two caches' isolation is per profile: an
  * `agent-read-only` acquisition may never be served what `agent-operations` opened.
  *
+ * The requester's file-access posture is in it too, for an engine that reads one, exactly as in
+ * the writable key: SQLite refuses a denied requester at connect, so a handle a trusted requester
+ * opened must never answer a denied requester's key. Absent reads as denied.
+ *
  * Exported for one caller that must join concurrent first acquisitions on exactly this key
  * without deriving a second one: src/lib/mcp/context.ts.
  */
-export async function profiledCacheKey(connection: DatabaseConnection, profile: ExecutionProfile): Promise<string> {
-  const key = await providerCacheKey(connection);
+export async function profiledCacheKey(
+  connection: DatabaseConnection,
+  profile: ExecutionProfile,
+  requester: EditorExecutionContext = {},
+): Promise<string> {
+  const key = await providerCacheKey(connection, requester.allowExternalFileAccess === true);
   return `${profile.length}:${profile}${key}`;
 }
 
@@ -716,7 +751,8 @@ function startIdleSweep(): void {
  *   `COPY`, `ATTACH` of a file and `INSTALL` are refused outside its private temp directory and
  *   its database's own file names (docs/providers/duckdb.md section 3.16) while the database
  *   stays writable. Pass
- *   `{ allowExternalFileAccess: true }` for the full editor reach. Every other engine ignores it.
+ *   `{ allowExternalFileAccess: true }` for the full editor reach. SQLite refuses a denied handle at
+ *   connect, since its drivers cannot confine a statement's file access; every other engine ignores it.
  *   A `readOnly` in it is refused (`DatabaseConfigError`): this cache holds writable providers,
  *   and a read-only one comes from `createDatabaseProvider` or an execution profile.
  * @returns Cached or new DatabaseProvider instance
@@ -726,7 +762,10 @@ export async function getOrCreateProvider(
   options: ProviderOptions = {},
   execution: EditorExecutionContext = {},
 ): Promise<DatabaseProvider> {
-  // First, ahead of the cache lookup and of any tunnel (#1089): see assertReadOnlyHonoured.
+  // First, ahead of the cache lookup and of any tunnel (#1089): see assertReadOnlyHonoured. The id
+  // refusal shares the place: the cache key length-frames connection.id, so a missing id must be
+  // refused before the key is computed, as the DatabaseConfigError the provider would have raised (#1539).
+  assertConnectionIdPresent(connection);
   assertReadOnlyHonoured(connection);
   // The writable cache never holds a read-only handle, and its key frames no such mode for an
   // execution context: a readOnly reaching the provider from here would be served to every later
@@ -740,7 +779,7 @@ export async function getOrCreateProvider(
   }
   // The DuckDB editor file-access posture, server-derived (non-admin DuckDB file access). A definite boolean, so the
   // handle it opens and the key it is cached under agree, and absent reads as deny (fail closed).
-  // Only DuckDB reads it; the cache key and the single-writer borrow ignore it for other engines.
+  // SQLite and DuckDB read it; engines without that capability ignore it.
   const allowExternalFileAccess = execution.allowExternalFileAccess === true;
   const cacheKey = await providerCacheKey(connection, allowExternalFileAccess);
 
@@ -959,9 +998,11 @@ function resolveAgentCredential(connection: DatabaseConnection): { user: string;
  * bound. See `PROFILE_ACQUISITION` for the whole of that argument.
  *
  * `requester` is the editor posture of the caller this acquisition serves, as
- * `editorExecutionContext` derives it (non-admin DuckDB file access). It never changes how a profiled handle
- * opens - every profile opens read-only with external access off - and is read only to
- * decide which open single-writer handle an `agent-operations` acquisition may borrow:
+ * `editorExecutionContext` derives it (non-admin DuckDB file access). It reaches the profiled
+ * handle and its cache key, as the editor's posture does: SQLite's drivers cannot confine a
+ * statement's file access even on a read-only handle, so a denied requester is refused at connect
+ * here too, while DuckDB's read-only profile already closes file access whatever the posture. It
+ * also decides which open single-writer handle an `agent-operations` acquisition may borrow:
  * one opened under that same posture, so an admin's agent is grounded from the admin's
  * own editor handle as before, and a requester is never lent a handle wider than its own.
  * Absent means deny, like everywhere else on this channel.
@@ -973,12 +1014,14 @@ export async function acquireExecutionProfileProvider(
   requester: EditorExecutionContext = {},
 ): Promise<DatabaseProvider> {
   // First, ahead of the profiled cache lookup and of any tunnel (#1089): see assertReadOnlyHonoured.
+  // The id refusal shares the place for the same reason: the profiled key frames connection.id (#1539).
+  assertConnectionIdPresent(connection);
   assertReadOnlyHonoured(connection);
   if (!EXECUTION_PROFILES.has(profile)) {
     throw new ExecutionProfileError(`Unknown execution profile: ${String(profile)}`, "UNSUPPORTED_PROFILE");
   }
 
-  const cacheKey = await profiledCacheKey(connection, profile);
+  const cacheKey = await profiledCacheKey(connection, profile, requester);
   const cached = profiledProviderCache.get(cacheKey);
   if (cached && cached.provider.config.queryTimeout !== connection.queryTimeout) {
     try {
@@ -1052,7 +1095,10 @@ export async function acquireExecutionProfileProvider(
     if (tunnel && !tunnelPreexisted) await tunnel.close().catch(() => {});
   };
 
-  const provider = await createDatabaseProvider(effectiveConnection, options, acquisition.context);
+  const provider = await createDatabaseProvider(effectiveConnection, options, {
+    ...acquisition.context,
+    allowExternalFileAccess: requester.allowExternalFileAccess === true,
+  });
   if (acquisition.requiresReadOnlyStatements && typeof provider.queryReadOnly !== "function") {
     await closeFreshTunnel();
     throw new ExecutionProfileError(

@@ -9,10 +9,13 @@ import mysql, {
   type PoolConnection,
   type RowDataPacket,
   type FieldPacket,
+  type QueryOptions,
   type ResultSetHeader,
 } from "mysql2/promise";
 import { SQLBaseProvider } from "./sql-base";
 import { mysqlColumnTypes } from "./column-types";
+import { uniqueFieldNames } from "../../utils/result-fields";
+import { keyRowsByPosition } from "../../utils/positional-rows";
 import {
   type ColumnSchema,
   type Container,
@@ -80,6 +83,7 @@ import { formatBytes } from "../../utils/pool-manager";
 import { measuredNullableAggregate } from "../../utils/measured-aggregate";
 import { CACHE_HIT_RATIO_UNAVAILABLE, formatCacheHitRatio, measuredNumber } from "@/lib/monitoring-cache-ratio";
 import { unquoteLiteral } from "@/lib/sql/values";
+import type { QueryResultSet } from "@/lib/types";
 import { portableDefaultSql, showCreateColumnDefaults } from "./mysql-show-create";
 
 /**
@@ -166,23 +170,37 @@ type MySQLQueryable = Pick<PoolConnection, "query" | "execute">;
  * The one exception is a server that refuses COM_STMT_PREPARE itself, which
  * `probeClientSideBinding()` measures at connect: there a parameterised statement is
  * written out by `bindClientSide()` and goes over the text protocol like any other.
+ *
+ * `arrayRows` asks for each row as its values in column order (`rowsAsArray`), on every one of
+ * those paths. A user's statement is read that way, see `buildQueryResult`; the provider's own
+ * reads keep object rows, because they read columns by the names they wrote themselves.
  */
 const runStatement = <T extends RowDataPacket[] = RowDataPacket[]>(
   queryable: MySQLQueryable,
   sql: string,
   params?: unknown[],
+  arrayRows = false,
 ): Promise<[T, FieldPacket[]]> => {
   const core = (queryable as { connection?: object }).connection;
   if (core !== undefined && BINDS_CLIENT_SIDE.has(core) && params !== undefined && params.length > 0) {
-    return runBoundClientSide<T>(queryable, core as CoreConnection, sql, params);
+    return runBoundClientSide<T>(queryable, core as CoreConnection, sql, params, arrayRows);
   }
   if (core !== undefined && UTF8_UNDER_UTF8MB3.has(core)) {
-    return runReadingUtf8mb3AsUtf8<T>(core as CoreConnection, sql, params);
+    return runReadingUtf8mb3AsUtf8<T>(core as CoreConnection, statementOf(sql, arrayRows), params);
   }
-  return params === undefined || params.length === 0
-    ? queryable.query<T>(sql)
+  // Two calls each rather than one over `statementOf()`: mysql2 types the text and the options
+  // object as two overloads, and the provider's own reads keep sending the bare text.
+  if (params === undefined || params.length === 0) {
+    return arrayRows ? queryable.query<T>({ sql, rowsAsArray: true }) : queryable.query<T>(sql);
+  }
+  return arrayRows
+    ? queryable.execute<T>({ sql, rowsAsArray: true }, asExecuteParams(params))
     : queryable.execute<T>(sql, asExecuteParams(params));
 };
+
+/** The statement as mysql2 takes it: the bare text, or with `rowsAsArray` when array rows are asked for. */
+const statementOf = (sql: string, arrayRows: boolean): string | QueryOptions =>
+  arrayRows ? { sql, rowsAsArray: true } : sql;
 
 /**
  * The core (callback) connections of a pool whose server refuses COM_STMT_PREPARE, see
@@ -296,6 +314,7 @@ async function runBoundClientSide<T extends RowDataPacket[]>(
   core: CoreConnection,
   sql: string,
   params: unknown[],
+  arrayRows: boolean,
 ): Promise<[T, FieldPacket[]]> {
   const text = bindClientSide(core, sql, params);
   if (params.some((value) => typeof value === "string" && value.includes("\\"))) {
@@ -307,7 +326,7 @@ async function runBoundClientSide<T extends RowDataPacket[]>(
       );
     }
   }
-  return runStatement<T>(queryable, text);
+  return runStatement<T>(queryable, text, undefined, arrayRows);
 }
 
 /**
@@ -379,6 +398,41 @@ const probeClientSideBinding = async (queryable: MySQLQueryable): Promise<boolea
 };
 
 /**
+ * One result set read as array rows: its columns named by `uniqueFieldNames`, and each row keyed by
+ * those names by position (`keyRowsByPosition`, which raises a row whose value count is not the
+ * column count).
+ */
+function mysqlResultSet(rows: readonly unknown[], declared: readonly FieldPacket[], sql: string): QueryResultSet {
+  const fields = uniqueFieldNames(declared.map((field) => field.name));
+  return {
+    rows: keyRowsByPosition(fields, rows as readonly unknown[][], "mysql", sql),
+    fields,
+    ...mysqlColumnTypes(declared.map((field, index) => ({ ...field, name: fields[index] }))),
+  };
+}
+
+/** What a statement that answered a result set, or a `CALL`'s list of them, is read as (`buildQueryResult`). */
+function mysqlResults(
+  rows: readonly unknown[],
+  fields: FieldPacket[] | undefined,
+  sql: string,
+): Pick<QueryResult, "rows" | "fields" | "columnTypes" | "rowCount" | "resultSets"> {
+  const perAnswer = (fields ?? []) as unknown as (FieldPacket[] | undefined)[];
+  if (!perAnswer.some((declared) => declared === undefined || Array.isArray(declared))) {
+    const set = mysqlResultSet(rows, fields ?? [], sql);
+    return { ...set, rowCount: set.rows.length };
+  }
+  const sets = perAnswer.flatMap((declared, index) =>
+    Array.isArray(declared) ? [mysqlResultSet(rows[index] as unknown[], declared, sql)] : [],
+  );
+  const [first] = sets;
+  if (first === undefined) {
+    return { rows: [], fields: [], rowCount: (rows[0] as { affectedRows?: number }).affectedRows ?? 0 };
+  }
+  return { ...first, rowCount: first.rows.length, ...(sets.length > 1 && { resultSets: sets }) };
+}
+
+/**
  * The core (callback) connections of a pool whose server sends UTF-8 under a utf8mb3
  * label, see `probeUtf8UnderUtf8mb3()`. Filled from that pool's `acquire` event, so
  * membership is per connection of the one pool that was measured, and nothing else in
@@ -392,8 +446,8 @@ interface CoreCommand {
   on(event: "fields", listener: (fields?: FieldPacket[]) => void): unknown;
 }
 interface CoreConnection {
-  query(sql: string, callback: CoreCallback): CoreCommand;
-  execute(sql: string, values: unknown[], callback: CoreCallback): CoreCommand;
+  query(sql: string | QueryOptions, callback: CoreCallback): CoreCommand;
+  execute(sql: string | QueryOptions, values: unknown[], callback: CoreCallback): CoreCommand;
   format(sql: string, values: unknown[]): string;
 }
 
@@ -429,7 +483,7 @@ const readUtf8mb3AsUtf8 = (fields?: FieldPacket[]): void => {
  */
 function runReadingUtf8mb3AsUtf8<T extends RowDataPacket[]>(
   core: CoreConnection,
-  sql: string,
+  sql: string | QueryOptions,
   params?: unknown[],
 ): Promise<[T, FieldPacket[]]> {
   return new Promise((resolve, reject) => {
@@ -507,7 +561,9 @@ const SERVER_STATUS_AUTOCOMMIT = 2;
  * element is the header of the call itself, which is the state after everything the
  * procedure ran. The two arrays are told apart by their first element, a row set (an
  * array) for the `CALL` and a row (an object) for a read, so a column that happens to be
- * named `serverStatus` is never read as the flags.
+ * named `serverStatus` is never read as the flags. A user's statement is read with array
+ * rows (`rowsAsArray`), where a read's first element is an array too; its last element is
+ * then a row, an array, which is no header either.
  */
 function statusFlagsOf(result: unknown): number | undefined {
   const header = Array.isArray(result) ? (Array.isArray(result[0]) ? result[result.length - 1] : undefined) : result;
@@ -585,10 +641,38 @@ async function openTransaction(conn: PoolConnection): Promise<unknown> {
  *   those two changes. Vitess refuses the QUOTED `EXPLAIN FORMAT='json'`, which is a
  *   reason to keep sending the unquoted form the probe and the strategy already use.
  */
-const EXPLAIN_PROBES: readonly (readonly [sql: string, format: ExplainFormat])[] = [
-  ["EXPLAIN FORMAT=JSON SELECT 1", "mysql-json"],
-  ["EXPLAIN SELECT 1", "mysql-text"],
+const EXPLAIN_PROBES: readonly (readonly [prefix: string, format: ExplainFormat])[] = [
+  ["EXPLAIN FORMAT=JSON", "mysql-json"],
+  ["EXPLAIN", "mysql-text"],
 ];
+
+/**
+ * One base table of the session's database, for the probes to name when the server refuses
+ * to explain a statement that names none (#1393).
+ *
+ * Vitess 25.0.0-SNAPSHOT (`vitess/vttestserver:mysql84`, built 2026-10-08) answers
+ * `EXPLAIN FORMAT=JSON SELECT 1`, `EXPLAIN SELECT 1` and `... SELECT 1 FROM dual` with `1105
+ * VT03031: EXPLAIN is only supported for single keyspace`, and answers both grammars for
+ * `SELECT * FROM customers LIMIT 0`. Through vtgate this lookup answers `customers`: vtgate
+ * rewrites the schema to the shard's `vt_e2e_0` and keeps the table's name (measured
+ * 2026-10-09).
+ */
+const EXPLAIN_PROBE_TABLE_SQL =
+  "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' LIMIT 1";
+
+/** The first grammar that explains `statement`, or `undefined` when the server refuses both. */
+const firstExplainFormat = async (queryable: MySQLQueryable, statement: string): Promise<ExplainFormat | undefined> => {
+  for (const [prefix, format] of EXPLAIN_PROBES) {
+    try {
+      await runStatement(queryable, `${prefix} ${statement}`);
+      return format;
+    } catch {
+      // Refused, so try the next grammar. The reason is the engine's own and there is
+      // nothing to report: the capability this produces IS the report.
+    }
+  }
+  return undefined;
+};
 
 /**
  * Which of those grammars this server accepts, or `undefined` when it accepts
@@ -601,20 +685,27 @@ const EXPLAIN_PROBES: readonly (readonly [sql: string, format: ExplainFormat])[]
  * take; asking the server what its grammar accepts is the same answer without the
  * enumeration.
  *
+ * `SELECT 1` is asked first, and a server that explains it is never asked anything else. Only
+ * when both grammars refuse it are they asked again against a table the session's database
+ * holds (`EXPLAIN_PROBE_TABLE_SQL`), because a refusal of `SELECT 1` can be about the statement
+ * rather than the grammar (#1393). `LIMIT 0` keeps the statement a plan with nothing to read. A
+ * database with no base table, or a lookup the server refuses, leaves the answer `undefined`.
+ *
  * Nothing here rejects. A grammar the server does not have is a fact about the
  * Explain panel, not about the connection, and `connect()` must not fail for it.
  */
 const probeExplainFormat = async (queryable: MySQLQueryable): Promise<ExplainFormat | undefined> => {
-  for (const [sql, format] of EXPLAIN_PROBES) {
-    try {
-      await runStatement(queryable, sql);
-      return format;
-    } catch {
-      // Refused, so try the next grammar. The reason is the engine's own and there is
-      // nothing to report: the capability this produces IS the report.
-    }
+  const format = await firstExplainFormat(queryable, "SELECT 1");
+  if (format !== undefined) return format;
+  let table: unknown;
+  try {
+    const [rows] = await runStatement(queryable, EXPLAIN_PROBE_TABLE_SQL);
+    table = rows[0]?.name;
+  } catch {
+    return undefined;
   }
-  return undefined;
+  if (typeof table !== "string" || table === "") return undefined;
+  return firstExplainFormat(queryable, `SELECT * FROM ${escapeMySQLIdentifier(table)} LIMIT 0`);
 };
 
 /**
@@ -947,10 +1038,12 @@ const OVERVIEW_DATABASE_SIZE_SQL = `
         WHERE TABLE_SCHEMA = ?;
       `;
 
-const OVERVIEW_OBJECT_COUNTS_SQL = `
-        SELECT
-          COUNT(DISTINCT TABLE_NAME) as table_count,
-          COUNT(DISTINCT INDEX_NAME) as index_count
+// INDEX_NAME is unique per table only, so a database-wide COUNT(DISTINCT INDEX_NAME)
+// collapses every table's PRIMARY (and any other index name two tables share) into
+// one. Counting distinct (TABLE_NAME, INDEX_NAME) pairs instead counts each table's
+// indexes separately, which is what "N indexes" in the overview means.
+const OVERVIEW_INDEX_COUNT_SQL = `
+        SELECT COUNT(DISTINCT TABLE_NAME, INDEX_NAME) as index_count
         FROM information_schema.STATISTICS
         WHERE TABLE_SCHEMA = ?;
       `;
@@ -1064,7 +1157,7 @@ function toSlowQueryStats(r: RowDataPacket): SlowQueryStats {
  * an appearance nobody can check. No component reads `HealthInfo.slowQueries` (the
  * monitoring Queries and Overview tabs read `MonitoringData.slowQueries`, a different
  * reading with its own `SlowQueryStats` shape), and the one caller of
- * `POST /api/db/health` - the 60s connection pulse in `src/hooks/use-connection-manager.ts` -
+ * `POST /api/db/health` - the 60s connection pulse in `src/hooks/use-connection-pulse.ts` -
  * reads `res.ok` and discards the body. The agent's curated health reading
  * (`src/lib/agent/tools.ts`) was the last live consumer and read only the list's LENGTH -
  * never `query`, never `avgTime` - and it no longer reads the list at all (#513). So this
@@ -1115,15 +1208,29 @@ const SELF_IDENTIFYING_VERSION = /mariadb|tidb|vitess|oceanbase/i;
 const DORIS_VERSION_COMMENT = /doris version (?:doris-)?(\S+)/i;
 
 /**
+ * Percona Server for MySQL answers `VERSION()` with a bare MySQL-style number
+ * (`8.4.11-11`) and keeps its name in `@@version_comment`:
+ * `"Percona Server (GPL), Release 11"`, measured against
+ * `percona/percona-server:latest` 8.4.11-11. Anchored at the start, because
+ * MySQL's own comment ("MySQL Community Server - GPL") and MariaDB's
+ * ("mariadb.org binary distribution") must not match (#1444).
+ */
+const PERCONA_VERSION_COMMENT = /^Percona Server\b/i;
+
+/**
  * How the overview names the server: the string as the server gave it when
  * that already names a vendor, Doris's own build string extracted from
  * `@@version_comment` when the fictitious `VERSION()` number is the only
- * other option, `MySQL <version>` otherwise.
+ * other option, `Percona Server <version>` when `@@version_comment` names
+ * Percona, `MySQL <version>` otherwise.
  */
 function labelServerVersion(version: string, versionComment?: string): string {
   if (SELF_IDENTIFYING_VERSION.test(version)) return version;
   const doris = versionComment?.match(DORIS_VERSION_COMMENT);
   if (doris) return `Apache Doris ${doris[1]}`;
+  if (versionComment !== undefined && PERCONA_VERSION_COMMENT.test(versionComment)) {
+    return `Percona Server ${version}`;
+  }
   return `MySQL ${version}`;
 }
 
@@ -1218,14 +1325,14 @@ const STORAGE_STATS_SQL = `
 // ============================================================================
 
 /**
- * The four schemas MySQL and MariaDB both reserve for themselves.
+ * Schemas the server reserves for itself.
  *
  * A hand-written name list, unlike Oracle's `ORACLE_MAINTAINED` and PostgreSQL's
  * `pg_depend` ownership test, because neither server publishes the fact: nothing in
- * `information_schema.SCHEMATA` says whether a schema is the server's own. What makes the
- * list safe is that all four names are RESERVED - `CREATE DATABASE mysql` answers
- * ER_DB_CREATE_EXISTS on a fresh server - so hiding them can never hide a database a
- * person created. Measured 2026-09-11 on MySQL 26.7.0 and MariaDB 12.3.2: `SCHEMATA` holds
+ * `information_schema.SCHEMATA` says whether a schema is the server's own. All four are
+ * RESERVED on MySQL and MariaDB - `CREATE DATABASE mysql` answers ER_DB_CREATE_EXISTS on a
+ * fresh server - so hiding them cannot hide a database a person created under that
+ * spelling. Measured 2026-09-11 on MySQL 26.7.0 and MariaDB 12.3.2: `SCHEMATA` holds
  * exactly these four plus the user's own on both.
  *
  * They are hidden from the BROWSER and remain fully reachable from the SQL editor, which is
@@ -1235,12 +1342,59 @@ const STORAGE_STATS_SQL = `
 const SYSTEM_SCHEMAS = ["information_schema", "mysql", "performance_schema", "sys"] as const;
 
 /**
- * Looked up by EXACT name, which is the comparison the former `NOT IN (...)` over
- * `SCHEMATA` made on MySQL (`utf8mb3_bin`) and TiDB (`utf8mb4_bin`), so the tree on both is
- * what it was. TiDB's upper-case `INFORMATION_SCHEMA` was never hidden by that clause and is
- * not hidden by this one.
+ * The reserved schemas that are reserved in EVERY spelling, compared case-insensitively.
+ *
+ * Only these two: measured 2026-10-09 on MySQL 8.4 with `lower_case_table_names=0`,
+ * `CREATE DATABASE INFORMATION_SCHEMA` and `CREATE DATABASE Performance_Schema` answer 1044,
+ * while `CREATE DATABASE MYSQL` and `CREATE DATABASE SYS` succeed. Folding `mysql` and `sys`
+ * too would hide those two user databases. TiDB v8.5.8 answers `SHOW DATABASES` with
+ * `INFORMATION_SCHEMA` and `PERFORMANCE_SCHEMA` in upper case, which is what this fold is
+ * for (#1428).
  */
-const SYSTEM_SCHEMA_SET: ReadonlySet<string> = new Set(SYSTEM_SCHEMAS);
+const CASE_FOLDED_SYSTEM_SCHEMAS: ReadonlySet<string> = new Set(["information_schema", "performance_schema"]);
+
+/**
+ * Databases a wire-compatible engine owns beyond the four above, keyed on what the server
+ * says it is, and compared by exact name.
+ *
+ * Keyed on the server rather than hidden everywhere, because none of these names is
+ * reserved on MySQL: measured 2026-10-09 on MySQL 8.4, `CREATE DATABASE` accepts
+ * `METRICS_SCHEMA`, `oceanbase`, `cluster` and `memsql`, and the tree must keep listing
+ * them there. Each was measured as listed as a person's database on its own engine (#1428).
+ *
+ * - TiDB v8.5.1 and v8.5.8: `METRICS_SCHEMA`, answered in upper case. `VERSION()` carries
+ *   `TiDB`.
+ * - OceanBase 4.4.2.1 CE: `oceanbase`. `VERSION()` carries `OceanBase`.
+ * - SingleStore 8.7.12 and 9.1.1: `cluster` and `memsql`. `VERSION()` is a plain `5.7.32`,
+ *   so `@@version_comment` (`SingleStoreDB source distribution ...`) is what names it.
+ */
+const ENGINE_OWNED_SCHEMAS: readonly {
+  readonly owns: (version: string | undefined, versionComment: string | undefined) => boolean;
+  readonly names: readonly string[];
+}[] = [
+  { owns: (version) => version !== undefined && /tidb/i.test(version), names: ["METRICS_SCHEMA"] },
+  { owns: (version) => version !== undefined && /oceanbase/i.test(version), names: ["oceanbase"] },
+  {
+    owns: (_version, versionComment) => versionComment !== undefined && /^SingleStoreDB\b/i.test(versionComment),
+    names: ["cluster", "memsql"],
+  },
+];
+
+/**
+ * The exact names hidden on a server that answered this `VERSION()` and `@@version_comment`.
+ * An unmeasured server gets the four reserved names only, so nothing a person could have
+ * created is hidden on a guess.
+ */
+function systemSchemasFor(version: string | undefined, versionComment: string | undefined): ReadonlySet<string> {
+  return new Set([
+    ...SYSTEM_SCHEMAS,
+    ...ENGINE_OWNED_SCHEMAS.filter((engine) => engine.owns(version, versionComment)).flatMap((engine) => engine.names),
+  ]);
+}
+
+function isSystemSchema(name: string, systemSchemas: ReadonlySet<string>): boolean {
+  return systemSchemas.has(name) || CASE_FOLDED_SYSTEM_SCHEMAS.has(name.toLowerCase());
+}
 
 /**
  * The containers this connection has, which on MySQL is one level: databases.
@@ -1915,6 +2069,23 @@ const probeServerVersion = async (queryable: MySQLQueryable): Promise<string | u
     return version === null || version === undefined ? undefined : String(version);
   } catch {
     // Refused, so the flavour is unmeasured. The capability this produces IS the report.
+    return undefined;
+  }
+};
+
+/**
+ * What this server says about its own build in `@@version_comment`, or `undefined` when it
+ * would not say. The same never-rejects contract as `probeServerVersion`, for the same reason:
+ * the answer only decides which databases the tree hides, and an unmeasured comment hides
+ * nothing beyond the reserved four.
+ */
+const probeVersionComment = async (queryable: MySQLQueryable): Promise<string | undefined> => {
+  try {
+    const [rows] = await runStatement(queryable, "SELECT @@version_comment AS version_comment");
+    const comment = rows[0]?.version_comment;
+    return comment === null || comment === undefined ? undefined : String(comment);
+  } catch {
+    // Refused, so the engine is unmeasured and only the reserved names are hidden.
     return undefined;
   }
 };
@@ -2740,6 +2911,7 @@ export class MySQLProvider extends SQLBaseProvider {
    * `measuredExplainFormat` stores a grammar and not the text of the probe that found it.
    */
   private measuredFlavour: MySQLFlavour = "mysql";
+  private systemSchemas: ReadonlySet<string> = systemSchemasFor(undefined, undefined);
 
   /**
    * Which maintenance verbs this server's grammar has, measured by `probeMaintenance()` at connect
@@ -2777,6 +2949,8 @@ export class MySQLProvider extends SQLBaseProvider {
       ...(this.measuredExplainFormat === undefined ? {} : { explainFormat: this.measuredExplainFormat }),
       supportsConnectionString: true,
       supportsInlineRowEdit: true,
+      // The Generate Test Data dialog's multi-row `INSERT INTO ... VALUES` (#1468).
+      supportsTestDataGeneration: true,
       // `LIMIT n OFFSET m`, applied by the shared limiter in `SQLBaseProvider.prepareQuery`.
       supportsResultPagination: true,
       // BEGIN over one held connection (`beginTransaction()` below).
@@ -2883,7 +3057,10 @@ export class MySQLProvider extends SQLBaseProvider {
       // Which server this is, which is what decides the object-kind declaration (#789).
       // Measured rather than derived from the type id, because there is no `mariadb` type
       // id to derive from.
-      this.measuredFlavour = flavourFor(await probeServerVersion(conn));
+      const version = await probeServerVersion(conn);
+      this.measuredFlavour = flavourFor(version);
+      // Which databases this engine owns beyond the reserved four (#1428). Never rejects.
+      this.systemSchemas = systemSchemasFor(version, await probeVersionComment(conn));
       // Which of ANALYZE, OPTIMIZE and CHECK TABLE this server has (#1387). Never rejects.
       this.measuredMaintenance = await probeMaintenance(conn, this.config.database);
       // Every later acquisition, this probe connection's included, then reads utf8mb3
@@ -3040,8 +3217,23 @@ export class MySQLProvider extends SQLBaseProvider {
    * footer renders. `affectedRows` is the matched count, which is why a no-op
    * UPDATE still reports 1 - matching mssql, whose `rowsAffected` counts the same
    * way.
+   *
+   * A result set arrives as array rows (`rowsAsArray`, see `runStatement`) and is keyed here by
+   * `uniqueFieldNames`, by position: mysql2's object rows keep the last of two columns that share
+   * a name, so a join projecting `id` from both tables showed one table's id under both headers.
+   * A `CALL` answers one result set per SELECT its procedure ran and its own OK packet last, with
+   * `fields` one list per set and `undefined` for each header; a connection string that opted into
+   * `multipleStatements` answers a `;`-separated text the same way. Then `rows`, `fields` and
+   * `columnTypes` are the first set's, `rowCount` its row count (or the first header's
+   * `affectedRows` when no set came back), and `resultSets` lists every set when there are several.
+   * Before, that list was read as one set's rows.
    */
-  private buildQueryResult(rows: unknown, fields: FieldPacket[] | undefined, executionTime: number): QueryResult {
+  private buildQueryResult(
+    rows: unknown,
+    fields: FieldPacket[] | undefined,
+    executionTime: number,
+    sql: string,
+  ): QueryResult {
     if (!Array.isArray(rows)) {
       const header = rows as { affectedRows?: number };
       return {
@@ -3063,10 +3255,7 @@ export class MySQLProvider extends SQLBaseProvider {
       // `0x0102ab` where Postgres showed `\x0102ab`, and the export wrote the eight
       // characters `'0x0102ab'` into a BLOB column rather than the three bytes.
       // Measured against MySQL 26.7.0 on 2026-08-24; see docs/providers/mysql.md §3.3.
-      rows: rows as Record<string, unknown>[],
-      fields: fields?.map((f: FieldPacket) => f.name) ?? [],
-      ...mysqlColumnTypes(fields),
-      rowCount: rows.length,
+      ...mysqlResults(rows, fields, sql),
       executionTime,
     };
   }
@@ -3085,7 +3274,7 @@ export class MySQLProvider extends SQLBaseProvider {
           if (queryId) {
             this.runningQueryThreadIds.set(queryId, conn.threadId);
           }
-          const [rows, fields] = await runStatement(conn, sql, params);
+          const [rows, fields] = await runStatement(conn, sql, params, true);
           return { rows, fields };
         } catch (error) {
           throw mapDatabaseError(error, "mysql", sql);
@@ -3095,7 +3284,7 @@ export class MySQLProvider extends SQLBaseProvider {
         }
       });
 
-      return this.buildQueryResult(result.rows, result.fields, executionTime);
+      return this.buildQueryResult(result.rows, result.fields, executionTime, sql);
     });
   }
 
@@ -3248,7 +3437,7 @@ export class MySQLProvider extends SQLBaseProvider {
     return this.trackQuery(async () => {
       const { result, executionTime } = await this.measureExecution(async () => {
         try {
-          const [rows, fields] = await runStatement(this.txConn!, sql, params);
+          const [rows, fields] = await runStatement(this.txConn!, sql, params, true);
           // The server's own word on whether the transaction survived the statement. A
           // statement that commits implicitly (DDL, `SET autocommit = 1`, a typed
           // `COMMIT`) ends it, and from then on the held connection autocommits: a
@@ -3265,7 +3454,7 @@ export class MySQLProvider extends SQLBaseProvider {
         }
       });
 
-      return this.buildQueryResult(result.rows, result.fields, executionTime);
+      return this.buildQueryResult(result.rows, result.fields, executionTime, sql);
     });
   }
 
@@ -3304,7 +3493,7 @@ export class MySQLProvider extends SQLBaseProvider {
       return (
         rows
           .map((row) => String(Object.values(row)[0]))
-          .filter((name) => !SYSTEM_SCHEMA_SET.has(name))
+          .filter((name) => !isSystemSchema(name, this.systemSchemas))
           .map((name) => ({ path: [name], name, level: 0, isSessionDefault: name === session?.name }))
           // By path, the rule `listObjects` orders by: vtgate answers SHOW DATABASES unsorted.
           .sort((left, right) => comparePaths(left.path, right.path))
@@ -3867,7 +4056,7 @@ export class MySQLProvider extends SQLBaseProvider {
       // `HealthInfo.slowQueries` (the monitoring Queries and Overview tabs read
       // `MonitoringData.slowQueries`, a different reading), and the one caller of
       // `POST /api/db/health` - the 60s connection pulse in
-      // `src/hooks/use-connection-manager.ts` - looks at `res.ok` and discards the body.
+      // `src/hooks/use-connection-pulse.ts` - looks at `res.ok` and discards the body.
       //
       // The operator is not left without the reason, because the SAME refusal reaches
       // them on the path that does have a channel: `getSlowQueries()` below lets it
@@ -4046,7 +4235,7 @@ export class MySQLProvider extends SQLBaseProvider {
       const databaseSize = databaseSizeBytes === undefined ? "N/A" : formatBytes(databaseSizeBytes);
 
       // Get table and index count
-      const [countRows] = await runStatement(conn, OVERVIEW_OBJECT_COUNTS_SQL, [this.config.database]);
+      const [countRows] = await runStatement(conn, OVERVIEW_INDEX_COUNT_SQL, [this.config.database]);
 
       const [tableCountRows] = await runStatement(conn, OVERVIEW_TABLE_COUNT_SQL, [this.config.database]);
 

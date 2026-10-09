@@ -43,13 +43,14 @@ import type { DatabaseConnection, WithTunnelFarEnd } from "@/lib/types";
  *   which server it reaches, and the mode changes neither.
  * - The file-access posture (the non-admin DuckDB file-access change), for an engine that opens its
  *   editor handle under one: `READS_FILE_ACCESS_POSTURE` in `./compatibility.ts` answers which, so
- *   this is not a `connection.type` branch (CLAUDE.md), and today only DuckDB answers true. A denied
+ *   this is not a `connection.type` branch (CLAUDE.md), and today DuckDB and SQLite answer true. A denied
  *   editor handle opens with `enable_external_access: 'false'` and a full-reach one without it, so the
  *   two must never share a cached handle: a caller of one posture would otherwise be handed the
  *   other's handle. (A seed a non-admin role can use gets one posture for every role in
  *   `editorExecutionContext`, so that record still keeps one key.) The deny posture appends a segment;
- *   the allow/admin posture and an absent posture append NOTHING, so every other engine's key and the
- *   profiled key (which passes no posture) stay byte-identical to before this change. The posture
+ *   the allow/admin posture and an absent posture append NOTHING, so every other engine's key stays
+ *   byte-identical to before this change, and `profiledCacheKey` passes a definite posture, absent
+ *   read as denied, so the profiled key splits the same way. The posture
  *   lives on `ProviderExecutionContext`, server-derived from the session role and the resolved
  *   connection's audience, never on the
  *   connection, so a request body cannot move a handle between the two pools.
@@ -83,14 +84,14 @@ export async function providerCacheKey(
   const [server, credentials] = await Promise.all([connectionFingerprint(connection), credentialDigest(connection)]);
   const mode = connection.readOnly === true ? "read-only" : "read-write";
   const parts = [connection.id, server, credentials, mode];
-  // Only an engine that opens its editor handle under a file-access posture, and only its deny
-  // posture, adds bytes: the admin/allow and absent postures leave the key byte-identical to before
-  // this field existed, which keeps every other engine's key and the profiled key (passed no posture)
-  // unchanged. A denied editor handle must not be shared with a full-reach one on the same
-  // connection, so its key carries this extra segment (the non-admin DuckDB file-access change). The
+  // Only an engine that reads a file-access posture, and only its deny posture, adds bytes: the
+  // admin/allow and absent postures leave the key byte-identical to before this field existed, which
+  // keeps every other engine's key unchanged. A denied handle must not be shared with a full-reach one
+  // on the same connection, so its key carries this extra segment (the non-admin DuckDB file-access
+  // change), on the profiled key too, which always passes a definite posture. The
   // engine is read from `READS_FILE_ACCESS_POSTURE`, not a `connection.type` branch (CLAUDE.md).
   if (READS_FILE_ACCESS_POSTURE[connection.type] && allowExternalFileAccess === false) {
-    parts.push("duckdb-deny-file-access");
+    parts.push(`${connection.type}-deny-file-access`);
   }
   // Length-framed like the two digests it joins: an id ending in a digit must not be able to
   // answer the same key as a shorter id followed by a longer fingerprint.
@@ -112,7 +113,7 @@ export async function providerCacheKey(
  * or the fingerprint, and `tests/unit/lib/db/provider-cache-key.test.ts` walks those maps to hold it,
  * because this list is hand-kept and the API key pair was once missing from it. The public fields
  * below (the agent user, what TLS presents and trusts, the mechanism, the auth database, the consent,
- * the data servers, the tunnel's auth method and host key) are outside that walk, so the same file
+ * the data servers, the warehouse, the tunnel's auth method and host key) are outside that walk, so the same file
  * holds them in a table of their own, one row per field.
  *
  * - `password` is the connection's own secret. `connectionString` is NOT here because the
@@ -141,6 +142,10 @@ export async function providerCacheKey(
  *   consent was taken back must not be handed a provider opened under it.
  * - `dataServers` decides which hosts receive the token (O6), so a connection whose list changed must
  *   not be handed a provider whose policy admitted other hosts.
+ * - `warehouse` decides which Databend compute every statement runs on (`X-DATABEND-WAREHOUSE`), and so which
+ *   servers receive the password and which warehouse Cloud resumes and bills, so a connection naming another
+ *   warehouse must not be handed a provider whose requests name this one. The fingerprint does not frame it, and
+ *   `connectionIdentity` leaves it out on purpose: it picks compute, not the catalog.
  * - The tunnel's SECRETS and `hostKeyFingerprint`. Its ROUTE is deliberately absent: `tunnelRoute`
  *   frames the four route values inside the fingerprint already, and this is the half that file
  *   explicitly leaves out as "a credential, not a route".
@@ -163,6 +168,7 @@ async function credentialDigest(connection: DatabaseConnection): Promise<string>
     connection.authSource ?? "",
     connection.allowInsecureAuth === true ? "insecure-auth" : "",
     connection.dataServers ?? "",
+    connection.warehouse ?? "",
     tunnel?.authMethod ?? "",
     tunnel?.password ?? "",
     tunnel?.privateKey ?? "",

@@ -189,6 +189,25 @@ Caveats baked into this approach:
   it, and the profiler reads a dotted column by walking the sampled document, so `address.city` is
   profiled from its real values rather than as absent. A top-level key that literally contains a
   dot is walked the same way, as a nested path, so it profiles as absent.
+- **Generated test data reconstructs nested paths.** Both row menus offer Generate Test Data on a
+  collection, because the provider declares `supportsTestDataGeneration: true` ([§9](#9-capabilities--labels)),
+  and the dialog writes one `insertMany`. It treats dotted
+  inferred columns as nested paths: when `address`, `address.city`, and `address.geo.lat` are
+  present, only the leaf fields are generated and the resulting document is rebuilt as
+  `{ address: { city, geo: { lat } } }`. A parent path with listed descendants does not receive a
+  scalar value. An `object` field with no listed descendants is generated as `{}`.
+  The generator is picked by the **leaf** of the path, so `address.city` is a city and
+  `address.zip` a postal code rather than two street addresses, and the value takes the JSON type
+  the inferred type names: `number`, `int` and `double` as JSON numbers, `boolean` as a boolean,
+  `array` as `[]`, `null` as `null`, and `date`, `objectId`, `uuid`, `long` and `decimal` as the
+  `$date`, `$oid`, `$uuid`, `$numberLong` and `$numberDecimal` wrappers, which the query reader
+  ([§3.1](#extended-json-in-the-query)) turns into those BSON types. A `mixed(...)` field is written as its first non-null type.
+  The driver reads both int32 and double as a JS number, so sampling reports `number` for both, and a `number`
+  field is written as an integer (BSON int32) unless its leaf name picks a decimal-valued generator such as `price`.
+  `_id` is left to the server. Measured on `mongo:7` on 2026-10-06: the generated command ran
+  through the provider and `$type` read back `int`, `double`, `long`, `decimal`, `bool`, `array`,
+  `date`, `objectId`, `binData` (UUID subtype 4) and `null`.
+
 - **Arrays are named and left closed.** `items.sku` addresses one value *per array entry*, so it
   does not mean on an array what the same syntax means on a subdocument; listing it in a flat field
   list would invite exactly that confusion. Date, ObjectId, Binary, Decimal128 and every other
@@ -203,6 +222,18 @@ Caveats baked into this approach:
   60 subdocuments of 10 fields each is 661 rows in the schema tree and 661 lines in an agent run's
   context window, for one collection.
 - A field with multiple observed types is reported as `mixed(a|b)`. `_id` is marked primary.
+- **Nullable means "absent or `null` in at least one sampled document"** (#1456). MongoDB declares
+  no nullability, and a field is empty in two ways, so inference counts in how many sampled
+  documents each path is present and marks it nullable when that is fewer than the sample, or when
+  a `null` was seen. `_id` follows the same rule: in an ordinary collection it is present and
+  non-null in every document, so it reads not nullable, but a collection holding `{_id: null}`, or
+  a `$group` view whose `_id` is `null`, reads nullable, because that is what the sample shows.
+  Before #1456 only a `null` counted, so a field most documents lack read "Nullable: No" in Docs and
+  `NN` in the ERD.
+- **The profiler counts the same two cases as null.** In Profile Collection a sampled value that
+  is absent or `null` adds to `nullCount`, and `null` is not a distinct value. The samples still
+  show an explicit null, as `NULL`. Before #1456 documents `{a: 1}`, `{a: null}`, `{}` reported
+  1 null and 2 distinct values for `a`; they now report 2 nulls and 1.
 
 ### 3.4 `find` is capped at 100; `aggregate` is not
 
@@ -264,11 +295,56 @@ pool is configured from `ProviderOptions.pool`:
 | `minPoolSize` | `pool.min` |
 | `maxIdleTimeMS` | `pool.idleTimeout` |
 | `connectTimeoutMS` | `pool.acquireTimeout` |
-| `serverSelectionTimeoutMS` | `pool.acquireTimeout` |
+| `serverSelectionTimeoutMS` | 30 s, a constant in `mongodb.ts` (`MONGODB_SERVER_SELECTION_TIMEOUT_MS`), not configurable |
 
 The database name comes from `config.database`, else from the connection string's path (after the authority, so `mongodb://host:27017` names none), else
 defaults to `test`, the driver's own default; it is the database a statement with no `database` key reads.
 After connecting, a `{ ping: 1 }` command validates the connection.
+
+**Server selection is bounded at 30 seconds, and the bound is not connect-only (#1458).**
+`serverSelectionTimeoutMS` is a `MongoClient` option, so the driver reads it when the client
+connects and again for every query and write for the life of that client
+(`mongodb/lib/sdam/topology.js`, `mongodb/lib/operations/execute_operation.js`). It therefore has
+to clear a replica set election, not only the initial dial: MongoDB documents the median election
+after an unplanned primary loss as up to 12 seconds and notes that network latency can extend it.
+This provider used to hand that option `pool.acquireTimeout`, whose default is 60000
+([`types.ts`](../../src/lib/db/types.ts)), so Test Connection to a host and port where nothing
+listens held the spinner for a minute (`Test Connection` passes `queryTimeout: 10000`, which
+`connect()` did not read). Measured here against a closed port on 127.0.0.1: 60.0 s before, 30.0 s
+after. `connectTimeoutMS` did not bound it and does not: that option caps ONE TCP attempt, and a
+refused connection fails its attempt at once.
+
+30 s is the driver's own default and sits above the election window, so a write issued right after
+an unplanned primary loss waits the election out instead of failing at the deadline. It is a
+ceiling under abnormal discovery, not a latency budget: a healthy deployment selects a server well
+before it, and a closed port used to be reported only after the full 30 s, half the old
+minute. The value is a constant in
+[`mongodb.ts`](../../src/lib/db/providers/document/mongodb.ts) rather than a second pool field,
+because it governs the whole client and not only the connect; `connectTimeoutMS` keeps following
+`pool.acquireTimeout` for the pool's own dial.
+
+**The connect itself is bounded by the request's `queryTimeout` (#1573).** The 30 s selection
+bound above is the client's, and a request that only wants to know whether the server is there
+should not wait it out: `connect()` races `MongoClient.connect()` against the `queryTimeout` the
+request already carries (10000 for Test Connection, `DEFAULT_QUERY_TIMEOUT` 60000 otherwise,
+[`types.ts`](../../src/lib/db/types.ts)), and closes the client when the deadline wins. The
+reported error is a `ConnectionError` naming the refusal the driver's monitoring saw (its last
+heartbeat failure, read from the `serverHeartbeatFailed` events the client relays), not a generic
+timeout. Two details the driver forces:
+
+- With `mongodb+srv`, `MongoClient._connect` resolves the SRV record before it creates the
+  topology and never checks `hasBeenClosed` (`mongo_client.js`), so a `close()` that lands during
+  a slow DNS lookup is a no-op. The client is closed again once the connect promise settles, so
+  no socket outlives the request either way.
+- A failed `connect()` closes the client and clears it, rather than leaving `this.client` set
+  with `this.db` null: on main the `connect()` guard only checks `this.client && this.db`, so a
+  failed ping used to leave the half-open client behind and a later `connect()` returned as if
+  it were connected.
+
+Measured against a closed port on 127.0.0.1 with `queryTimeout: 10000`: the refusal
+(`connect ECONNREFUSED`) arrives in 10.0 s instead of 30.0. The write path is unchanged: the
+30 s client-wide bound still governs every operation after the connect, and no failover was
+run to measure it here.
 
 ### 4.1 SSL / TLS
 
@@ -348,6 +424,11 @@ mongo 8.2.12 a `find` over two differently shaped documents hid every key only t
 carried from the grid and from those exports (the JSON export kept them). A uniform result still
 answers exactly the first document's keys in their order. The union covers top-level keys only:
 a subdocument stays one column.
+
+**An empty top-level key is a column named `(No column name)`, and the rows carrying it are keyed under that name.**
+BSON carries an empty key: `BSON.deserialize(BSON.serialize({ "": 1 }))` answers `{ "": 1 }` (measured in-process with the bundled driver on 2026-10-07; a live server was not measured).
+Keyed by `""`, the grid could not take the column at all, so [`uniquelyKeyedRows`](../../src/lib/db/utils/result-fields.ts) names it through `uniqueFieldNames`, numbered past any key the documents already use (`(No column name) (2)` when one is literally called `(No column name)`).
+Every other key, and every document without an empty key, is answered as read.
 
 **`options` handling differs per operation** (a real source of surprise — see
 [Known limitations](#13-known-limitations--future-work)):
@@ -448,7 +529,8 @@ The `hasSource` column is [§6 Object source](#object-source-789).
 `acceptsRowWrites` on `collection` is the **per-kind** half and is deliberately not conjoined with
 this provider's engine-wide `supportsInlineRowEdit: false` ([§9](#9-capabilities--labels)). That flag
 is about the results grid's `UPDATE … SET`, which has no MongoDB spelling; an import into a
-collection is an ordinary `insertMany`. A view carries no such declaration: the server reports
+collection is an ordinary `insertMany`, and so is Generate Test Data, which the engine declares on
+its own with `supportsTestDataGeneration: true`. A view carries no such declaration: the server reports
 `info.readOnly: true` on every one, on the same call that classifies it.
 
 #### What is not declared, and why each absence is a measurement
@@ -504,7 +586,8 @@ Inside a database, the reserved namespace prefix is **`system.` with the dot**. 
 `systemetrics` is created without complaint. The fixture holds `systemetrics`, so a rule written on
 the letters `system` without the dot fails a test by name. The two internal namespaces the fixture's
 own listing contains are `system.views` (created the moment a view is) and
-`system.buckets.readings` (the bucket collection behind the time series one).
+`system.buckets.readings` (the bucket collection behind the time series one). `getTableStats()`
+applies the same prefix, so Monitoring's Tables list does not show either of them.
 
 `listDatabases` is sent as `{ listDatabases: 1, nameOnly: true, authorizedDatabases: true }`. The
 flag is load-bearing rather than tidy: the server's default for it depends on whether the connecting
@@ -838,12 +921,12 @@ Every method is wrapped in try/catch. Degradation reports the absence rather tha
 
 | Method | Source | Notes |
 |--------|--------|-------|
-| `getHealth()` | `serverStatus`, `dbStats`, `currentOp`, `system.profile` | connections (**omitted**, never `0`, when the server publishes none — [§7.2](#72-a-connection-count-nobody-published-is-absent-not-zero)), data size (**`"N/A"`**, never `"0 B"`, when `db.stats()` answers without `dataSize` — [§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)), WiredTiger cache-hit % (`"N/A"` when unmeasurable, [§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)), current ops; slow queries need the profiler (placeholder row if disabled) |
-| `getOverview()` | `serverStatus`, `buildInfo`, `dbStats`, `listCollections` | version, uptime, connections (**omitted**, never `0`, on the same two paths as `getHealth()` — [§7.2](#72-a-connection-count-nobody-published-is-absent-not-zero)), database size (`databaseSizeBytes` **omitted**, never `0`, on those same two paths — [§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)), collection/index counts. `maxConnections` is `connections.current + connections.available`, or `0` — the repo's spelling of *no limit published* — when the server publishes no headroom |
+| `getHealth()` | `serverStatus`, `dbStats`, `currentOp`, `system.profile` | connections (**omitted**, never `0`, when the server publishes none, [§7.2](#72-a-connection-count-nobody-published-is-absent-not-zero)), data size (**`dataSize + indexSize`**, the same sum `getOverview()` publishes; **`"N/A"`**, never `"0 B"`, when `db.stats()` answers without either addend, [§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)), WiredTiger cache-hit % (`"N/A"` when unmeasurable, [§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)), current ops; slow queries need the profiler (placeholder row if disabled) |
+| `getOverview()` | `serverStatus`, `buildInfo`, `dbStats`, `listCollections` | version, uptime, connections (**omitted**, never `0`, on the same two paths as `getHealth()`, [§7.2](#72-a-connection-count-nobody-published-is-absent-not-zero)), database size (**`dataSize + indexSize`**, the database-level sums of the per-collection `collStats.size` and `totalIndexSize` the rows are built from, so a share's numerator and denominator are the same pair; `databaseSizeBytes` **omitted**, never `0`, when either addend is unpublished, [§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)), collection/index counts. `maxConnections` is `connections.current + connections.available`, or `0` (the repo's spelling of *no limit published*) when the server publishes no headroom |
 | `getPerformanceMetrics()` | `serverStatus` (WiredTiger + opcounters) | cache-hit %, **ops/sec** (`query`+`insert`+`update`+`delete` opcounters ÷ uptime — *total operations, not just queries*), buffer-pool % (cache bytes), `deadlocks: 0`. **Every field is optional**: each one is present only if its reading was, and a failed `serverStatus` reports `{}` ([§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)) |
 | `getSlowQueries()` | `system.profile` | per-op time/returned; **`[]` if the profiler isn't enabled** (`db.setProfilingLevel(1)`); sorted by `millis` (slowest) — note `getHealth()`'s slow-query block instead sorts by `ts` (most recent) and emits a placeholder row when disabled |
 | `getActiveSessions()` | `currentOp` | opid, ns, lock waits, duration — ⚠️ the **`user` field is populated from `op.client`** (the client `host:port`), **not** an authenticated user |
-| `getTableStats()` | `collStats` per collection | row count + data/index/total sizes, `totalIndexSize` carried as the byte figure `indexSizeBytes` and not only as formatted text |
+| `getTableStats()` | `collStats` per collection | row count + data/index/total sizes, `totalIndexSize` carried as the byte figure `indexSizeBytes` and not only as formatted text; a time series collection is **one** row, because the server's internal `system.buckets.<name>` duplicate is skipped rather than summed beside it; every other `system.*` namespace (`system.views` included) is skipped with the same `system.` prefix the object browser uses, so Monitoring lists the same collections the tree does. `systemetrics` does not start with that prefix and stays |
 | `getIndexStats()` | `$indexStats` + `indexes()` | **real `scans`** (`accesses.ops`); `indexSize` `N/A`; **`indexType` only distinguishes `text` vs `btree`** — `hashed`/`2dsphere`/`2d`/wildcard/clustered are all mislabelled `btree` |
 | `getStorageStats()` | `dbStats` + WiredTiger | Data / Indexes / Storage / WiredTiger cache (with usage %) |
 
@@ -946,14 +1029,30 @@ fabrication. Both outlived the round that fixed the count, one field over in the
   `try`, so a user without `clusterMonitor` reaches it - and `DatabaseOverview.databaseSizeBytes` is
   **optional** precisely so that a provider with no byte figure can say so. The key is now omitted;
 - both success paths formatted `dbStats.dataSize || 0`, which cannot tell a database that measures
-  0 bytes from a `db.stats()` that answered without `dataSize`. Both are now
-  `measuredNumber(dbStats.dataSize)`: absent, the overview omits `databaseSizeBytes` and reports
-  `databaseSize: "N/A"`; measured, a real `0` still formats as `"0 B"`. MongoDB's own
+  0 bytes from a `db.stats()` that answered without `dataSize`. Both are now `measuredNumber(...)`:
+  absent, the field is omitted and `databaseSize` reads `"N/A"`; measured, a real `0` still formats
+  as `"0 B"`. MongoDB's own
   [`dbStats` reference](https://www.mongodb.com/docs/manual/reference/command/dbStats/) documents
   `dataSize` unconditionally - the only output fields it gates are `freeStorageSize`,
   `indexFreeStorageSize` and `totalFreeStorageSize`, on the command's `freeStorage: 1` option - so
   this arm is **not** a deployment measured in this repo; it is the input `|| 0` could not
   distinguish, and the optional field exists to carry it.
+
+**What `getOverview()` publishes is a sum**, `dataSize + indexSize`, and the reason is field parity
+rather than a shared unit: `dbStats.dataSize` and `dbStats.indexSize` are documented as the
+database-level sums of the collection-level `collStats.size` and `collStats.totalIndexSize`, which
+are the two fields `getTableStats()` builds each row from, so the database figure is exactly the sum
+of the row figures. That figure is the denominator of every share on the Storage tab and the
+numerators carry both measures: a collection's row is `collStats.size + collStats.totalIndexSize`
+and the *Indexes* card sums `totalIndexSize`. `dataSize` alone left index bytes in the numerator
+only, so on MongoDB 8.2 the *Indexes* card read 1062.8% of the database and a `customers` collection
+read 354.7% (#1455). `dbStats.totalSize` is the other candidate and the wrong one: it is
+`storageSize + indexSize`, and `storageSize` is the on-disk footprint including pre-allocated space,
+so it is not the measure the rows are in. When either addend is unpublished the key is omitted
+rather than filled in: a sum of one reading and one guess is not a reading, and `dataSize` alone is
+exactly the state the shares were wrong in. `getHealth()`'s `databaseSize` publishes the same sum,
+because the admin fleet view prints it per row beside the overview's byte total, and both are one
+database's size.
 
 **What the absence buys is a whole panel.**
 [`StorageTab.tsx`](../../src/components/monitoring/tabs/StorageTab.tsx) keys its entire breakdown off
@@ -1000,11 +1099,19 @@ uses `getDatabaseName()`, the name `connect()` opened - a connection-string conn
 
 | Type | MongoDB action |
 |------|----------------|
-| `analyze` | `validate` (one collection, or every collection) |
-| `vacuum` / `optimize` | `compact` (one collection, or best-effort all) |
+| `analyze` | `validate` (one collection, or every collection; views skipped) |
+| `vacuum` / `optimize` | `compact` (one collection, or every collection; views skipped) |
 | `check` | `dbCheck` (**requires** a collection target) |
 | `kill` | `killOp` (**requires** an opid) |
 | `reindex` | **unsupported** — returns a message (the `reIndex` command was removed in MongoDB 6.0+) |
+
+Without a target, `validate` and `compact` run on every entry `listCollections()` answers except
+views, which the server refuses for both (#1408). A time series collection is attempted, not
+dropped: the test is view versus everything else, as in the object tree. A refusal from one
+collection is collected rather than ending the run, and the result names it:
+`Validated 3 collections; skipped 1 view; failed on 1: users (<server message>)`, with `success`
+false whenever anything failed. Before #1408 the first view aborted the validate loop with a 500,
+and the compact loop swallowed every error into a bare "Compacted collections".
 
 `getCapabilities().maintenanceOperations = ['vacuum', 'analyze', 'check']` — so the UI surfaces those
 three, though `runMaintenance` also accepts `optimize`/`kill`/`reindex` when invoked directly.
@@ -1045,6 +1152,7 @@ request here.
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — the query language is JSON commands, so there is no `UPDATE ... SET` for the results grid's inline editor to emit |
+| `supportsTestDataGeneration` | `true` - a separate fact from the flag above: the Generate Test Data dialog writes one `insertMany` command, which a collection takes ([§3.3](#33-sampling-based-schema-inference-nested-to-three-levels)), so both row menus offer it (#1468) |
 | `supportsResultPagination` | `false` — `prepareQuery` pins `offset` to 0 and returns the command untouched, so page two would be page one. The find document's own `limit` stays the bound here (#816) |
 | `supportsTransactions` | `false` — multi-document transactions need a client session this provider does not hold, so BEGIN/COMMIT/ROLLBACK and SANDBOX are not offered; they used to be, and answered HTTP 400 (#464) |
 | `declaresForeignKeys` | `false` — MongoDB has no foreign key constraint at all, so an empty `foreignKeys` list here is the engine's model and not this database's shape |

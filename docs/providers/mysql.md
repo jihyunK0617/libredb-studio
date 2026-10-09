@@ -61,7 +61,11 @@ answer with a plain MySQL number and give nothing to key on. Apache Doris is the
 (a fixed `5.7.99`), but it does put its real build in `@@version_comment`
 (`doris version doris-4.1.3-rc02-7126cf65d96`), which the same query now reads alongside `VERSION()`,
 so `labelServerVersion()` shows `Apache Doris 4.1.3-rc02-7126cf65d96` there instead of the fictitious
-number.
+number. Percona Server for MySQL answers `VERSION()` with a bare `8.4.11-11` and names itself only in
+`@@version_comment` (`Percona Server (GPL), Release 11`, measured on `percona/percona-server:latest`),
+so a comment starting with `Percona Server` labels it `Percona Server 8.4.11-11` (#1444); MySQL's own
+comment (`MySQL Community Server - GPL`) and MariaDB's (`mariadb.org binary distribution`) do not
+match.
 
 **`performance_schema` is OFF by default on MariaDB.** Measured on `mariadb:12.3`
 (`@@performance_schema` = 0, build `12.3.2-MariaDB-ubu2404`): the `performance_schema` tables exist,
@@ -266,8 +270,8 @@ against three live servers:
 One behaviour does differ, and only for a connection that opted into `multipleStatements=true` in its
 connection string: a `;`-separated statement is rejected by the prepared protocol and accepted by the
 text one, which then answers an array of result sets. That is the shape `CALL <procedure>()` already
-answers today on both protocols, so nothing new reaches the envelope; the app splits multi-statement
-input itself (`POST /api/db/multi-query`) and issues one statement per call.
+answers on both protocols, and the envelope reads it the same way ([§5.1](#51-execution)); the app
+splits multi-statement input itself (`POST /api/db/multi-query`) and issues one statement per call.
 
 `rowCount` is `rows.length` **only when the driver returns a row array** (i.e. `SELECT`); for a
 non-`SELECT` statement mysql2 returns a `ResultSetHeader` rather than an array, and the provider
@@ -371,7 +375,12 @@ their tables (49 under `system`) and views, a table expands to its columns and o
 storage statistics answer, and an inline edit of a `VARCHAR` to `it's \ edited` was saved and read
 back exactly. Through the provider, a value holding all nine characters above round-tripped through an
 `INSERT`, an `UPDATE ... WHERE name = ?` (one row matched) and a read. What stays unavailable there is
-the engine's: see [README.md](./README.md#wire-compatible-engines).
+the engine's: no `information_schema.ROUTINES`, `TRIGGERS` or `EVENTS`, no `SHOW STATUS`, no
+`information_schema.processlist` or `performance_schema`, no index statistics, no foreign keys, and no
+transaction state in the status flags ([§6.0.1](#601-servers-that-report-no-transaction-state)).
+Databend is no longer a relative of this provider: it ships as the `databend` type-id over its own HTTP
+query API ([databend.md](./databend.md)), and these measurements stay as the record of what its MySQL
+handler answers a `mysql` connection.
 
 ### 3.5 No server-side query timeout
 
@@ -652,8 +661,34 @@ standard envelope with the driver's own values
 ([§3.3](#33-blob--binary-values-reach-every-surface-as-bytes)):
 
 ```ts
-{ rows, fields: string[], rowCount: rows.length, executionTime, columnTypes? }
+{ rows, fields: string[], rowCount: rows.length, executionTime, columnTypes?, resultSets? }
 ```
+
+**Every column keeps its own value.**
+`query()` and `queryInTransaction()` ask `mysql2` for array rows (`rowsAsArray: true`, on the text protocol, the prepared one, the client-side binding and the utf8mb3 relabelling path alike), name the columns with `uniqueFieldNames` ([result-fields.ts](../../src/lib/db/utils/result-fields.ts)) and key each row by those names by position.
+`mysql2`'s object rows key a value by its column's name and keep the last of two columns that share one, so before this a repeated name lost a value with no error.
+`rowsAsArray` changes the row's shape and nothing else: `dateStrings`, `supportBigNumbers` and the relabelled decoding read every value as before.
+`columnTypes` is keyed by the same names.
+A row whose value count is not the column count raises a `QueryError` rather than being read.
+The provider's own reads (the object tree, monitoring, maintenance) keep object rows, because they read columns by names they wrote themselves.
+
+Measured on MySQL 8.4 through `mysql2` 3.24.5 on 2026-10-07, before and after:
+
+| Statement | Before | After |
+|---|---|---|
+| `SELECT 1 AS a, 2 AS a` | fields `["a","a"]`, row `{"a":2}` | fields `["a","a (2)"]`, row `{"a":1,"a (2)":2}` |
+| `SELECT 1, 1` (MySQL names an unaliased expression by its text) | fields `["1","1"]`, row `{"1":1}` | fields `["1","1 (2)"]`, row `{"1":1,"1 (2)":1}` |
+| `SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id` | fields `["id","customer_id","item","id","name"]`, the customer's id under both `id` headers, the order's id gone | fields `["id","customer_id","item","id (2)","name"]`, the order's id under `id` and the customer's under `id (2)` |
+| `SELECT ''` (MySQL names a column holding an empty string literal by it, and `SELECT 1 AS ''` names it empty too) | fields `[""]`, which the results grid cannot take as a column id | fields `["(No column name)"]`, row `{"(No column name)":""}` |
+| `SELECT '', ''` | fields `["",""]`, one value under `""` | fields `["(No column name)","(No column name) (2)"]`, both values |
+| `CALL sys.ps_setup_show_enabled(FALSE, FALSE)` | `TypeError: undefined is not an object (evaluating 'f.name')`, after the procedure had run | the first of its four result sets, and all four in `resultSets` |
+
+An empty column name is named `(No column name)`, as `uniqueFieldNames` names it for every engine.
+
+**A `CALL` answers a list of result sets.**
+`mysql2` answers one result set per SELECT the procedure ran and the call's own OK packet last, with the field packets one list per set and `undefined` for each header.
+`rows`, `fields` and `columnTypes` are the first set's, `rowCount` its row count, and `resultSets` lists every set when there are several.
+A list with no result set in it, which only a connection that opted into `multipleStatements` can receive, answers the first header's `affectedRows`.
 
 Native `mysql2` errors are normalised via `mapDatabaseError()` into the shared
 [`errors.ts`](../../src/lib/db/errors.ts) classes.
@@ -779,6 +814,14 @@ the connection the pool check already holds, `probeExplainFormat()`
 that is refused, `EXPLAIN SELECT 1`. The first statement that succeeds names the format
 `getCapabilities()` then declares.
 
+Only when both are refused does it read one base table of the session's database
+(`SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE() AND
+table_type = 'BASE TABLE' LIMIT 1`) and ask the same two grammars, in the same order, about
+`SELECT * FROM <table> LIMIT 0` (#1393). A refusal of `SELECT 1` can be about the statement rather
+than the grammar, as the Vitess 25.0.0-SNAPSHOT row shows. A server that explains `SELECT 1` is never
+asked for a table, so every other row below sends exactly what it sent before. A database with no
+base table, or a lookup the server refuses, leaves no Explain.
+
 Measured 2026-09-06 through `mysql2` 3.24.2 over the text protocol, one connection per engine:
 
 | Engine (image) | `EXPLAIN FORMAT=JSON SELECT 1` | plain `EXPLAIN SELECT 1` | resulting `explainFormat` |
@@ -791,7 +834,7 @@ Measured 2026-09-06 through `mysql2` 3.24.2 over the text protocol, one connecti
 | Apache Doris 4.1.3 (`apache/doris:all-in-one-4.1.3`) | errno 1105 `mismatched input '=' expecting {<EOF>, ';'}(line 1, pos 14)` | ok, one column `Explain String(Nereids Planner)` | `mysql-text` |
 | Vitess 24.0.2 (`vitess/vttestserver:v24.0.2-mysql80`) | ok, one column `EXPLAIN` (the QUOTED `EXPLAIN FORMAT='json'` is errno 1105 there; the unquoted form the probe sends is accepted) | ok, 12 tabular columns | `mysql-json` |
 | Vitess 24.0.4 (`vitess/vttestserver:v24.0.4-mysql84`), re-measured 2026-10-04 | ok | ok | `mysql-json` |
-| Vitess 25.0.0-SNAPSHOT (`vitess/vttestserver:mysql84`, the floating tag, built 2026-10-02), measured 2026-10-04 | errno 1105 `VT03031: EXPLAIN is only supported for single keyspace`, because `SELECT 1` names no table; `EXPLAIN FORMAT=JSON SELECT * FROM customers` is answered | the same `VT03031` | none, so the Explain panel is unavailable on that build (an open defect in the probe's statement, not fixed here) |
+| Vitess 25.0.0-SNAPSHOT (`vitess/vttestserver:mysql84`, the floating tag, built 2026-10-02 and again 2026-10-08), measured 2026-10-04 and 2026-10-09 | errno 1105 `VT03031: EXPLAIN is only supported for single keyspace`, because `SELECT 1` names no table (`SELECT 1 FROM dual` too); `EXPLAIN FORMAT=JSON SELECT * FROM customers LIMIT 0` is answered | the same `VT03031` | `mysql-json` since #1393, from the table form; the lookup answers `customers` through vtgate, which rewrites the schema to the shard's `vt_e2e_0`. An empty keyspace has no table to ask about and still gets none |
 | OceanBase CE 4.4.2 (`oceanbase/oceanbase-ce:4.4.2-lts`, tenant `test`) | ok, 8 rows in one column `Query Plan`, an ASCII plan | ok, 9 rows in the same column | `mysql-json` |
 | Databend 1.2.925 (`datafuselabs/databend:v1.2.925-patch-11`) | errno 1105, SyntaxException | ok, one column `explain`, 5 rows | `mysql-text` |
 
@@ -1171,14 +1214,27 @@ That is what ends the single-database confinement. MySQL resolves a qualified na
 on one connection, unlike PostgreSQL where a `pg` pool is pinned to one database, so every
 database the server holds is genuinely browsable from one session.
 
-Four schemas are hidden: `information_schema`, `mysql`, `performance_schema`, `sys`. It is a
-hand-written name list, unlike Oracle's `ORACLE_MAINTAINED` and PostgreSQL's `pg_depend` ownership
-test, because neither server publishes the fact: nothing in `SCHEMATA` says whether a schema is the
-server's own. What makes the list safe is that all four names are RESERVED, so hiding them can never
-hide a database a person created; measured 2026-09-11, `SCHEMATA` holds exactly these four plus the
-user's own on both servers. They are hidden from the BROWSER and stay fully reachable from the SQL
-editor, the same treatment `pg_catalog` gets on PostgreSQL, and this provider itself reads two of
-them.
+Four schemas are hidden on every server: `information_schema`, `mysql`, `performance_schema`, `sys`.
+It is a hand-written name list, unlike Oracle's `ORACLE_MAINTAINED` and PostgreSQL's `pg_depend`
+ownership test, because neither server publishes the fact: nothing in `SCHEMATA` says whether a schema
+is the server's own. What makes the list safe is that all four names are RESERVED, so hiding them can
+never hide a database a person created; measured 2026-09-11, `SCHEMATA` holds exactly these four plus
+the user's own on both servers. They are hidden from the BROWSER and stay fully reachable from the SQL
+editor, the same treatment `pg_catalog` gets on PostgreSQL, and this provider itself reads two of them.
+
+Some wire-compatible engines own more, and those names are hidden **only on the engine that owns
+them**, keyed on what the server says it is at connect time (#1428):
+
+| Engine | Hidden as well | Recognised by |
+|---|---|---|
+| TiDB v8.5.1, v8.5.8 | `METRICS_SCHEMA` | `VERSION()` contains `TiDB` |
+| OceanBase 4.4.2.1 CE | `oceanbase` | `VERSION()` contains `OceanBase` |
+| SingleStore 8.7.12, 9.1.1 | `cluster`, `memsql` | `@@version_comment` starts with `SingleStoreDB`; `VERSION()` is a plain `5.7.32` |
+
+They are not hidden everywhere because none of them is reserved on MySQL: measured 2026-10-09 on
+MySQL 8.4, `CREATE DATABASE` accepts `METRICS_SCHEMA`, `oceanbase`, `cluster` and `memsql`, and a
+MySQL user's database of that name stays listed. A server whose `@@version_comment` is refused or NULL
+is treated as unmeasured and gets the reserved four only.
 
 **`SHOW DATABASES` and not `information_schema.SCHEMATA`, because of Vitess.** Through vtgate the two
 disagree, and only `SHOW DATABASES` names something a statement can address. Measured 2026-10-04 on
@@ -1225,16 +1281,17 @@ started with `--skip-show-database`, as a user granted only `e2e.*`: `SHOW DATAB
 errno 1227, and only on it, `listContainers()` reads `SCHEMATA` instead, so that user's tree shows `e2e`
 exactly as it did before. Any other failure is raised as it is.
 
-Three consequences of reading a `SHOW` statement. The reserved four are dropped by the provider after
+Three consequences of reading a `SHOW` statement. The reserved names are dropped by the provider after
 the read rather than by a `WHERE`, because vtgate ignores a `WHERE` on `SHOW DATABASES` and answers all
-five rows anyway; the comparison is by exact name, which is what the former `NOT IN (...)` did on
-MySQL (`utf8mb3_bin`) and TiDB (`utf8mb4_bin`), so TiDB's upper-case `INFORMATION_SCHEMA`,
-`METRICS_SCHEMA` and `PERFORMANCE_SCHEMA` are listed exactly as before. On MariaDB, whose `SCHEMATA`
-collates `utf8mb3_general_ci`, the former clause compared without regard to case, so a user database
-named `SYS` or `Mysql` (possible with `lower_case_table_names=0`) was hidden before and is listed now.
-And the order is the provider's code-point order over the path, the rule `listObjects` already uses,
-because vtgate answers unsorted; on MariaDB that differs from the former SQL order only for database
-names that differ in case.
+five rows anyway. `information_schema` and `performance_schema` are compared without regard to case,
+because TiDB answers them as `INFORMATION_SCHEMA` and `PERFORMANCE_SCHEMA`, and no spelling of either
+can be a person's: measured 2026-10-09 on MySQL 8.4 with `lower_case_table_names=0`, `CREATE DATABASE
+INFORMATION_SCHEMA` and `CREATE DATABASE Performance_Schema` both answer 1044. `mysql` and `sys` are
+compared by exact name, because the same server accepts `CREATE DATABASE MYSQL` and `CREATE DATABASE
+SYS`, and those stay listed. The engine-owned names above are exact too, in the spelling each engine
+answers. And the order is the provider's code-point order over the path, the rule `listObjects`
+already uses, because vtgate answers unsorted; on MariaDB that differs from the former SQL order only
+for database names that differ in case.
 
 `Container.isSessionDefault` comes from `SELECT DATABASE()`, the server's own answer for which
 database the session is in, rather than from `config.database`, because the configured value is what a
@@ -1941,7 +1998,7 @@ reading does not have. `HealthInfo.slowQueries` is a `SlowQuery[]`: no error fie
 refusal cannot be represented in this reading at all. Nothing renders it either — no component reads
 `HealthInfo.slowQueries` (the monitoring Queries and Overview tabs read `MonitoringData.slowQueries`,
 a different reading), and the one caller of `POST /api/db/health`, the 60s connection pulse in
-[`use-connection-manager.ts`](../../src/hooks/use-connection-manager.ts), reads `res.ok` and
+[`use-connection-pulse.ts`](../../src/hooks/use-connection-pulse.ts), reads `res.ok` and
 discards the body. `ProviderLabels.slowQueriesEmptyState` is **not** a carrier for it: `QueriesTab`
 renders that one fixed sentence for every empty list whatever produced it, which is why the sentence
 had to stop naming a cause (it used to end *"enable the Performance Schema to see them"* — the one
@@ -1973,11 +2030,11 @@ and the missing threshold are stated at
 [`HEALTH_SLOW_QUERY_LIMIT`](../../src/lib/db/providers/sql/mysql.ts) and pinned by a test that reads
 the statement the health call actually issued.
 
-**Sibling engines.** All nine MySQL-protocol engines in
+**Sibling engines.** All eight MySQL-protocol engines in
 [`compatibility.ts`](../../src/lib/db/compatibility.ts) — MariaDB, Percona Server for MySQL, TiDB,
-StarRocks, Apache Doris, Databend, Vitess, OceanBase, SingleStore — reach this exact code, so every
+StarRocks, Apache Doris, Vitess, OceanBase, SingleStore — reach this exact code, so every
 one of them showed the sentence and none of them shows it now. MariaDB and Percona are the two
-measured above; on the other seven the health line now carries whatever their own
+measured above; on the other six the health line now carries whatever their own
 `performance_schema.events_statements_summary_by_digest` publishes for the connected schema, and an
 empty list where it publishes nothing or the table cannot be read. OceanBase is the one whose reading
 changes shape without changing meaning: its tenants have no `performance_schema` database at all
@@ -2214,6 +2271,7 @@ gated on the literal `vacuum`, so MySQL's own wording was written and never show
 | `supportsExternalQueryLimiting` | `true` (from base) |
 | `supportsCreateTable` | `true` (from base) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core MySQL DML |
+| `supportsTestDataGeneration` | `true` - the row menus offer Generate Test Data on tables, which writes one multi-row `INSERT INTO ... VALUES` |
 | `supportsResultPagination` | `true` — `LIMIT n OFFSET m` from the shared limiter (#816) |
 | `supportsTransactions` | `true`: the transaction runs on one held connection opened with `BEGIN` ([§6.0.1](#601-servers-that-report-no-transaction-state)), so the trio and the SANDBOX toggle are offered (#464) |
 | `implicitCommitStatements` | `ALTER`, `ANALYZE`, `BEGIN`, `CACHE`, `CHANGE`, `CHECK`, `CREATE`, `DROP`, `FLUSH`, `GRANT`, `INSTALL`, `LOCK`, `OPTIMIZE`, `RENAME`, `REPAIR`, `RESET`, `REVOKE`, `START`, `STOP`, `TRUNCATE`, `UNINSTALL`, `UNLOCK`: the statements MySQL commits implicitly, which SANDBOX refuses before sending ([§6.0](#60-what-the-server-says-about-the-transaction)) |

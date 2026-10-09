@@ -113,6 +113,38 @@ let lastMongoUri = "";
 // `MongoClient` constructor is the only place it is stated.
 let lastMongoOptions: Record<string, unknown> = {};
 
+// ----------------------------------------------------------------------------
+// #1573: the connect deadline. The mock client has to behave like the driver on
+// the two paths the deadline opens: it must RELAY the heartbeat failure the way
+// `Topology` relays `serverHeartbeatFailed` to the client, and its `close()` must
+// be countable, because "no client outlives a timed-out connect" is the second
+// acceptance criterion of the issue.
+// ----------------------------------------------------------------------------
+
+/**
+ * How the next `MongoClient.connect()` behaves. `undefined` connects at once; a
+ * function returns its promise, which the deadline tests leave pending the way a
+ * server-selection loop retries a refused port until its own 30 s bound.
+ */
+let mockConnectBehavior: (() => Promise<void>) | undefined;
+/**
+ * The failure the monitoring delivered, delivered to every `serverHeartbeatFailed`
+ * listener the provider registered on the client, exactly as the driver does.
+ */
+let mockHeartbeatFailure: Error | undefined;
+/** Every `close()` the mocked clients received, per client instance, in order. */
+let mockClientCloses: number[] = [];
+
+/** Delivers the configured heartbeat failure the way the driver relays it. */
+function emitMockHeartbeatFailure(): void {
+  if (mockHeartbeatFailure === undefined) return;
+  // The event shape `ServerHeartbeatFailedEvent` carries: the refusal is on `.failure`.
+  const event = { failure: mockHeartbeatFailure };
+  for (const listener of mockHeartbeatListeners) listener(event);
+}
+/** The provider's heartbeat listeners on the current client, as `on()` registered them. */
+let mockHeartbeatListeners: ((event: { failure: Error }) => void)[] = [];
+
 const createMockCursor = (data: Record<string, unknown>[]) => {
   const cursor = {
     project: () => cursor,
@@ -271,6 +303,9 @@ const createMockCollection = (name = "users", dbName = "testdb") => ({
 
 const mockCommandResults: Record<string, unknown> = {};
 
+/** A per-collection `validate` / `compact` refusal, by collection name (#1408). */
+let mockMaintenanceRefusal: Record<string, Error> = {};
+
 /**
  * What `serverStatus` answers, as a function rather than a literal: the metric
  * paths have to be driven on a server that publishes NO `wiredTiger` section
@@ -310,16 +345,32 @@ const defaultDbStats = () => ({
 
 let mockDbStats: () => Record<string, unknown> = defaultDbStats;
 
+/**
+ * Per-collection `collStats` answers, for a test that has to drive the ROW BYTES rather
+ * than the one shared fixture below. A collection the map does not name keeps answering
+ * `{ size: 1024, totalIndexSize: 512, count: 42 }`.
+ */
+let mockCollStatsByCollection: Record<string, { size: number; totalIndexSize: number; count: number }> = {};
+
 const createMockDb = (dbName = "testdb") => ({
   command: async (cmd: Record<string, unknown>) => {
     if (cmd.ping) return { ok: 1 };
     if (cmd.collStats) {
-      if (isMockView(String(cmd.collStats), dbName))
-        throw commandNotSupportedOnView("collStats", String(cmd.collStats));
-      return { size: 1024, totalIndexSize: 512, count: 42 };
+      const collName = String(cmd.collStats);
+      if (isMockView(collName, dbName)) throw commandNotSupportedOnView("collStats", collName);
+      return mockCollStatsByCollection[collName] ?? { size: 1024, totalIndexSize: 512, count: 42 };
     }
-    if (cmd.validate) return { ok: 1, valid: true };
-    if (cmd.compact) return { ok: 1 };
+    if (cmd.validate || cmd.compact) {
+      const name = String(cmd.validate ?? cmd.compact);
+      // The server refuses both on a view, code 166 with these sentences (measured on
+      // 7.0.43, 8.0.32 and 8.2.12, #1408).
+      if (isMockView(name, dbName)) {
+        throw mongoServerError(166, cmd.validate ? "Cannot validate a view" : "can't compact a view");
+      }
+      const refusal = mockMaintenanceRefusal[name];
+      if (refusal !== undefined) throw refusal;
+      return cmd.validate ? { ok: 1, valid: true } : { ok: 1 };
+    }
     return mockCommandResults;
   },
   listCollections: () => ({
@@ -382,20 +433,40 @@ mock.module("mongodb", () => ({
   MongoClient: class MockMongoClient {
     private _uri: string;
     private _opts: unknown;
+    private _closes = 0;
 
     constructor(uri: string, opts?: unknown) {
       this._uri = uri;
       this._opts = opts;
       lastMongoUri = uri;
       lastMongoOptions = (opts ?? {}) as Record<string, unknown>;
+      mockClientCloses.push(0);
+    }
+
+    // The driver's client is an event emitter and `Topology` relays the monitor's
+    // `serverHeartbeatFailed` to it (`constants.js` SERVER_RELAY_EVENTS), which is
+    // where the provider reads the refusal the deadline reports (#1573).
+    on(event: string, listener: (...args: never[]) => void) {
+      if (event === "serverHeartbeatFailed") {
+        mockHeartbeatListeners.push(listener as (event: { failure: Error }) => void);
+      }
+      return this;
     }
 
     async connect() {
-      // noop — connection established
+      // The heartbeat failure lands while the connect is still selecting, as it does
+      // on a closed port: the monitor's connect attempt fails at once and the
+      // selection loop keeps retrying (#1458). Deferred to a microtask because the
+      // provider registers its `serverHeartbeatFailed` listener between the
+      // constructor and this call, and the monitor on a real client fires only once
+      // the topology starts connecting.
+      queueMicrotask(() => emitMockHeartbeatFailure());
+      return mockConnectBehavior?.();
     }
 
     async close() {
-      // noop — connection closed
+      this._closes++;
+      mockClientCloses[mockClientCloses.length - 1] = this._closes;
     }
 
     db(name?: string) {
@@ -613,6 +684,7 @@ function resetObjectSurfaceMocks(): void {
   mockDatabaseList = [];
   mockCollectionsByDb = {};
   mockListCollectionsError = {};
+  mockMaintenanceRefusal = {};
   mockDocumentsByNs = {};
   mongoOpenedDatabases = [];
   mongoAggregatePipelines = [];
@@ -623,6 +695,10 @@ function resetObjectSurfaceMocks(): void {
   lastListDatabasesCommand = {};
   listDatabasesCommands = [];
   mockListDatabasesRefusal = undefined;
+  mockConnectBehavior = undefined;
+  mockHeartbeatFailure = undefined;
+  mockClientCloses = [];
+  mockHeartbeatListeners = [];
 }
 
 function useObjectFixture(): void {
@@ -660,6 +736,7 @@ describe("MongoDBProvider", () => {
     mockCurrentOps = [];
     mockServerStatus = defaultServerStatus;
     mockDbStats = defaultDbStats;
+    mockCollStatsByCollection = {};
     resetObjectSurfaceMocks();
     provider = new MongoDBProvider({ ...baseConfig });
   });
@@ -873,6 +950,146 @@ describe("MongoDBProvider", () => {
       await provider.connect(); // should not throw
       expect(provider.isConnected()).toBe(true);
     });
+
+    // #1458: server selection is a retry loop the driver runs until its own deadline, and
+    // `serverSelectionTimeoutMS` is a client option it applies to every query and write,
+    // so the bound has to clear a replica set election as well as the initial dial. The
+    // defect was handing it `pool.acquireTimeout` - 60000 by default - which made Test
+    // Connection to a port nothing listens on spin for a minute before the `ECONNREFUSED`
+    // it already had. `connectTimeoutMS` did not bound it: that caps one TCP attempt, and a
+    // refusal fails that attempt at once.
+    test("server selection carries its own bound, not the pool acquire timeout", async () => {
+      await provider.connect();
+      expect(lastMongoOptions.serverSelectionTimeoutMS).toBe(30000);
+      expect(lastMongoOptions.connectTimeoutMS).toBe(60000);
+    });
+
+    test("a configured pool still reaches the driver, and does not move the selection bound", async () => {
+      provider = new MongoDBProvider(
+        { ...baseConfig },
+        { pool: { min: 1, max: 4, idleTimeout: 12000, acquireTimeout: 25000 } },
+      );
+      await provider.connect();
+      expect(lastMongoOptions).toMatchObject({
+        minPoolSize: 1,
+        maxPoolSize: 4,
+        maxIdleTimeMS: 12000,
+        connectTimeoutMS: 25000,
+        serverSelectionTimeoutMS: 30000,
+      });
+    });
+
+    // #1573: the request that starts a connect carries its own deadline, `queryTimeout`,
+    // which `connect()` used not to read. The driver's server selection waits out its own
+    // 30 s bound on a closed port (#1458), so Test Connection spun past the request's
+    // query timeout. The contract here is pinned against a mocked driver; the wall-clock
+    // measurement against the real one is `mongodb-server-selection.test.ts`.
+    describe("the request's query timeout bounds connect() (#1573)", () => {
+      test("a connect that outlives queryTimeout is refused, the client closed, and the refusal names the driver's error", async () => {
+        mockConnectBehavior = () => new Promise<void>(() => {});
+        mockHeartbeatFailure = new Error("connect ECONNREFUSED 127.0.0.1:27999");
+        const deadlineProvider = new MongoDBProvider({ ...baseConfig }, { queryTimeout: 25 });
+
+        const started = Date.now();
+        let refusal = "";
+        try {
+          await deadlineProvider.connect();
+          refusal = "connect() returned while its driver was still selecting";
+        } catch (error) {
+          refusal = error instanceof Error ? error.message : String(error);
+        }
+        const elapsed = Date.now() - started;
+
+        // The deadline is queryTimeout (25 ms here), not the driver's 30 s: the margin
+        // is for a slow machine, the defect waits the driver's own bound out.
+        expect(elapsed).toBeLessThan(5000);
+        expect(refusal).toContain("ECONNREFUSED");
+        // No client outlives a timed-out connect: close() was called on it.
+        expect(mockClientCloses[0]).toBeGreaterThan(0);
+
+        await deadlineProvider.disconnect();
+      }, 10_000);
+
+      test("a later connect() starts fresh after a timed-out one", async () => {
+        let release: (() => void) | undefined;
+        mockConnectBehavior = () => new Promise<void>((resolve) => (release = resolve));
+        mockHeartbeatFailure = new Error("connect ECONNREFUSED 127.0.0.1:27999");
+        const deadlineProvider = new MongoDBProvider({ ...baseConfig }, { queryTimeout: 25 });
+
+        await expect(deadlineProvider.connect()).rejects.toThrow(/ECONNREFUSED/);
+        // The connect settles after the deadline (the SRV window: `_connect` resolves
+        // SRV before it creates the topology, so a close during the lookup is a no-op)
+        // and the client is closed again once it does: the close count goes from 1
+        // (the deadline path) to 2 (the settle), pinning the second close.
+        expect(mockClientCloses.length).toBe(1);
+        expect(mockClientCloses[0]).toBe(1);
+        release?.();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(mockClientCloses.length).toBe(1);
+        expect(mockClientCloses[0]).toBe(2);
+
+        // A fresh connect succeeds on the same provider, on a new client.
+        mockConnectBehavior = undefined;
+        await deadlineProvider.connect();
+        expect(deadlineProvider.isConnected()).toBe(true);
+        expect(mockClientCloses.length).toBe(2);
+
+        await deadlineProvider.disconnect();
+      }, 10_000);
+
+      test("a timed-out connect clears the provider's client so a later disconnect() closes nothing", async () => {
+        // Pins `this.client = null` on the timeout path (#1573). Deleting that clear
+        // leaves the timed-out client on the provider: every query is still refused
+        // (the state is not connected), but a later `disconnect()` finds the stale
+        // client and closes it a third time.
+        let release: (() => void) | undefined;
+        mockConnectBehavior = () => new Promise<void>((resolve) => (release = resolve));
+        mockHeartbeatFailure = new Error("connect ECONNREFUSED 127.0.0.1:27999");
+        const deadlineProvider = new MongoDBProvider({ ...baseConfig }, { queryTimeout: 25 });
+
+        await expect(deadlineProvider.connect()).rejects.toThrow(/ECONNREFUSED/);
+        release?.();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        // The deadline closed the client once and the settle closed it again.
+        expect(mockClientCloses.length).toBe(1);
+        expect(mockClientCloses[0]).toBe(2);
+
+        // With the clear, `disconnect()` is a no-op: the client it would close is
+        // already gone. Without it, the stale client takes a third close.
+        await deadlineProvider.disconnect();
+        expect(mockClientCloses.length).toBe(1);
+        expect(mockClientCloses[0]).toBe(2);
+      }, 10_000);
+
+      test("a failed connect leaves no half-open client behind", async () => {
+        // The driver's own refusal, before any deadline: `connect()` used to keep
+        // `this.client` set while `this.db` stayed null, so a later `connect()` found
+        // the half-open one and returned as if it were connected (#1573).
+        mockConnectBehavior = async () => {
+          throw new Error("connect ECONNREFUSED 127.0.0.1:27999");
+        };
+        const failingProvider = new MongoDBProvider({ ...baseConfig });
+        await expect(failingProvider.connect()).rejects.toThrow(/ECONNREFUSED/);
+        expect(mockClientCloses.length).toBe(1);
+        expect(mockClientCloses[0]).toBeGreaterThan(0);
+
+        mockConnectBehavior = undefined;
+        await failingProvider.connect();
+        expect(failingProvider.isConnected()).toBe(true);
+        expect(mockClientCloses.length).toBe(2);
+
+        await failingProvider.disconnect();
+      });
+
+      test("a connect within the deadline is untouched: one client, no close", async () => {
+        const fastProvider = new MongoDBProvider({ ...baseConfig }, { queryTimeout: 10000 });
+        await fastProvider.connect();
+        expect(fastProvider.isConnected()).toBe(true);
+        expect(mockClientCloses.length).toBe(1);
+        expect(mockClientCloses[0]).toBe(0);
+        await fastProvider.disconnect();
+      });
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -904,6 +1121,8 @@ describe("MongoDBProvider", () => {
       // No SQL at all here: the query language is JSON commands, so the inline row
       // editor's `UPDATE ... SET` has nothing to run against (#269).
       expect(caps.supportsInlineRowEdit).toBe(false);
+      // The generator writes `insertMany`, not the grid's `UPDATE ... SET`, so it is offered (#1468).
+      expect(caps.supportsTestDataGeneration).toBe(true);
       // `prepareQuery` pins `offset` to 0 and returns the command untouched, so page two
       // would be page one. The control is hidden rather than offered (#816).
       expect(caps.supportsResultPagination).toBe(false);
@@ -1011,6 +1230,21 @@ describe("MongoDBProvider", () => {
       const result = await provider.query(JSON.stringify({ collection: "mixed", operation: "find", filter: {} }));
       expect(result.fields).toEqual(["_id", "name", "ts", "balance", "tags", "re"]);
       expect(result.rows.length).toBe(3);
+    });
+
+    // BSON carries an empty key (`BSON.deserialize(BSON.serialize({ "": 1 }))` answers `{ "": 1 }`,
+    // measured in-process 2026-10-07), and a grid column cannot take an empty id.
+    test("a document key that is empty is answered under a name of its own", async () => {
+      mockDocumentsByNs["testdb.blank"] = [
+        { _id: new MockObjectId("b1"), "": "blank" },
+        { _id: new MockObjectId("b2"), name: "B" },
+      ];
+      const result = await provider.query(JSON.stringify({ collection: "blank", operation: "find", filter: {} }));
+      expect(result.fields).toEqual(["_id", "(No column name)", "name"]);
+      expect(result.rows).toEqual([
+        { _id: "b1", "(No column name)": "blank" },
+        { _id: "b2", name: "B" },
+      ]);
     });
 
     test("an empty find answers no columns", async () => {
@@ -1457,6 +1691,31 @@ describe("MongoDBProvider", () => {
       expect((await provider.getHealth()).databaseSize).toBe("0 B");
     });
 
+    test("getHealth publishes the same database size the overview does", async () => {
+      // The admin fleet view prints each row's `getHealth().databaseSize` and adds up
+      // `getOverview().databaseSizeBytes` as its total, and the Monitoring Overview's DB Size
+      // card reads the overview figure. While `getHealth()` still published `dataSize` alone,
+      // one MongoDB read two sizes side by side: a data-only row against a data+index total.
+      mockDbStats = () => ({ dataSize: 2048, indexSize: 1024, storageSize: 4096 });
+      const health = await provider.getHealth();
+      const overview = await provider.getOverview();
+
+      expect(health.databaseSize).toBe(overview.databaseSize);
+      expect(health.databaseSize).toBe("3 KB");
+    });
+
+    test("getHealth omits the database size when either addend is missing", async () => {
+      // The same omit-when-either-is-missing rule the overview follows: a sum of one reading
+      // and a guess is not a reading, and `indexSize` alone is no more a database size than
+      // `dataSize` alone was.
+      mockDbStats = () => ({ dataSize: 2048, storageSize: 4096 });
+      const health = await provider.getHealth();
+      const overview = await provider.getOverview();
+
+      expect(health.databaseSize).toBe("N/A");
+      expect(overview.databaseSize).toBe("N/A");
+    });
+
     test("maps in-progress operations to active sessions", async () => {
       mockCurrentOps = [
         {
@@ -1543,6 +1802,56 @@ describe("MongoDBProvider", () => {
 
     test("unsupported maintenance type throws", async () => {
       await expect(provider.runMaintenance("flush" as never)).rejects.toThrow();
+    });
+
+    // #1408: the whole-database loops ran `validate` on every `listCollections()` entry,
+    // views included, and the server refuses it on a view - so the first view aborted
+    // the run with a 500. Compact swallowed every error and answered a bare success.
+    describe("over the whole database (#1408)", () => {
+      beforeEach(() => {
+        mockCollections = [
+          { name: "users", type: "collection" },
+          { name: "active_users", type: "view" },
+          { name: "readings", type: "timeseries" },
+          { name: "orders", type: "collection" },
+        ];
+      });
+
+      test("validate skips the view, attempts the time series collection, and says so", async () => {
+        const result = await provider.runMaintenance("analyze");
+        expect(result).toMatchObject({
+          success: true,
+          message: "Validated 3 collections; skipped 1 view",
+        });
+      });
+
+      test("a collection whose validate fails is named while the rest still run", async () => {
+        mockMaintenanceRefusal.users = mongoServerError(13, "not authorized on testdb to execute command");
+        const result = await provider.runMaintenance("analyze");
+        expect(result).toMatchObject({
+          success: false,
+          message:
+            "Validated 2 collections; skipped 1 view; failed on 1: users (not authorized on testdb to execute command)",
+        });
+      });
+
+      test("compact skips the view and reports a failure instead of a bare success", async () => {
+        mockMaintenanceRefusal.orders = mongoServerError(20, "compact is not allowed here");
+        const result = await provider.runMaintenance("vacuum");
+        expect(result).toMatchObject({
+          success: false,
+          message: "Compacted 2 collections; skipped 1 view; failed on 1: orders (compact is not allowed here)",
+        });
+      });
+
+      test("a single collection and a single view read in the singular", async () => {
+        mockCollections = [
+          { name: "users", type: "collection" },
+          { name: "active_users", type: "view" },
+        ];
+        const result = await provider.runMaintenance("vacuum");
+        expect(result).toMatchObject({ success: true, message: "Compacted 1 collection; skipped 1 view" });
+      });
     });
   });
 
@@ -1679,6 +1988,89 @@ describe("MongoDBProvider", () => {
       // Everything the same read DID answer still arrives - this is not a failed read.
       expect(overview.tableCount).toBe(2);
       expect(overview.activeConnections).toBe(5);
+    });
+
+    test("the published size is the same measure as the table rows the Storage tab divides", async () => {
+      // The Storage tab's shares are `figure / overview.databaseSizeBytes`, and the figures
+      // that go into them are this provider's own: a collection's row is
+      // `collStats.size + collStats.totalIndexSize`, and the Indexes card sums
+      // `totalIndexSize` (`getTableStats()`). Publishing `dbStats.dataSize` alone - the
+      // documents, uncompressed - put index bytes in the numerator and left them out of the
+      // denominator, so the Indexes share and every collection carrying an index read over
+      // 100% (measured on MongoDB 8.2: 1062.8% for Indexes, 354.7% for `customers`).
+      mockDbStats = () => ({ dataSize: 2048, indexSize: 1024, storageSize: 4096 });
+      const overview = await provider.getOverview();
+      const tables = await provider.getTableStats();
+
+      // Both dbStats measures the collection rows are built from, summed once.
+      expect(overview.databaseSizeBytes).toBe(3072);
+      expect(overview.databaseSize).toBe("3 KB");
+
+      const total = overview.databaseSizeBytes ?? 0;
+      const dataBytes = tables.reduce((sum, t) => sum + (t.tableSizeBytes ?? 0), 0);
+      const indexBytes = tables.reduce((sum, t) => sum + (t.indexSizeBytes ?? 0), 0);
+      // `collStats` answers 1024 + 512 for each of the two collections.
+      expect(dataBytes).toBe(2048);
+      expect(indexBytes).toBe(1024);
+      // And every figure the tab divides now sits inside the total it divides by.
+      expect((dataBytes / total) * 100).toBeLessThanOrEqual(100);
+      expect((indexBytes / total) * 100).toBeLessThanOrEqual(100);
+      for (const table of tables) {
+        expect(((table.totalSizeBytes ?? 0) / total) * 100).toBeLessThanOrEqual(100);
+      }
+    });
+
+    test("a dbStats answer carrying only one of the two measures publishes no byte figure", async () => {
+      // The published size is a sum of two readings now, and one reading plus a guess is not
+      // a reading: `dataSize` alone is exactly the state the shares were wrong in, and 0 for
+      // the index bytes the answer never carried would be the same fabrication one step
+      // further in. The absence the optional field carries is unchanged by that.
+      mockDbStats = () => ({ dataSize: 2048, storageSize: 4096 });
+      const overview = await provider.getOverview();
+
+      expect("databaseSizeBytes" in overview).toBe(false);
+      expect(overview.databaseSize).toBe("N/A");
+      // What the same read did answer still arrives - this is not a failed read.
+      expect(overview.tableCount).toBe(2);
+    });
+
+    test("a time series collection is counted once, without its internal bucket collection", async () => {
+      // `listCollections` answers a time series collection TWICE: the collection itself
+      // (`type: "timeseries"`) and the server's own bucket collection
+      // `system.buckets.<name>`, and `collStats` answers the same bytes for both. Counting
+      // both put the collection's bytes into the rows twice, so Tables + Indexes summed past
+      // the database total and the Storage tab's "Other (unattributed)" remainder went
+      // negative (#1455). The numbers here are the `mongo:8` measurement the reviewer took:
+      // 110334 B of rows against a 105066 B total, the 5268 B time series collection counted
+      // twice.
+      mockCollections = [
+        { name: "weather", type: "timeseries" },
+        { name: "system.buckets.weather", type: "collection" },
+        { name: "sensors", type: "collection" },
+      ];
+      mockCollStatsByCollection = {
+        weather: { size: 5000, totalIndexSize: 268, count: 12 },
+        "system.buckets.weather": { size: 5000, totalIndexSize: 268, count: 12 },
+        sensors: { size: 99798, totalIndexSize: 0, count: 900 },
+      };
+      mockDbStats = () => ({ dataSize: 104798, indexSize: 268, storageSize: 4096 });
+
+      const overview = await provider.getOverview();
+      const tables = await provider.getTableStats();
+
+      const total = overview.databaseSizeBytes ?? 0;
+      expect(total).toBe(105066);
+      const dataBytes = tables.reduce((sum, t) => sum + (t.tableSizeBytes ?? 0), 0);
+      const indexBytes = tables.reduce((sum, t) => sum + (t.indexSizeBytes ?? 0), 0);
+      // The rows are the sums `dbStats` reports, each collection counted once...
+      expect(dataBytes).toBe(104798);
+      expect(indexBytes).toBe(268);
+      // ...so the figures the tab divides add up to the total they divide by and the
+      // remainder is not negative. Before the fix this pair read 110334 against 105066.
+      expect(dataBytes + indexBytes).toBe(total);
+      expect(total - dataBytes - indexBytes).toBeGreaterThanOrEqual(0);
+      // The internal bucket collection is not a second table.
+      expect(tables.map((t) => t.tableName).sort()).toEqual(["sensors", "weather"]);
     });
   });
 
@@ -1836,6 +2228,23 @@ describe("MongoDBProvider", () => {
   describe("getTableStats()", () => {
     beforeEach(async () => {
       await provider.connect();
+    });
+
+    test("skips system.* collections and keeps one whose name only starts with those letters", async () => {
+      // Monitoring listed `system.views` and `system.buckets.readings` while the tree hid both
+      // (#1428). The bucket here has no time-series parent, so the earlier duplicate-bucket
+      // check would have kept it; the reserved prefix is what drops it. `systemetrics` does
+      // not start with `system.` and is a collection a person created.
+      mockCollections = [
+        { name: "orders", type: "collection" },
+        { name: "system.views", type: "collection" },
+        { name: "system.buckets.readings", type: "collection" },
+        { name: "systemetrics", type: "collection" },
+      ];
+
+      const stats = await provider.getTableStats();
+
+      expect(stats.map((row) => row.tableName).sort()).toEqual(["orders", "systemetrics"]);
     });
 
     test("returns collection stats", async () => {
@@ -2489,6 +2898,63 @@ describe("object surface", () => {
       ["ts", "timestamp"],
       ["uid", "uuid"],
       ["weird", "Unlisted"],
+    ]);
+  });
+
+  // #1456: nullable was set only when a sampled value was `null`, so a field most documents
+  // lack read "Nullable: No" in Docs and `NN` in the ERD. Absent counts as empty too.
+  test("infers nullable from absent fields as well as nulls (#1456)", async () => {
+    mockDocumentsByNs["app.customers"] = [
+      {
+        _id: new MockObjectId("c1"),
+        name: "Ada",
+        city: "Istanbul",
+        nick: null,
+        address: { city: "Izmir", zip: "35000" },
+      },
+      { _id: new MockObjectId("c2"), name: "Grace", city: "Ankara", address: { city: "Ankara" } },
+      { _id: new MockObjectId("c3"), name: "Lin" },
+    ];
+    const detail = await objectProvider.describeObject(["app", "customers"], "collection");
+    expect(detail.columns.map((c) => [c.name, c.nullable])).toEqual([
+      ["_id", false],
+      // Absent from one document.
+      ["address", true],
+      ["address.city", true],
+      ["address.zip", true],
+      ["city", true],
+      // Present in every document, never null.
+      ["name", false],
+      // Present only once, and as null there.
+      ["nick", true],
+    ]);
+  });
+
+  test("a field present in every sampled document is nullable only when one of them holds null (#1456)", async () => {
+    mockDocumentsByNs["app.customers"] = [
+      { _id: new MockObjectId("c1"), name: "Ada", city: null },
+      { _id: new MockObjectId("c2"), name: "Grace", city: "Ankara" },
+    ];
+    const detail = await objectProvider.describeObject(["app", "customers"], "collection");
+    expect(detail.columns.map((c) => [c.name, c.nullable])).toEqual([
+      ["_id", false],
+      ["city", true],
+      ["name", false],
+    ]);
+  });
+
+  // #1456 review: `_id` follows the same rule as every other field. Measured on mongo:7, a
+  // collection holding `{_id: null}` and `{_id: 2}` (or a `$group` view with `_id: null`) has a
+  // null `_id`, and a fixed "never nullable" for `_id` contradicted the sample.
+  test("an _id that is null in a sampled document is nullable (#1456)", async () => {
+    mockDocumentsByNs["app.customers"] = [
+      { _id: null, name: "Ada" },
+      { _id: 2, name: "Grace" },
+    ];
+    const detail = await objectProvider.describeObject(["app", "customers"], "collection");
+    expect(detail.columns.map((c) => [c.name, c.type, c.nullable])).toEqual([
+      ["_id", "mixed(null|number)", true],
+      ["name", "string", false],
     ]);
   });
 

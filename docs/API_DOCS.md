@@ -27,12 +27,12 @@
 
 ## Overview
 
-LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant and Oxia.
+LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia and Databend.
 
 ### Key Features
 
 - **JWT Authentication** - Secure token-based authentication stored in HTTP-only cookies
-- **Multi-Database Support** - Twenty-six engines: PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia
+- **Multi-Database Support** - Twenty-seven engines: PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia, Databend
 - **AI-Powered Insights** - EXPLAIN explanations, query-safety analysis and schema docs, streamed
 - **Real-time Health Monitoring** - Database metrics and performance insights
 
@@ -811,6 +811,39 @@ carries a plain statement. Four things differ from the other SQL providers:
 
 ---
 
+##### Databend Query Format
+
+Databend speaks SQL over its own HTTP query API (`POST /v1/query`, port `8000` by default), so the `sql` field carries a plain statement.
+Four things differ from the other SQL providers:
+
+- **`database` is the default database** of every statement, and a statement may still name any other database in full.
+  `warehouse` names the compute every statement runs on, sent as the `X-DATABEND-WAREHOUSE` header; Databend Cloud requires one and resumes a suspended warehouse on the first statement, billing while it runs.
+- **A password needs TLS.** It travels in a Basic `Authorization` header on every request, so a connection with a password and no SSL mode to a host that is not this machine, and not reached through an SSH tunnel, is refused before any socket unless it sets `allowInsecureAuth`.
+- **No positional parameters.** A request carrying `params` is refused with "Databend's HTTP API takes no bound parameters from Studio; write the value in the statement."
+- **Each statement runs in its own session.** A transaction or a temporary table a statement leaves open ends with it: Studio rolls the transaction back and the response carries a `warning` saying so.
+
+```json
+{
+  "connection": {
+    "type": "databend",
+    "host": "localhost",
+    "port": 8000,
+    "user": "libredb",
+    "database": "libredb_demo"
+  },
+  "sql": "SELECT number, number * 2 AS doubled FROM numbers(3)"
+}
+```
+
+**Notes:**
+- `columnTypes` are Databend's declared type strings verbatim, such as `UInt64` or `Nullable(String)`; an integer past 2^53 and every decimal, date and timestamp value arrive as the server's text.
+- A duplicate output name is disambiguated rather than dropped: `fields` carries `id` and `id (2)`.
+- `POST /api/db/maintenance` accepts `kill` only, and its target is a session id from the Sessions panel (`system.processes.id`), not a query id, which `KILL QUERY` refuses with 1053; the answer's `message` names the session whose current statement Databend was asked to stop.
+- `POST /api/db/cancel` works: cancelling a running statement sends the server a kill for it.
+- Full reference: [`docs/providers/databend.md`](providers/databend.md).
+
+---
+
 ##### Apache Cassandra Query Format
 
 Cassandra speaks CQL over the native protocol (port `9042`), so the `sql` field carries a plain CQL
@@ -991,6 +1024,23 @@ Milvus's provider implements `engineUser()`: the Milvus user name, the user name
   "success": true,
   "executionTime": 1234,
   "message": "VACUUM completed successfully"
+}
+```
+
+A response can also carry `rows` (an array of objects) and `fields` (their column order), when the operation's answer is a table to read rather than only a sentence.
+Redis `analyze` is the only operation that fills them today: it runs `INFO` and returns one row per `key:value` metric, with the columns `section`, `key` and `value`, and the count in `message` is the number of rows.
+`fields` is present whenever `rows` is, and both are absent on every other operation.
+
+```json
+{
+  "success": true,
+  "executionTime": 3,
+  "message": "Server info retrieved (2 metrics)",
+  "rows": [
+    { "section": "Server", "key": "redis_version", "value": "7.2.4" },
+    { "section": "Clients", "key": "connected_clients", "value": "1" }
+  ],
+  "fields": ["section", "key", "value"]
 }
 ```
 
@@ -1884,6 +1934,11 @@ Mints a token for the signed-in user and role; it reads no body field and spends
 
 The write-through storage sync layer (see [`docs/STORAGE.md`](STORAGE.md)). Data is per-user, keyed by the session username.
 
+In server storage mode a browser tab that has matched its copy of the workspace to the signed-in account sends that account's username, URI-encoded, in the `X-LibreDB-Workspace-Owner` header on every request it makes through `appFetch`, not only on the storage routes.
+When the header is present and does not name the session's username, the middleware (`src/proxy.ts`) answers `409 { "error": "...", "code": "WORKSPACE_OWNER_MISMATCH" }` before any route runs, and the browser reloads the tab so the owner check runs again for the account signed in now.
+A request without the header is not checked: MCP clients, the agent drive callback, external clients and local mode behave as before.
+The public routes (`/api/auth/*`, `/api/storage/config`, `/api/db/health` and the others listed above) are not checked either, so a tab can still ask which account is signed in.
+
 #### GET /api/storage/config
 
 Public. Returns the active storage configuration so the client can discover whether server-side storage is enabled.
@@ -1975,6 +2030,9 @@ Events of type `agent_operation` come from the agent execution path (#328) and a
 
 Body `{ "connections": [...] }`; returns per-connection health `{ "results": [{ connectionId, status, latencyMs, ... }] }`. `400` if `connections` is missing. `401` with no session, `403` with a session that is not an admin — see the note above.
 Each connection is resolved the way the db routes resolve one: a managed seed by its `seedId`, a copy that claims a `seed:` id by the operator's record (so a seed that no longer exists is an `error` row), and an inline connection as sent, or as an `error` row while `ALLOW_CUSTOM_CONNECTIONS` is off.
+`status` is `healthy`, `degraded` (the check took over 5 s), `error`, or `not-checked`.
+A `not-checked` row is a connection whose provider declares `resumesBilledCompute`: the route reads that from an unconnected provider and answers with `latencyMs: 0`, caching no provider and sending no statement, since a check would resume compute the engine bills for (a suspended Databend Cloud warehouse).
+The admin Overview shows it as not checked and keeps it out of the health score and the average latency.
 
 #### GET, POST /api/admin/accounts
 
@@ -2004,6 +2062,19 @@ It names apps and engine types only, never a host name or an environment value.
 `cookieSecureOff` is true when `AUTH_COOKIE_SECURE` is `false`, `off` or `0`, in any letter case.
 Both flags drive a display warning and never a security decision.
 
+#### GET /api/admin/seed-sources
+
+The status of the operator seed sources ([SEED_CONNECTIONS.md](./SEED_CONNECTIONS.md#diagnostics)), read by the admin Overview page.
+It goes through the shared route guard: `401` with no session, `403` for a non-admin.
+It answers `{ "sources": [{ "source", "location", "state", "checkedAt", "error": { "code", "message" } | null, "connected": [{ "id", "name", "type" }], "skipped": [{ "id", "origin", "reason", "variable"?, "field"? }], "notes": [...] }] }`, one entry per enabled source in load order, where `state` is `ok`, `empty`, `missing` or `error`.
+The only operator source today is `SEED_CONFIG_PATH`, so `sources` holds at most that one entry: `source` is `"SEED_CONFIG_PATH"` and `location` is the seed file's path.
+`missing` is a file named explicitly in `SEED_CONFIG_PATH` that does not exist; the default path absent is `empty`.
+`error.code` is `unreadable`, `unparseable`, `invalid` or `duplicate-id`.
+`notes` is always empty.
+Further operator sources add their own entries, error codes and notes; the response shape does not change.
+Every message, skip and note names files, variables, fields and ids only, never a value, and the answer never quotes a seed file.
+A source that fails is reported here with `state: "error"` while `GET /api/connections/managed` answers `500` with `reason: "seed-config-unreadable"`; this route answers `500` only when reading the status itself throws.
+
 ---
 
 > **Internal routes (not part of this public reference).** The frontend also calls several internal `/api/db/*` endpoints that mirror provider internals and change with the UI: `multi-query`, `transaction`, `cancel`, `disconnect`, `test-connection`, `monitoring`, `pool-stats`, `profile`, `provider-meta`, and the object-surface routes under `objects/` that are not documented above (`describe`, `edit-plan` and `edit-apply` are). They're auth-gated by the middleware like everything else; consult the route handlers in `src/app/api/db/` for their shapes.
@@ -2018,7 +2089,7 @@ The object is one shape on the wire. Fields the server reads from a request body
 change how a connection is opened — are the coordinates and credentials (`id`, `name`, `type`,
 `host`, `port`, `user`, `password`, `database`, `schema`, `connectionString`), plus `ssl`,
 `sshTunnel`, `serviceName` (Oracle), `instanceName` (MSSQL), `localDataCenter` (Cassandra),
-`authSource` (MongoDB), `saslMechanism` (Kafka), `allowInsecureAuth` (Db2, InfluxDB, InfluxDB 3, Oxia), `dataServers` (Oxia), `queryTimeout`, `agentUser`, `agentPassword`, `apiKeyId`/`apiKeySecret`
+`authSource` (MongoDB), `saslMechanism` (Kafka), `allowInsecureAuth` (Db2, InfluxDB, InfluxDB 3, Oxia, Databend), `dataServers` (Oxia), `warehouse` (Databend), `queryTimeout`, `agentUser`, `agentPassword`, `apiKeyId`/`apiKeySecret`
 (Elasticsearch, #708), and `readOnly` (#1089). `color`, `environment`, `group`,
 `managed`, `seedId`, and `createdAt` are client-side bookkeeping that travel in the same object.
 
@@ -2046,8 +2117,9 @@ interface DatabaseConnection {
   localDataCenter?: string; // Cassandra only, and REQUIRED there: the driver refuses to connect without it (`datacenter1` on a stock single node)
   authSource?: string; // MongoDB only: the database the credentials live in (`?authSource=admin`). Not the database being opened - without it the driver checks the user against that one, which fails as a credentials error
   saslMechanism?: 'PLAIN' | 'SCRAM-SHA-256' | 'SCRAM-SHA-512'; // Kafka only: the SASL mechanism that checks user and password, absent meaning none. A user or password with no mechanism is refused, and every mechanism requires TLS
-  allowInsecureAuth?: boolean; // Db2, both InfluxDB types and Oxia (#786): connect with no TLS although the password (Db2), the password or token (InfluxDB) or the token (Oxia) then crosses the network in cleartext; without it the Db2 provider refuses a connection that has no TLS, both InfluxDB providers one that sends its secret with no TLS to a host that is not loopback, and the Oxia provider one that sends a token with no TLS to a host that is not this machine (docs/providers/oxia.md section 4.6)
+  allowInsecureAuth?: boolean; // Db2, both InfluxDB types, Oxia and Databend (#786): connect with no TLS although the password (Db2, Databend), the password or token (InfluxDB) or the token (Oxia) then crosses the network in cleartext; without it the Db2 provider refuses a connection that has no TLS, both InfluxDB providers one that sends its secret with no TLS to a host that is not loopback, the Oxia provider one that sends a token with no TLS to a host that is not this machine (docs/providers/oxia.md section 4.6), and the Databend provider one that sends its password with no TLS to a host that is not loopback
   dataServers?: string; // Oxia only: a cluster's data-server addresses, host:port entries separated by commas or whitespace, at most 64; see docs/providers/oxia.md section 4.4
+  warehouse?: string;   // Databend only: the warehouse every statement runs on, sent as the X-DATABEND-WAREHOUSE header; Databend Cloud requires one (the warehouse= value of its DSN) and resumes a suspended one on the first statement, billing while it runs. Not a secret
   skipObjectScan?: boolean; // read no catalog when this connection opens: zero reads on connect, so the editor is usable immediately and the object tree offers a load action instead of scanning (#765, an Oracle owner with 43,512 tables froze the browser on connect)
   readOnly?: boolean;      // refuse writes, value edits and maintenance before any request (#1089). Accepted only where the engine's provider enforces it: true anywhere else is refused at seed load and before any provider is built, and a value that is not a boolean is refused everywhere
   managed?: boolean;       // true = admin-controlled: not editable in the UI, secrets kept on the server
@@ -2058,7 +2130,7 @@ interface DatabaseConnection {
   apiKeySecret?: string;   // the pair's secret half; either alone (after trim) falls back to user/password rather than sending a key built from an empty half
 }
 
-type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'libsql' | 'duckdb' | 'mongodb' | 'redis' | 'oracle' | 'db2' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra' | 'prometheus' | 'kafka' | 'etcd' | 'neo4j' | 'milvus' | 'qdrant' | 'influxdb' | 'influxdb3' | 'oxia';
+type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'libsql' | 'duckdb' | 'mongodb' | 'redis' | 'oracle' | 'db2' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra' | 'prometheus' | 'kafka' | 'etcd' | 'neo4j' | 'milvus' | 'qdrant' | 'influxdb' | 'influxdb3' | 'oxia' | 'databend';
 type ConnectionEnvironment = 'production' | 'staging' | 'development' | 'local' | 'other';
 ```
 
@@ -2254,6 +2326,7 @@ These are the values of the `code` field emitted by `createErrorResponse` (`src/
 | `AUTH_ERROR` | Authentication failed (401) |
 | `CUSTOM_CONNECTIONS_DISABLED` | `ALLOW_CUSTOM_CONNECTIONS` is off and the request supplied a connection that is not a seed (403); see `GET /api/connections/policy`. A seed the caller's role may not open is refused with `AUTH_ERROR` (403) instead |
 | `AUTH_REQUIRED` | No Studio session, or one that no longer verifies (401). Answered by the middleware and the route-level session checks rather than `createErrorResponse`; the only 401 the browser answers by sending the user to sign in |
+| `WORKSPACE_OWNER_MISMATCH` | The request's `X-LibreDB-Workspace-Owner` header names an account other than the signed-in one (409). Answered by the middleware rather than `createErrorResponse`; the browser reloads the tab for it (see [Storage API](#storage-api)) |
 | `TIMEOUT_ERROR` | Query exceeded time limit (408); `POST /api/ai/query-safety` answers it with 504 when the model does not answer in time |
 | `CONNECTION_ERROR` | Database connection failed (503) |
 | `POOL_EXHAUSTED` | Connection pool exhausted (503) |

@@ -68,6 +68,7 @@ import {
 } from "@/lib/db/providers/sql/cassandra/introspect";
 import {
   CASSANDRA_KEYSPACE_LIST_CQL,
+  SCYLLA_IDENTITY_CQL,
   cassandraDescribeCql,
   cassandraObjectColumnsCql,
   cassandraObjectListCql,
@@ -402,6 +403,8 @@ function healthyReplies(overrides: Record<string, Reply> = {}): Record<string, R
   return {
     [CASSANDRA_IDENTITY_CQL]: IDENTITY_RESULT,
     [CASSANDRA_VIRTUAL_KEYSPACE_CQL]: VIRTUAL_KEYSPACE_LIST,
+    // Measured on cassandra:5.0.9: `SELECT key FROM system.versions` answers 8704.
+    [SCYLLA_IDENTITY_CQL]: responseError(8704, "table versions does not exist"),
     [cassandraTableListCql(KEYSPACE)]: TABLE_LIST,
     [cassandraViewListCql(KEYSPACE)]: VIEW_LIST,
     [cassandraColumnListCql(KEYSPACE)]: COLUMN_LIST,
@@ -473,6 +476,7 @@ describe("capabilities", () => {
     // amount = 1 WHERE customer_id = 3` - a plausible guess on a real table - is
     // "Some partition key parts are missing: id".
     expect(capabilities.supportsInlineRowEdit).toBe(false);
+    expect(capabilities.supportsTestDataGeneration).toBe(false);
     // CQL has no OFFSET clause and `prepareQuery` throws on a positive offset, so the
     // control that would provoke that refusal is never rendered (#816).
     expect(capabilities.supportsResultPagination).toBe(false);
@@ -591,10 +595,11 @@ describe("connect", () => {
     const { provider, session } = await connectedProvider();
 
     expect(provider.isConnected()).toBe(true);
-    // Two statements and no more: the identity read that proves the session can carry
-    // one, then the virtual-keyspace catalog the monitoring degradation keys on. The
-    // second is the whole cost of that discriminator, paid once per connection.
-    expect(session.asked).toEqual([CASSANDRA_IDENTITY_CQL, CASSANDRA_VIRTUAL_KEYSPACE_CQL]);
+    // Three statements and no more: the identity read that proves the session can carry
+    // one, the virtual-keyspace catalog the monitoring degradation keys on, and the
+    // ScyllaDB identity read the keyspace tree keys its hidden keyspaces on (#1428). The
+    // last two are the whole cost of those discriminators, paid once per connection.
+    expect(session.asked).toEqual([CASSANDRA_IDENTITY_CQL, CASSANDRA_VIRTUAL_KEYSPACE_CQL, SCYLLA_IDENTITY_CQL]);
     expect((await provider.getOverview()).version).toBe("Apache Cassandra 5.0.9");
   });
 
@@ -769,6 +774,17 @@ describe("query", () => {
     });
   });
 
+  test("two result columns of one name surface as a query error naming the column", async () => {
+    const twice = "SELECT id AS x, name AS x FROM probe.customers";
+    // What cassandra-driver hands over for that statement: two declared columns and a row
+    // object holding only the last one's value.
+    const answer = result(declare(["x", INT], ["x", TEXT]), [{ x: "a" }]);
+    const { provider } = await connectedProvider(healthyReplies({ [twice]: answer }));
+
+    await expect(provider.query(twice)).rejects.toThrow(QueryError);
+    await expect(provider.query(twice)).rejects.toThrow('The result has two columns named "x"');
+  });
+
   test("a write reports no columns and no invented row count", async () => {
     const insert = "INSERT INTO probe.customers (id, name) VALUES (1, 'a')";
     const { provider } = await connectedProvider(healthyReplies({ [insert]: VOID_RESULT }));
@@ -899,7 +915,8 @@ describe("prepareQuery", () => {
   test("the bound goes BEFORE a trailing ALLOW FILTERING, where CQL accepts it", () => {
     // Measured both ways: `… LIMIT 3 ALLOW FILTERING` returns rows, while
     // `… ALLOW FILTERING LIMIT 3` is "line 1:60 mismatched input 'LIMIT' expecting
-    // EOF". The shared limiter appends, so the two clauses are transposed.
+    // EOF". The clause is declared in the grammar as one that must follow the row
+    // bound, so the shared limiter places the bound before it (#1398).
     const prepared = provider.prepareQuery("SELECT * FROM probe.orders WHERE amount > 5 ALLOW FILTERING", {
       limit: 500,
     });
@@ -914,6 +931,34 @@ describe("prepareQuery", () => {
     });
 
     expect(prepared.query).toBe("SELECT * FROM probe.orders WHERE amount > 5 LIMIT 10 ALLOW  FILTERING");
+  });
+
+  // ScyllaDB, which shares this type-id, has two more clauses that must follow the
+  // row bound (measured 2026-10-03/04 on 2026.3.2, #1398): with the bound appended
+  // after `BYPASS CACHE` the statement is "line 1:38 : Syntax error", and after
+  // `USING TIMEOUT 5s` it is "line 1:42". Both come from the same grammar
+  // declaration as `ALLOW FILTERING` above, not from any branch in this provider.
+  test("the bound goes BEFORE a trailing BYPASS CACHE", () => {
+    const prepared = provider.prepareQuery("SELECT * FROM shop.e2e_t BYPASS CACHE", { limit: 500 });
+
+    expect(prepared.query).toBe("SELECT * FROM shop.e2e_t LIMIT 500 BYPASS CACHE");
+    expect(prepared.wasLimited).toBe(true);
+  });
+
+  test("the bound goes BEFORE a trailing USING TIMEOUT", () => {
+    const prepared = provider.prepareQuery("SELECT * FROM shop.e2e_t USING TIMEOUT 5s", { limit: 500 });
+
+    expect(prepared.query).toBe("SELECT * FROM shop.e2e_t LIMIT 500 USING TIMEOUT 5s");
+    expect(prepared.wasLimited).toBe(true);
+  });
+
+  test("an existing bound followed by a ScyllaDB clause is recognised, not doubled", () => {
+    // On the old path this was read as unbounded, so a second bound was appended
+    // and the engine refused the pair.
+    const prepared = provider.prepareQuery("SELECT * FROM shop.e2e_t LIMIT 10 BYPASS CACHE", { limit: 500 });
+
+    expect(prepared.query).toBe("SELECT * FROM shop.e2e_t LIMIT 10 BYPASS CACHE");
+    expect(prepared.wasLimited).toBe(false);
   });
 
   test("a statement ending in a `--` comment is not rewritten", () => {
@@ -2296,6 +2341,65 @@ describe("the object surface, against the committed fixture", () => {
       // suite describes.
       absentSource: { path: [KEYSPACE, "no_such_table"], kind: "table" },
     });
+  });
+
+  // Measured 2026-10-09 on scylladb/scylla:2026.2.4: `system.versions` answers one row.
+  const SCYLLA_IDENTITY_ROWS = result(declare(["key", TEXT]), [{ key: "local" }]);
+  // ScyllaDB's own keyspaces next to ones a person made, as both engines would list them.
+  const ENGINE_KEYSPACES = result(declare(["keyspace_name", TEXT]), [
+    { keyspace_name: "audit" },
+    { keyspace_name: "system_replicated_keys" },
+    { keyspace_name: "system_distributed_everywhere" },
+    { keyspace_name: "system_reports" },
+    { keyspace_name: KEYSPACE },
+  ]);
+
+  test("on Cassandra, audit, system_replicated_keys and system_distributed_everywhere are a person's keyspaces", async () => {
+    // Measured 2026-10-09 on cassandra:5.0.9: CREATE KEYSPACE accepts all three names, and
+    // the ScyllaDB identity read answers 8704, so none of them is hidden there.
+    const { provider } = await connectedProvider(objectReplies({ [CASSANDRA_KEYSPACE_LIST_CQL]: ENGINE_KEYSPACES }));
+
+    expect((await provider.listContainers!()).map((container) => container.name)).toEqual([
+      "audit",
+      KEYSPACE,
+      "system_distributed_everywhere",
+      "system_replicated_keys",
+      "system_reports",
+    ]);
+  });
+
+  test("on ScyllaDB, hides its own keyspaces, and skips tables whose name ends in $paxos", async () => {
+    // Measured on ScyllaDB 2026.2.4 and 2026.3.2 (#1428): `audit`, `system_replicated_keys` and
+    // `system_distributed_everywhere` are the engine's, and a user table `e2e_t` is listed
+    // beside the LWT shadow `e2e_t$paxos`, which SELECT cannot parse. `system_reports` is a
+    // keyspace a person created and stays. `notes$paxos_extra` contains the suffix without
+    // ending in it, so it stays too.
+    const { provider } = await connectedProvider(
+      objectReplies({
+        [SCYLLA_IDENTITY_CQL]: SCYLLA_IDENTITY_ROWS,
+        [CASSANDRA_KEYSPACE_LIST_CQL]: ENGINE_KEYSPACES,
+        [cassandraObjectListCql(KEYSPACE, "table")!]: result(declare(["table_name", TEXT]), [
+          { table_name: "customers" },
+          { table_name: "e2e_t$paxos" },
+          { table_name: "e2e_t" },
+          { table_name: "notes$paxos_extra" },
+        ]),
+      }),
+    );
+
+    const containers = await provider.listContainers!();
+    expect(containers.map((container) => container.name)).toEqual([KEYSPACE, "system_reports"]);
+
+    const tables = await provider.listObjects!([KEYSPACE], "table");
+    expect(tables.map((table) => table.name)).toEqual(["customers", "e2e_t", "notes$paxos_extra"]);
+    expect(await provider.countObjects!([KEYSPACE])).toMatchObject({ table: { count: 3 } });
+
+    const described = await provider.describeObjects!([KEYSPACE], "table");
+    expect(described.details.map((detail) => detail.path)).toEqual([
+      [KEYSPACE, "customers"],
+      [KEYSPACE, "e2e_t"],
+      [KEYSPACE, "notes$paxos_extra"],
+    ]);
   });
 
   test("lists the user keyspaces and marks the session's own, and does NOT hide system_reports", async () => {

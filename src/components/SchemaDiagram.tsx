@@ -17,7 +17,7 @@ import {
   type NodeTypes,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { relationObjects, type DetailedObject } from "@/lib/db/detailed-object";
+import { relationCountLabel, relationObjects, type DetailedObject } from "@/lib/db/detailed-object";
 import { objectPathLabel } from "@/lib/db/object-path";
 import type { ProviderCapabilities } from "@/lib/db/types";
 import { Download, Info, LoaderCircle, Search, X } from "lucide-react";
@@ -130,8 +130,8 @@ function SchemaDiagramInner({ schema, onClose, capabilities }: SchemaDiagramProp
   }, [relations, deferredQuery]);
 
   const graph = useMemo(
-    () => buildGraph(filteredSchema, { compact: compactMode, expandedTables: new Set(expandedTables) }),
-    [filteredSchema, compactMode, expandedTables],
+    () => buildGraph(filteredSchema, { compact: compactMode, expandedTables: new Set(expandedTables), capabilities }),
+    [filteredSchema, compactMode, expandedTables, capabilities],
   );
 
   // The STRUCTURE of the graph (tables, relationships, compact mode). Both the
@@ -479,7 +479,7 @@ function SchemaDiagramInner({ schema, onClose, capabilities }: SchemaDiagramProp
                   ERD Visualizer
                 </h3>
                 <div className="flex items-center gap-3 text-xs text-fg-muted">
-                  <span>{filteredSchema.length} tables</span>
+                  <span>{relationCountLabel(filteredSchema, capabilities)}</span>
                   <span>{graph.edgeCount} relationships</span>
                   {isLayouting && (
                     <span className="flex items-center gap-1 text-fg-subtle">

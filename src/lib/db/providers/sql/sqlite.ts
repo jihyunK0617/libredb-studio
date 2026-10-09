@@ -47,7 +47,7 @@ import {
 } from "../../errors";
 import { assertReadOnlyBudget, measureResultBytes } from "./read-only-budget";
 import { formatBytes } from "../../utils/pool-manager";
-import { loadSQLiteDriver, type SQLiteDatabase } from "./sqlite-driver";
+import { loadSQLiteDriver, type SQLiteDatabase, type SQLiteStatement } from "./sqlite-driver";
 import { declaredColumnTypes } from "./column-types";
 import {
   applySourceBound,
@@ -67,6 +67,9 @@ import { logger } from "@/lib/logger";
 import * as fs from "fs";
 import * as path from "path";
 import { isUnwritableExistingFile } from "@/lib/db/utils/unwritable-file";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
+import { keyRowsByPosition } from "@/lib/db/utils/positional-rows";
+import { isReservedStoragePath } from "@/lib/data-dir";
 
 /**
  * SQLite's identity for the shared container-path renderer.
@@ -1005,6 +1008,44 @@ export function readDbstatSizes(db: SQLiteDatabase): Map<string, SQLiteTableSize
 }
 
 /**
+ * Read one row-returning statement's result: the rows keyed by column names that are
+ * non-empty and unique, and the declared types keyed by the same names.
+ *
+ * The rows are read as arrays (`values()`) and keyed by position, because a row read keyed
+ * by name keeps one value per name: `SELECT 1 AS a, 2 AS a` answered `{ a: 2 }` on both
+ * drivers, a join projecting `id` from two tables lost the first table's id, and
+ * `SELECT 1 AS ""` answered a column named "", which no grid column can take. The names are
+ * the declared column names through `uniqueFieldNames`, so those come back as `a` and
+ * `a (2)`, and as `(No column name)`. A column with no alias keeps the name SQLite gives it,
+ * its expression text (`4 + 5`), so SQLite itself never declares an empty name unasked.
+ *
+ * Declared types travel with the result (#273), and are read AFTER the rows because
+ * bun:sqlite refuses the question until the statement has run - see
+ * `SQLiteStatement.declaredColumns`, where both drivers were measured. Each type is paired
+ * with its column by position, so a repeated name keeps its own type too.
+ * `declaredColumnTypes` omits the key entirely when nothing was declared, which is the
+ * common case here rather than a failure: SQLite declares nothing for a computed column,
+ * a literal, an aggregate or any PRAGMA.
+ *
+ * An empty result still names its columns, because they come from the statement rather
+ * than from a first row.
+ */
+function readResultRows(
+  stmt: SQLiteStatement,
+  sql: string,
+  params: readonly unknown[],
+): { rows: Record<string, unknown>[]; fields: string[]; declared: Pick<QueryResult, "columnTypes"> } {
+  const values = stmt.values(...params);
+  const columns = stmt.declaredColumns();
+  const fields = uniqueFieldNames(columns.map(([name]) => name));
+  return {
+    rows: keyRowsByPosition(fields, values, "sqlite", sql),
+    fields,
+    declared: declaredColumnTypes(columns.map(([, type], index) => [fields[index], type] as const)),
+  };
+}
+
+/**
  * Build one table's stats row. `size` is `null` when this driver publishes no page
  * bytes, and then the byte fields are OMITTED rather than zeroed: a 0 reads as an
  * empty table on the Storage tab, which is the same fabrication the `rowCount * 100`
@@ -1043,6 +1084,7 @@ export class SQLiteProvider extends SQLBaseProvider {
   private db: SQLiteDatabase | null = null;
   /** True when this instance was opened under the agent read-only profile. */
   private readonly readOnlyProfile: boolean;
+  private readonly denyExternalAccess: boolean;
   /** The file's path when the editor opened it read-only because this process cannot write it; else null. */
   private unwritableFilePath: string | null = null;
 
@@ -1052,6 +1094,7 @@ export class SQLiteProvider extends SQLBaseProvider {
     // path builds providers from caller-supplied ProviderOptions, which has no
     // route to this flag in either direction.
     this.readOnlyProfile = execution.readOnly === true;
+    this.denyExternalAccess = execution.allowExternalFileAccess === false;
     this.validate();
   }
 
@@ -1063,10 +1106,13 @@ export class SQLiteProvider extends SQLBaseProvider {
     return {
       ...super.getCapabilities(),
       defaultPort: null,
+      readsFileAccessPosture: true,
       supportsExplain: true,
       explainFormat: "sqlite-queryplan",
       supportsConnectionString: false,
       supportsInlineRowEdit: true,
+      // The Generate Test Data dialog's multi-row `INSERT INTO ... VALUES` (#1468).
+      supportsTestDataGeneration: true,
       // `LIMIT n OFFSET m`, applied by the shared limiter in `SQLBaseProvider.prepareQuery`.
       supportsResultPagination: true,
       // SQLite HAS transactions; this provider holds no session for one, so
@@ -1136,11 +1182,18 @@ export class SQLiteProvider extends SQLBaseProvider {
       return;
     }
 
+    if (this.denyExternalAccess) {
+      throw new DatabaseConfigError(
+        "SQLite connections require an administrator because this driver cannot confine statement-level file access",
+        "sqlite",
+      );
+    }
+
     try {
       // Dynamically load the runtime-appropriate SQLite driver
       const SQLiteDB = await loadSQLiteDriver();
 
-      const dbPath = this.getDatabasePath();
+      const dbPath = this.getDatabasePath(true);
 
       if (this.readOnlyProfile) {
         this.connectReadOnly(SQLiteDB, dbPath);
@@ -1296,7 +1349,7 @@ export class SQLiteProvider extends SQLBaseProvider {
     }
   }
 
-  private getDatabasePath(): string {
+  private getDatabasePath(checkReserved = false): string {
     let dbPath: string;
     if (this.config.connectionString) {
       dbPath = this.config.connectionString.startsWith("file:")
@@ -1316,7 +1369,20 @@ export class SQLiteProvider extends SQLBaseProvider {
       throw new DatabaseConfigError("Invalid database path: NUL bytes are not allowed", "sqlite");
     }
 
-    return path.resolve(dbPath);
+    const resolved = path.resolve(dbPath);
+
+    // The server's own storage database is reserved: it is Studio's to manage, not a
+    // target a connection may open. A connection whose path resolves to it is refused
+    // here on connect, before any handle is opened. Metadata reads reuse the
+    // resolved path without repeating filesystem identity checks.
+    if (checkReserved && isReservedStoragePath(resolved)) {
+      throw new DatabaseConfigError(
+        "This path is reserved for the server's own storage and cannot be opened as a connection",
+        "sqlite",
+      );
+    }
+
+    return resolved;
   }
 
   // ============================================================================
@@ -1332,23 +1398,10 @@ export class SQLiteProvider extends SQLBaseProvider {
           const stmt = this.db!.prepare(sql);
 
           // Routed on what SQLite compiled, not on the leading keyword: a statement with
-          // result columns is read with `all()`, whatever it starts with. A keyword set
+          // result columns is read for its rows, whatever it starts with. A keyword set
           // missed WITH, VALUES and every `... RETURNING`, and `run()` dropped their rows.
           if (stmt.returnsRows()) {
-            const rows = params ? stmt.all(...params) : stmt.all();
-            const fields = rows.length > 0 ? Object.keys(rows[0] as object) : [];
-            return {
-              rows: (rows as unknown[]).map((row) => row as Record<string, unknown>) as Record<string, unknown>[],
-              fields,
-              changes: 0,
-              // Declared types travel with the result (#273), and are read AFTER the rows
-              // because bun:sqlite refuses the question until the statement has run - see
-              // `SQLiteStatement.declaredColumns`, where both drivers were measured.
-              // `declaredColumnTypes` omits the key entirely when nothing was declared,
-              // which is the common case here rather than a failure: SQLite declares
-              // nothing for a computed column, a literal, an aggregate or any PRAGMA.
-              declared: declaredColumnTypes(stmt.declaredColumns()),
-            };
+            return { ...readResultRows(stmt, sql, params ?? []), changes: 0 };
           } else {
             const info = params ? stmt.run(...params) : stmt.run();
             return {
@@ -1462,18 +1515,13 @@ export class SQLiteProvider extends SQLBaseProvider {
 
     return this.trackQuery(async () => {
       const {
-        result: { rows, declared },
+        result: { rows, fields, declared },
         executionTime,
       } = await this.measureExecution(async () => {
         try {
-          const stmt = this.db!.prepare(sql);
-          // The rows first and the declarations second, for the reason `query()` above
-          // states: bun:sqlite answers the second question only once the first has been
-          // asked. The budgets below are checked on the rows either way, so a result
-          // refused for being too large carries its types no further than it carries its
-          // rows.
-          const all = stmt.all() as Record<string, unknown>[];
-          return { rows: all, declared: declaredColumnTypes(stmt.declaredColumns()) };
+          // The budgets below are checked on the rows either way, so a result refused for
+          // being too large carries its types no further than it carries its rows.
+          return readResultRows(this.db!.prepare(sql), sql, []);
         } catch (error) {
           throw mapDatabaseError(error, "sqlite", sql);
         }
@@ -1509,7 +1557,7 @@ export class SQLiteProvider extends SQLBaseProvider {
 
       return {
         rows,
-        fields: rows.length > 0 ? Object.keys(rows[0]) : [],
+        fields,
         rowCount: rows.length,
         executionTime,
         ...declared,

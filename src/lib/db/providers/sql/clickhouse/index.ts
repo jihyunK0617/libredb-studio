@@ -473,6 +473,8 @@ function toQueryResult(result: ClickHouseQueryResult, measuredMs: number): Query
 
   return {
     rows,
+    // The transport already numbered a name the server declared twice, so these
+    // are unique and are the keys every row uses.
     fields: textual ? [RAW_TEXT_COLUMN] : (result.fieldNames ?? []),
     // A write returns no rows, so its row count is what the server says it
     // changed - verbatim, including the zero a queued mutation reports.
@@ -536,6 +538,7 @@ export class ClickHouseProvider extends SQLBaseProvider {
       // `ALTER TABLE t UPDATE c = v WHERE ...`, an asynchronous mutation rather
       // than a statement the shared hook can emit, so the control is hidden here.
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
       // `LIMIT n OFFSET m` from the shared limiter. A statement whose end the limiter
       // declines to rewrite - a trailing `FORMAT` or `SETTINGS` clause - comes back with
       // `wasLimited: false`, and the route's `hasMore` requires that, so those statements
@@ -824,9 +827,15 @@ export class ClickHouseProvider extends SQLBaseProvider {
       return new ConnectionError(error.message, this.type, this.connection.host, this.connection.port);
     }
     if (error.code === CLICKHOUSE_FAILURE_CODES.NO_SERVER_CODE) {
-      // Nothing below the SQL layer answered, so there is no code to key on and
-      // the shared message-based mapping - which recognises a refused socket and
-      // a timeout - is the best classification available.
+      // A connection that never opened is a connection problem. Its message says
+      // "timed out", which the shared message-based mapping would read as a slow
+      // query and answer with query advice, so the transport's kind decides first.
+      if (error.failure === "timed-out") {
+        return new ConnectionError(error.message, this.type, this.connection.host, this.connection.port);
+      }
+      // Otherwise nothing below the SQL layer answered, so there is no code to key
+      // on and the shared message-based mapping - which recognises a refused socket
+      // and a query deadline - is the best classification available.
       return this.mapError(error, sql);
     }
 

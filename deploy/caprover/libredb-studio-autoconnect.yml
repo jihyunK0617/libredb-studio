@@ -43,6 +43,12 @@ services:
         caproverExtra:
             containerHttpPort: '3000'
     $$cap_appname-discovery:
+        # CapRover creates the apps one at a time and removes nothing when a
+        # step fails, so this app, the one that holds the Docker socket, is
+        # created after Studio: an install that stops early never leaves it
+        # running on its own.
+        depends_on:
+            - $$cap_appname
         image: ghcr.io/libredb/libredb-studio:$$cap_version
         restart: always
         # A one-click command replaces the image entrypoint, so the exporter
@@ -64,8 +70,8 @@ caproverOneClickApp:
     variables:
         - id: $$cap_version
           label: LibreDB Studio Version
-          defaultValue: '0.18.0'
-          description: Image tag to deploy. Always pin a fixed version, never "latest". Example - 0.18.0. Browse all valid tags at https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+          defaultValue: '0.18.1'
+          description: Image tag to deploy. Always pin a fixed version, never "latest". Example - 0.18.1. Browse all valid tags at https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
           validRegex: '/^([^\s^\/])+$/'
         - id: $$cap_admin_email
           label: Admin Email
@@ -123,7 +129,7 @@ caproverOneClickApp:
             cannot read that file through a DuckDB connection. Still give the
             standard login only to someone you trust, because a connection that
             names a database file on this server is not limited to a directory
-            (https://github.com/libredb/libredb-studio/blob/main/docs/providers/sqlite.md#14-known-limitations--future-work).
+            (https://github.com/libredb/libredb-studio/blob/main/docs/providers/duckdb.md#143-the-file-path-is-a-trust-boundary-for-every-role-and-statement-reach-is-the-admins).
             Enable HTTPS for Studio before you sign in for the first time. If
             you do not want the Docker socket on this server, install the plain
             LibreDB Studio entry instead.
@@ -135,6 +141,9 @@ caproverOneClickApp:
             follows them as you add or remove them.
 
             What you can set below (defaults are sensible - you can usually just click Deploy):
+              - App name: at most 39 characters, starting with a letter. The
+                second app is named after it with -discovery appended, and the
+                project CapRover puts both apps in takes the same name.
               - Version: the image tag to deploy (a tested fixed version by default).
               - Admin login: full access, including maintenance/admin tools. The
                 connected databases are listed for this login only.
@@ -199,7 +208,7 @@ caproverOneClickApp:
             every database's password. Still give the standard login only to
             someone you trust, because a connection that names a database file
             on this server is not limited to a directory:
-            https://github.com/libredb/libredb-studio/blob/main/docs/providers/sqlite.md#14-known-limitations--future-work
+            https://github.com/libredb/libredb-studio/blob/main/docs/providers/duckdb.md#143-the-file-path-is-a-trust-boundary-for-every-role-and-statement-reach-is-the-admins
 
             Save these credentials now. This screen does not show them again,
             but they stay readable as ADMIN_PASSWORD and USER_PASSWORD under the
@@ -237,5 +246,5 @@ caproverOneClickApp:
             See https://github.com/libredb/libredb-studio
     displayName: LibreDB Studio (auto-connect)
     isOfficial: false
-    description: LibreDB Studio that connects itself to the PostgreSQL, MySQL, MariaDB, MongoDB and Redis databases on this server. Adds a discovery app that reads the Docker socket.
+    description: LibreDB Studio that connects itself to this server's PostgreSQL, MySQL, MariaDB, Percona, MongoDB, Redis, Valkey, KeyDB and Dragonfly databases. Adds a discovery app that reads the Docker socket.
     documentation: Image and docs - https://github.com/libredb/libredb-studio . Uses ghcr.io/libredb/libredb-studio for both apps. The -discovery app mounts the Docker socket; see deploy/caprover/README.md in that repository.

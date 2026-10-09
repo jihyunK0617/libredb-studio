@@ -487,6 +487,11 @@ afterwards proves the session can carry one. A probe that fails closes the sessi
 already opened, before the failure is mapped, so a retried connection attempt leaves no pool, no
 sockets and no reconnection timers behind — the same lifecycle as the Druid and Couchbase providers.
 
+Two more reads follow the identity read, and neither can fail the connection: the virtual-keyspace
+catalog the monitoring reads key their degradation on, and `SELECT key FROM system.versions`, which
+says whether the server is ScyllaDB and so which keyspaces the tree hides (see "A system keyspace is
+excluded by exact NAME, never by a prefix", #1428).
+
 ---
 
 ## 5. Query interface
@@ -536,9 +541,13 @@ SELECT * FROM probe.orders WHERE amount > 5 LIMIT 3 ALLOW FILTERING   -> 3 rows
 SELECT * FROM probe.orders WHERE amount > 5 ALLOW FILTERING LIMIT 3   -> line 1:60 mismatched input 'LIMIT'
 ```
 
-The limiter appends, so the two clauses are **transposed** — with the writer's own spacing preserved.
-This is strictly better than declining to bound the statement, which is the shape a user writes
-precisely when a scan is about to happen.
+The clause is declared in the dialect grammar as one that must FOLLOW the row bound, so the shared
+limiter places the bound before it and re-attaches it with the writer's own spacing — and reads
+`… LIMIT 3 ALLOW FILTERING` as the existing bound it is, which the old after-the-fact transposition
+did not, emitting `LIMIT 3 LIMIT 500 ALLOW FILTERING` instead. ScyllaDB's `BYPASS CACHE` and
+`USING TIMEOUT 5s`, which share this type-id, come from the same declaration. This is strictly
+better than declining to bound the statement, which is the shape a user writes precisely when a
+scan is about to happen.
 
 **3. A line comment must be closed by a newline — and CQL has a third comment form.**
 
@@ -575,6 +584,12 @@ matched, which would corrupt the statement.
 The **declaration** drives the row shape, not the row's own keys: it is the only source for the order
 the statement projected. `fieldNames: null` (a write) and `fieldNames: []` are kept apart at the
 seam and both collapse to no columns for the grid.
+
+A column declared with an empty name comes back as `(No column name)` (`uniqueFieldNames` in [`result-fields.ts`](../../src/lib/db/utils/result-fields.ts)), so the grid always has a key for it.
+Two columns of one name (`SELECT id AS x, name AS x`) are refused with a query error naming the column: cassandra-driver 4.10.0 builds each row as `row[column.name] = value` (`lib/streams.js`, `parseRows`), so the earlier column's value is already gone when the row reaches this provider, and a second header would only repeat the last value.
+Give each column its own alias.
+The refusal covers a repeat of one column too (`SELECT a, a`), whose two values would be equal: it stays because it is explicit and never shows a wrong value, where telling the two cases apart needs a live cluster to measure against.
+This is read from the driver source and pinned with the driver's row shape in `tests/unit/db/cassandra/wire.test.ts` and `tests/integration/db/cassandra-provider.test.ts`; it was not measured against a live cluster in this change, so whether a given server version accepts a repeated name at all is not stated here.
 
 `columnTypes` carries the wire's declared type per column. Note that `text` reads back as `varchar`
 and a column declared `varchar` reads back as `text` — they are one type on the wire — so this is
@@ -644,7 +659,7 @@ generators used to write here (#1410), and the provider now declares both away.
 `supportsConstantPredicate: false` makes **Generate Query** (on a table or a materialized view) write
 `SELECT <columns> FROM <keyspace>.<table> LIMIT 100;` with no `WHERE 1=1`, and
 `supportsMultiRowInsert: false` makes the **CSV/JSON import** into an existing table, and the
-**Test Data Generator**, write one `INSERT` per row, which the editor sends through `/api/db/multi-query` one statement at a time.
+**Test Data Generator** (not offered by the row menus, `supportsTestDataGeneration: false`, BACKLOG U93), write one `INSERT` per row, which the editor sends through `/api/db/multi-query` one statement at a time.
 Measured on 5.0.9 on 2026-10-04 through the provider and the multi-query splitter: the generated
 select on a table runs, and a two-row import inserts both rows. ScyllaDB shares the provider and
 the declaration, and was not re-measured. An import into a **new** table stays withheld by `supportsCreateTable: false`.
@@ -869,6 +884,21 @@ provider carries an exact list: Cassandra 5.0's own five system keyspaces plus t
 (measured: seven rows on the fixture node, neither among them) and cost nothing to carry. The fixture
 creates `system_reports` precisely so the prefix spelling stays refuted rather than merely
 unattractive, and the test asserts that the container listing **shows** it.
+
+ScyllaDB owns three more, all listed as user keyspaces on 2026.2.4 and 2026.3.2 before #1428:
+`audit` (the audit log keyspace, `audit.audit_log`), `system_replicated_keys` (scylladb#27954) and
+`system_distributed_everywhere`. They are hidden **only on ScyllaDB**, because on Cassandra they are a
+person's: measured 2026-10-09 on cassandra:5.0.9, `CREATE KEYSPACE` accepts all three names. The
+provider tells the two apart at connect time with `SELECT key FROM system.versions`, ScyllaDB's own
+table: scylladb/scylla:2026.2.4 answers one row and cassandra:5.0.9 answers 8704 "table versions does
+not exist". `release_version` cannot do it, because ScyllaDB answers a Cassandra-compatible `3.0.8`
+there. A refused read of any kind hides none of the three.
+
+A table whose name **ends in `$paxos`** is ScyllaDB's lightweight-transaction shadow
+(scylladb#28183). Measured on 2026.3.2, `e2e_t` was listed beside `e2e_t$paxos`, and opening the
+shadow composed `SELECT * FROM shop.e2e_t$paxos`, which the parser rejects. The listing and the
+count both drop that suffix, and only on the `table` kind: a name that merely contains `$paxos`
+without ending in it stays listed, and so does a user table of any other name.
 
 The exclusion is applied in TypeScript rather than in the statement, because `keyspace_name` is the
 partition key and CQL has no `NOT IN` over one: filtering server-side would need `ALLOW FILTERING` on
@@ -1196,6 +1226,7 @@ because there are no table statistics to list at all.)
   supportsExternalQueryLimiting: true,
   supportsCreateTable: false,        // the modal cannot emit valid CQL, and a diff cannot derive the partition key (§5.5)
   supportsInlineRowEdit: false,      // one guessed key column is not a CQL primary key (§5.5)
+  supportsTestDataGeneration: false, // the row menus never offered the generator here; not measured (#1468)
   supportsResultPagination: false,   // CQL has no OFFSET; prepareQuery throws rather than answer page two with page one (#816)
   supportsTransactions: false,       // CQL has no transaction; BATCH is not one (#464)
   declaresForeignKeys: false,        // the clause does not exist (§6.2)

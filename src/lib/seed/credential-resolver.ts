@@ -14,6 +14,9 @@ const RESOLVABLE_FIELDS = [
   "database",
   // Oxia's data servers (O6): addresses a deployment keeps out of the seed file, as `host` is.
   "dataServers",
+  // Databend's warehouse (I16): the compute a Cloud DSN names, which a deployment keeps beside its host, so a
+  // seeded `${DATABEND_WAREHOUSE}` is resolved rather than sent to Cloud as a literal warehouse name.
+  "warehouse",
   // Elasticsearch API key pair (#708). A seeded `${ELASTIC_API_KEY_ID}` / `${vault:...}`
   // that is not on this list is sent literally and the cluster answers 401 on a key
   // that works. Both halves, not one: either left unresolved is a half-filled pair
@@ -49,6 +52,7 @@ interface VaultResolvableConnection {
   host?: string;
   database?: string;
   dataServers?: string;
+  warehouse?: string;
   apiKeyId?: string;
   apiKeySecret?: string;
   ssl?: ResolvableSsl;
@@ -84,6 +88,26 @@ const warnedPlaintext = new Set<string>();
 
 export function resetPlaintextWarnings(): void {
   warnedPlaintext.clear();
+}
+
+/**
+ * A whole-value `${NAME}` whose variable is not defined. The operator loader drops that one connection and records
+ * the skip with these names (Spec A, section 5.2 step 4), so the admin view shows which variable a connection waits
+ * for. Names only: the message carries no value, as before.
+ */
+export class UndefinedSeedVariableError extends Error {
+  readonly variable: string;
+  readonly connectionId: string;
+  readonly field: string;
+  constructor(variable: string, connectionId: string, field: string) {
+    super(
+      `Environment variable ${variable} is not defined (required by seed connection "${connectionId}" field "${field}")`,
+    );
+    this.name = "UndefinedSeedVariableError";
+    this.variable = variable;
+    this.connectionId = connectionId;
+    this.field = field;
+  }
 }
 
 /** The values of `SEED_LITERAL_VALUES` that turn literal mode on, once trimmed and lowercased. */
@@ -123,8 +147,9 @@ export function resetLiteralModeNotices(): void {
  * `${NAME}` in `user`, `password`, `host`, `database` and the other resolvable fields from this
  * process's environment, and a `${vault:...}` reference from Vault. A platform user allowed to name
  * a database user `${JWT_SECRET}` would therefore have Studio send its own session secret, as that
- * user name, to a server whose log the platform user reads. With the mode on, `src/lib/seed/index.ts`
- * keeps every file seed out of `resolveAllCredentials` and marks it literal after the role filter,
+ * user name, to a server whose log the platform user reads. With the mode on, the operator loader
+ * (`src/lib/seed/operator-loader.ts`) records the mode for its fill and resolves no file-like entry,
+ * `src/lib/seed/index.ts` marks each of them literal after the role filter,
  * and `resolveConnection` returns a marked connection without calling `resolveVaultCredentials`, so
  * nothing is looked up when connections are listed, when a refused id is checked or when one is
  * opened. The plaintext-password warning is not logged either, because every value in such a file
@@ -183,11 +208,7 @@ function resolveField(value: string | undefined, fieldName: string, connId: stri
 
   const envVar = match[1];
   const envValue = process.env[envVar];
-  if (envValue === undefined) {
-    throw new Error(
-      `Environment variable ${envVar} is not defined (required by seed connection "${connId}" field "${fieldName}")`,
-    );
-  }
+  if (envValue === undefined) throw new UndefinedSeedVariableError(envVar, connId, fieldName);
 
   return envValue;
 }
@@ -201,21 +222,6 @@ export function resolveConnectionCredentials(conn: SeedConnection): SeedConnecti
     }
   }
   return resolved;
-}
-
-export function resolveAllCredentials(connections: SeedConnection[]): SeedConnection[] {
-  const results: SeedConnection[] = [];
-  for (const conn of connections) {
-    try {
-      results.push(resolveConnectionCredentials(conn));
-    } catch (err) {
-      logger.error("Seed connection skipped due to credential resolution failure", err, {
-        route: "seed/credential-resolver",
-        connectionId: conn.id,
-      });
-    }
-  }
-  return results;
 }
 
 function parseVaultReference(value: string, connId: string, fieldName: ResolvableField): { path: string; key: string } {

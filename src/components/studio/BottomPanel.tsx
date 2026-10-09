@@ -57,15 +57,19 @@ import { offersSqlExport } from "@/lib/db/types";
  * drift between two spellings of one list is what put the delimiter options out of
  * step with the writers before.
  */
-const RESULT_FORMATS: readonly {
+export type ResultFormatEntry = {
   readonly format: ResultExportFormat;
   readonly label: string;
   readonly csvDelimiter?: CsvDelimiter;
-}[] = [
+};
+
+export const RESULT_FORMATS: readonly ResultFormatEntry[] = [
   { format: "csv", label: "CSV" },
   { format: "csv", label: "CSV (semicolon)", csvDelimiter: ";" },
   { format: "csv", label: "CSV (tab)", csvDelimiter: "\t" },
   { format: "json", label: "JSON" },
+  { format: "markdown", label: "Markdown" },
+  { format: "html", label: "HTML" },
   { format: "sql-insert", label: "SQL INSERT" },
   { format: "sql-ddl", label: "DDL (CREATE TABLE)" },
 ];
@@ -588,8 +592,14 @@ export const BottomPanel = React.memo(function BottomPanel({
       <div className="flex-1 overflow-hidden relative">
         {/* One pair of boundaries for the whole switch: only one view is ever mounted,
             so the fallback is what the user sees while a split chunk is in flight and
-            the error boundary is what they see when it never arrives. */}
-        <ChunkBoundary label="This view">
+            the error boundary is what they see when it never arrives or a view throws.
+            The boundary outlives every result, mode and tab, so it is reset by what it
+            shows: one result a view cannot draw must not fail every later one. The docs
+            and diff views draw the schema and the connection, so those reset it too. */}
+        <ChunkBoundary
+          label="This view"
+          resetKeys={[mode, result, agentArtifact, explainPlan, schema, activeConnection]}
+        >
           <React.Suspense fallback={<ViewLoading label="Loading the panel" />}>
             {mode === "pivot" ? (
               <PivotTable
@@ -724,8 +734,12 @@ export const BottomPanel = React.memo(function BottomPanel({
                   className="mb-2 h-8 w-8 text-destructive opacity-50"
                 />
                 <p className="text-xs font-medium text-destructive">The query failed.</p>
+                {/*
+                  Left-aligned inside the centred block: an engine's message can span lines with a caret under
+                  the failing name, and centring each line on its own moves the caret off its column.
+                */}
                 <p
-                  className="mt-1 max-w-xl break-words whitespace-pre-wrap font-mono text-xs text-destructive"
+                  className="mt-1 max-w-xl break-words whitespace-pre-wrap text-left font-mono text-xs text-destructive"
                   data-testid="run-failure-message"
                 >
                   {runError}

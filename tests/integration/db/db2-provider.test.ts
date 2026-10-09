@@ -605,6 +605,7 @@ describe("Db2Provider: declaration", () => {
     const capabilities = makeProvider().getCapabilities();
 
     expect(capabilities.supportsInlineRowEdit).toBe(true);
+    expect(capabilities.supportsTestDataGeneration).toBe(true);
     expect(capabilities.supportsCreateTable).toBe(false);
     expect(capabilities.objectKinds?.filter((kind) => kind.acceptsRowWrites === true).map((kind) => kind.id)).toEqual([
       "table",
@@ -807,6 +808,20 @@ describe("Db2Provider: query", () => {
     expect(result.fields).toEqual(["A", "A (2)"]);
     expect(result.rows).toEqual([{ A: 1, "A (2)": 2 }]);
     expect(result).not.toHaveProperty("warnings");
+  });
+
+  test("a repeat is numbered past a name the statement declares later", async () => {
+    userQuery = async () => ({
+      rows: [[1, 2, 3]],
+      rowCount: 1,
+      columns: [column("A", "Integer"), column("A", "Integer"), column("A (2)", "Integer")],
+      diagnostics: [],
+    });
+    const provider = await connected();
+    const result = await provider.query('SELECT 1 AS A, 2 AS A, 3 AS "A (2)" FROM SYSIBM.SYSDUMMY1');
+
+    expect(result.fields).toEqual(["A", "A (3)", "A (2)"]);
+    expect(result.rows).toEqual([{ A: 1, "A (3)": 2, "A (2)": 3 }]);
   });
 
   // K24, measured on 12.1.0.0 and 11.5.9.0 through 1.0.24 and 1.0.25: a value bound to a CLOB(1M)

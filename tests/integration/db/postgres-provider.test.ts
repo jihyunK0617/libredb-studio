@@ -130,48 +130,96 @@ function answerParseProbe(): Promise<{ rows: unknown[] }> {
   );
 }
 
+/**
+ * A `pg` config asking for array rows. `query()` and `queryInTransaction()` send the user's statement
+ * as `{ text, rowMode: "array" }` with the values beside it, and `queryReadOnly()` adds the
+ * same `rowMode` to its `queryMode: "extended"` config.
+ */
+interface MockRowModeConfig {
+  text: string;
+  rowMode: "array";
+  queryMode?: "extended";
+}
+
+type MockPgAnswer = { rows: unknown[]; fields?: { name: string; dataTypeID?: number }[]; rowCount?: number | null };
+
+/**
+ * What `pg` answers under `rowMode: "array"`: each row holds its values in column order, and one
+ * answer per statement for a multi-statement simple query. A fixture written with object rows is
+ * read in the order its `fields` declare, or in its first row's key order when it declares none,
+ * which is what a real server's row description would have said. A fixture that already answers
+ * array rows is handed on unchanged, which is the only way to model two columns of one name.
+ */
+function asRowModeArray(answer: MockPgAnswer | MockPgAnswer[]): MockPgAnswer | MockPgAnswer[] {
+  if (Array.isArray(answer)) return answer.map((one) => asRowModeArray(one) as MockPgAnswer);
+  const rows = answer.rows ?? [];
+  const declared = answer.fields ?? [];
+  const fields =
+    declared.length > 0 || rows.length === 0 || Array.isArray(rows[0])
+      ? declared
+      : Object.keys(rows[0] as object).map((name) => ({ name }));
+  return {
+    ...answer,
+    fields,
+    rows: rows.map((row) =>
+      Array.isArray(row) ? row : fields.map((field) => (row as Record<string, unknown>)[field.name]),
+    ),
+  };
+}
+
+/** The fixture server behind `mockClient.query`, answering what the provider sent. */
+function mockClientQuery(sql: string | MockParseConfig, params?: unknown[]): Promise<unknown> {
+  mockWire.push(sql);
+  // A config carrying a `name` is a NAMED prepared statement, which is the only way
+  // node-postgres reaches Parse, and it is answered the way the server answers a Parse (D76).
+  // A config with no name is `queryMode: "extended"`, which the read-only profile sends and
+  // which goes to `mockQueryFn` exactly as it always did.
+  if (typeof sql !== "string" && typeof sql.name === "string") return answerParseProbe();
+  // The two statements that end a transaction on the wire also end it here, so a
+  // test can observe the provider's rollback rather than only the call to it.
+  const ended = /^\s*(COMMIT|ROLLBACK)\s*;?\s*$/i.test(sql as string);
+  if (ended) mockTxStatus = "I";
+  // A bare BEGIN opens one, which PostgreSQL reports as "T" on the very next
+  // ReadyForQuery. `mockBeginOpens = false` is the server that accepts BEGIN and opens
+  // nothing, the way RisingWave does.
+  if (mockBeginOpens && /^\s*BEGIN\s*;?\s*$/i.test(sql as string)) mockTxStatus = "T";
+  // The aborted block the maintenance probe asks inside (#1387), as PostgreSQL keeps it: the
+  // poison aborts an open block, and every later statement but the ROLLBACK is refused with
+  // `25P02` after its parse, or with the grammar error a statement in `mockAbortedBlockRefusals`
+  // gets from a server that does not have it.
+  if (sql === "SELECT 1/0" && mockTxStatus === "T") {
+    mockTxStatus = "E";
+    return Promise.reject(Object.assign(new Error("division by zero"), { code: "22012" }));
+  }
+  if (typeof sql === "string" && mockTxStatus === "E" && !ended) {
+    const refusal = mockAbortedBlockRefusals[sql];
+    if (refusal === "resolves") return Promise.resolve({ rows: [] });
+    return Promise.reject(
+      refusal ??
+        Object.assign(new Error("current transaction is aborted, commands ignored until end of transaction block"), {
+          code: "25P02",
+        }),
+    );
+  }
+  const answer = mockQueryFn(sql as string, params);
+  if (typeof sql !== "string") return answer;
+  // One result per statement, which is what `pg` hands back for a multi-statement simple
+  // query and what the apply's post-condition counts.
+  const count = mockApplyResultCount;
+  return sql.startsWith(APPLY_UNIT_PREFIX) && count !== "not-an-array"
+    ? answer.then((result) => Array.from({ length: count }, () => result))
+    : answer;
+}
+
 const mockClient = {
-  query: (sql: string | MockParseConfig, params?: unknown[]) => {
-    mockWire.push(sql);
-    // A config carrying a `name` is a NAMED prepared statement, which is the only way
-    // node-postgres reaches Parse, and it is answered the way the server answers a Parse (D76).
-    // A config with no name is `queryMode: "extended"`, which the read-only profile sends and
-    // which goes to `mockQueryFn` exactly as it always did.
-    if (typeof sql !== "string" && typeof sql.name === "string") return answerParseProbe();
-    // The two statements that end a transaction on the wire also end it here, so a
-    // test can observe the provider's rollback rather than only the call to it.
-    const ended = /^\s*(COMMIT|ROLLBACK)\s*;?\s*$/i.test(sql as string);
-    if (ended) mockTxStatus = "I";
-    // A bare BEGIN opens one, which PostgreSQL reports as "T" on the very next
-    // ReadyForQuery. `mockBeginOpens = false` is the server that accepts BEGIN and opens
-    // nothing, the way RisingWave does.
-    if (mockBeginOpens && /^\s*BEGIN\s*;?\s*$/i.test(sql as string)) mockTxStatus = "T";
-    // The aborted block the maintenance probe asks inside (#1387), as PostgreSQL keeps it: the
-    // poison aborts an open block, and every later statement but the ROLLBACK is refused with
-    // `25P02` after its parse, or with the grammar error a statement in `mockAbortedBlockRefusals`
-    // gets from a server that does not have it.
-    if (sql === "SELECT 1/0" && mockTxStatus === "T") {
-      mockTxStatus = "E";
-      return Promise.reject(Object.assign(new Error("division by zero"), { code: "22012" }));
-    }
-    if (typeof sql === "string" && mockTxStatus === "E" && !ended) {
-      const refusal = mockAbortedBlockRefusals[sql];
-      if (refusal === "resolves") return Promise.resolve({ rows: [] });
-      return Promise.reject(
-        refusal ??
-          Object.assign(new Error("current transaction is aborted, commands ignored until end of transaction block"), {
-            code: "25P02",
-          }),
-      );
-    }
-    const answer = mockQueryFn(sql as string, params);
-    if (typeof sql !== "string") return answer;
-    // One result per statement, which is what `pg` hands back for a multi-statement simple
-    // query and what the apply's post-condition counts.
-    const count = mockApplyResultCount;
-    return sql.startsWith(APPLY_UNIT_PREFIX) && count !== "not-an-array"
-      ? answer.then((result) => Array.from({ length: count }, () => result))
-      : answer;
+  query: (sql: string | MockParseConfig | MockRowModeConfig, params?: unknown[]) => {
+    const arrayRows = typeof sql !== "string" && (sql as MockRowModeConfig).rowMode === "array";
+    // The user's statement on the simple protocol is unwrapped to the text it carries, so every
+    // fixture below keeps matching on the statement; the read-only profile's extended config is
+    // handed on whole, as it always was.
+    if (arrayRows && (sql as MockRowModeConfig).queryMode === undefined) sql = (sql as MockRowModeConfig).text;
+    const answered = mockClientQuery(sql as string | MockParseConfig, params);
+    return arrayRows ? answered.then((answer) => asRowModeArray(answer as MockPgAnswer | MockPgAnswer[])) : answered;
   },
   getTransactionStatus: () => mockTxStatus,
   // `pg`'s client is an EventEmitter; `runMaintenance` listens for the server's notices (#1387).
@@ -681,6 +729,11 @@ function defaultMockQuery(sql: string): Promise<{ rows: unknown[]; fields?: { na
 
   // getTableStats: pg_stat_user_tables
   if (normalized.includes("pg_stat_user_tables") && normalized.includes("n_live_tup")) {
+    // A size column the statement no longer asks the engine for answers NULL, the way the
+    // server answers the `NULL::bigint` a refused builtin is rewritten to (#1436). Without
+    // this the mock would hand back bytes for a column the statement does not select, and a
+    // test of the repair would pass on rows no engine could have produced.
+    const sized = (fn: string, bytes: string): string | null => (normalized.includes(`${fn}(relid)`) ? bytes : null);
     return Promise.resolve({
       rows: [
         {
@@ -689,12 +742,9 @@ function defaultMockQuery(sql: string): Promise<{ rows: unknown[]; fields?: { na
           live_row_count: "1000",
           dead_row_count: "50",
           row_count: "1050",
-          table_size: "64 kB",
-          table_size_bytes: "65536",
-          index_size: "32 kB",
-          index_size_bytes: "32768",
-          total_size: "96 kB",
-          total_size_bytes: "98304",
+          table_size_bytes: sized("pg_table_size", "65536"),
+          index_size_bytes: sized("pg_indexes_size", "32768"),
+          total_size_bytes: sized("pg_total_relation_size", "98304"),
           last_vacuum: null,
           last_autovacuum: new Date().toISOString(),
           last_analyze: null,
@@ -707,12 +757,9 @@ function defaultMockQuery(sql: string): Promise<{ rows: unknown[]; fields?: { na
           live_row_count: "5000",
           dead_row_count: "200",
           row_count: "5200",
-          table_size: "256 kB",
-          table_size_bytes: "262144",
-          index_size: "128 kB",
-          index_size_bytes: "131072",
-          total_size: "384 kB",
-          total_size_bytes: "393216",
+          table_size_bytes: sized("pg_table_size", "262144"),
+          index_size_bytes: sized("pg_indexes_size", "131072"),
+          total_size_bytes: sized("pg_total_relation_size", "393216"),
           last_vacuum: new Date().toISOString(),
           last_autovacuum: null,
           last_analyze: new Date().toISOString(),
@@ -2225,10 +2272,15 @@ describe("PostgresProvider", () => {
     // confirmed against a live instance. They are the schemas a wire-compatible
     // engine puts in pg_tables/information_schema alongside a user's own tables.
     const DOCUMENTED_ENGINE_SCHEMAS = [
-      // Materialize - materialize.com/docs/sql/system-catalog/
+      // Materialize - materialize.com/docs/sql/system-catalog/ documents the first three.
+      // The other two were measured on v26.44.1 (#1428).
       "mz_catalog",
       "mz_internal",
       "mz_introspection",
+      "mz_unsafe",
+      "mz_catalog_unstable",
+      // RisingWave - docs.risingwave.com/sql/system-catalogs/rw-catalog. Measured on 3.1.0.
+      "rw_catalog",
       // CockroachDB - cockroachlabs.com/docs/stable/system-catalogs
       "crdb_internal",
       "pg_extension",
@@ -2375,7 +2427,11 @@ describe("PostgresProvider", () => {
     // PanelUnavailable then reads that sentence to decide whether the absence is an
     // engine limit or a refused statement (see monitoring-absence.ts).
 
-    test("getTableStats() surfaces the engine's sentence instead of an empty result", async () => {
+    // A refused SIZE is no longer a refused PANEL (#1436): the sizes are three columns of a
+    // read whose other columns the engine answers, so each is dropped on its own and the rows
+    // arrive with that size absent. What still rejects is a refusal that leaves NOTHING to
+    // answer with - the catalog itself, or a planner restriction, both below.
+    test("getTableStats() answers the rows when only the size builtin is refused", async () => {
       mockQueryFn = (sql: string) => {
         if (sql.includes("pg_table_size")) {
           return Promise.reject(new Error('function "pg_table_size" does not exist'));
@@ -2385,7 +2441,9 @@ describe("PostgresProvider", () => {
       provider = new PostgresProvider(makePgConfig());
       await provider.connect();
 
-      await expect(provider.getTableStats()).rejects.toThrow(/pg_table_size/);
+      const stats = await provider.getTableStats();
+      expect(stats.length).toBe(2);
+      expect(stats[0].tableSizeBytes).toBeUndefined();
     });
 
     test("getIndexStats() surfaces the engine's sentence instead of an empty result", async () => {
@@ -3232,7 +3290,13 @@ describe("PostgresProvider", () => {
       expect(Array.isArray(stats)).toBe(true);
     });
 
-    test("quotes identifiers in the stats query for mixed-case safety", async () => {
+    // The size builtins used to take `quote_ident(schemaname) || '.' || quote_ident(relname)`.
+    // Stock PostgreSQL casts that text to regclass; CockroachDB v26.3.2 answers `unknown
+    // signature: pg_table_size(string)` and RisingWave 3.1.0 fails to bind it, which killed the
+    // whole read on both (#1436). `relid` is the table's oid, already in pg_stat_user_tables, so
+    // it needs no cast and no name re-parsing. No `pg_size_pretty()` either: RisingWave does not
+    // bind that one, and `formatBytes()` already spells every other size this provider reports.
+    test("the size builtins take relid, never a concatenated name", async () => {
       provider = new PostgresProvider(makePgConfig());
       await provider.connect();
       let capturedSql = "";
@@ -3241,8 +3305,109 @@ describe("PostgresProvider", () => {
         return defaultMockQuery(sql);
       };
       await provider.getTableStats();
-      expect(capturedSql).toContain("quote_ident(schemaname)");
-      expect(capturedSql).toContain("quote_ident(relname)");
+      expect(capturedSql).toContain("pg_table_size(relid)");
+      expect(capturedSql).toContain("pg_indexes_size(relid)");
+      expect(capturedSql).toContain("pg_total_relation_size(relid)");
+      expect(capturedSql).not.toContain("quote_ident");
+      expect(capturedSql).not.toContain("pg_size_pretty");
+    });
+
+    test("formats the sizes itself, from the bytes the engine answered", async () => {
+      provider = new PostgresProvider(makePgConfig());
+      await provider.connect();
+      const stats = await provider.getTableStats();
+      const users = stats.find((s) => s.tableName === "users")!;
+      expect(users.tableSizeBytes).toBe(65536);
+      expect(users.tableSize).toBe("64 KB");
+      expect(users.indexSize).toBe("32 KB");
+      expect(users.totalSize).toBe("96 KB");
+    });
+
+    // RisingWave 3.1.0's measured shape: pg_table_size and pg_indexes_size answer, and
+    // pg_total_relation_size does not bind. The rows and the two sizes that ARE published
+    // survive, and the total comes from PostgreSQL's own definition of it rather than from a
+    // 0 nobody measured (BACKLOG D105).
+    //
+    // Measured on RisingWave 3.1.0 on 2026-10-08, one table of two rows:
+    //   pg_table_size(relid)           -> 89
+    //   pg_indexes_size(relid)         -> 0
+    //   pg_total_relation_size(relid)  -> "function pg_total_relation_size(integer) does not exist"
+    //
+    // Before this, the row reached the Tables tab as tableSizeBytes 89 beside totalSizeBytes 0,
+    // and the Size card summed that 0 into "0 B" over a table with bytes in it, because the
+    // card and the Storage tab's share gate on `tableSizeBytes` alone.
+    test("a refused total is derived from the two parts the engine did publish", async () => {
+      let attempts = 0;
+      mockQueryFn = (sql: string) => {
+        if (sql.includes("pg_total_relation_size")) {
+          attempts++;
+          return Promise.reject(new Error("Failed to bind expression: pg_total_relation_size"));
+        }
+        return defaultMockQuery(sql);
+      };
+      provider = new PostgresProvider(makePgConfig());
+      await provider.connect();
+
+      const stats = await provider.getTableStats();
+      expect(attempts).toBe(1);
+      expect(stats.length).toBe(2);
+      const users = stats.find((s) => s.tableName === "users")!;
+      expect(users.tableSizeBytes).toBe(65536);
+      expect(users.indexSizeBytes).toBe(32768);
+      // pg_total_relation_size is documented as pg_table_size plus pg_indexes_size.
+      expect(users.totalSizeBytes).toBe(65536 + 32768);
+      expect(users.totalSize).toBe("96 KB");
+      // Never the placeholder beside a measured part, which is what drew "0 B".
+      expect(stats.every((s) => s.tableSizeBytes === undefined || s.totalSizeBytes > 0)).toBe(true);
+    });
+
+    // The shape no engine measured here produces, and the one the derivation cannot repair:
+    // with a part missing too there is nothing to add up. The parts go with the total, so the
+    // panels read the absence rather than summing the 0 the required field still carries.
+    test("a total that cannot be derived takes the measured part with it", async () => {
+      mockQueryFn = (sql: string) => {
+        for (const fn of ["pg_indexes_size", "pg_total_relation_size"]) {
+          if (sql.includes(`${fn}(relid)`)) {
+            return Promise.reject(new Error(`function "${fn}" does not exist`));
+          }
+        }
+        return defaultMockQuery(sql);
+      };
+      provider = new PostgresProvider(makePgConfig());
+      await provider.connect();
+
+      const stats = await provider.getTableStats();
+      const users = stats.find((s) => s.tableName === "users")!;
+      expect(users.tableSizeBytes).toBeUndefined();
+      expect(users.indexSizeBytes).toBeUndefined();
+      expect(users.totalSize).toBe("N/A");
+      // The rows are what the panel was opened for, and they are still there.
+      expect(users.liveRowCount).toBe(1000);
+    });
+
+    test("each size builtin is dropped on its own, so one absence does not cost the others", async () => {
+      const refused: string[] = [];
+      mockQueryFn = (sql: string) => {
+        for (const fn of ["pg_table_size", "pg_indexes_size", "pg_total_relation_size"]) {
+          if (sql.includes(`${fn}(relid)`) && !refused.includes(fn)) {
+            refused.push(fn);
+            return Promise.reject(new Error(`function "${fn}" does not exist`));
+          }
+        }
+        return defaultMockQuery(sql);
+      };
+      provider = new PostgresProvider(makePgConfig());
+      await provider.connect();
+
+      const stats = await provider.getTableStats();
+      expect(refused.length).toBe(3);
+      expect(stats.length).toBe(2);
+      const users = stats.find((s) => s.tableName === "users")!;
+      expect(users.tableSizeBytes).toBeUndefined();
+      expect(users.indexSizeBytes).toBeUndefined();
+      expect(users.totalSize).toBe("N/A");
+      // The rows are still the point: the row counts a user came to the panel for survive.
+      expect(users.liveRowCount).toBe(1000);
     });
   });
 
@@ -3397,8 +3562,9 @@ describe("PostgresProvider", () => {
         const built = new SessionClient(lastPoolConfig);
         for (const sent of startup) built.emit("notice", sent);
         session = Object.assign(built, {
-          query: async (sql: string, params?: unknown[]) => {
-            for (const sent of raised[sql] ?? []) built.emit("notice", sent);
+          query: async (sql: string | { text: string }, params?: unknown[]) => {
+            // The user's statement arrives as a `{ text, rowMode }` config, the provider's own as text.
+            for (const sent of raised[typeof sql === "string" ? sql : sql.text] ?? []) built.emit("notice", sent);
             return mockClient.query(sql, params);
           },
           getTransactionStatus: mockClient.getTransactionStatus,
@@ -3615,6 +3781,7 @@ describe("PostgresProvider", () => {
       // `UPDATE t SET c = v WHERE pk = v` is core PostgreSQL DML — exactly the
       // statement shape the inline row editor builds (#269).
       expect(caps.supportsInlineRowEdit).toBe(true);
+      expect(caps.supportsTestDataGeneration).toBe(true);
       // `LIMIT n OFFSET m` from the shared limiter (#816).
       expect(caps.supportsResultPagination).toBe(true);
       // BEGIN/COMMIT/ROLLBACK run over one held pool client here, so the toolbar's
@@ -3827,11 +3994,24 @@ describe("PostgresProvider", () => {
 
     /** The server executes each semicolon-separated command of a simple-protocol string in turn. */
     function splitCommands(text: string): string[] {
-      // Naive split is faithful enough for this suite's corpus (no ';' inside literals).
-      return text
-        .split(";")
-        .map((part) => part.trim())
-        .filter((part) => part.length > 0);
+      // A split that skips dollar-quoted bodies is faithful enough for this suite's corpus: the
+      // only ';' inside a literal is in the `DO` block connect sends (#1437).
+      const commands: string[] = [];
+      let start = 0;
+      let quote: string | null = null;
+      for (let i = 0; i < text.length; i++) {
+        const tag = text[i] === "$" ? /^\$[A-Za-z_]*\$/.exec(text.slice(i))?.[0] : undefined;
+        if (tag !== undefined) {
+          if (quote === null) quote = tag;
+          else if (tag === quote) quote = null;
+          i += tag.length - 1;
+        } else if (text[i] === ";" && quote === null) {
+          commands.push(text.slice(start, i));
+          start = i + 1;
+        }
+      }
+      commands.push(text.slice(start));
+      return commands.map((part) => part.trim()).filter((part) => part.length > 0);
     }
 
     type EngineProtocol = "simple" | "extended";
@@ -4055,6 +4235,14 @@ describe("PostgresProvider", () => {
           case "EXPLAIN":
           case "SHOW":
             return this.rows(this.selectRows);
+          case "DO":
+            // This mock runs no PL/pgSQL, so a block is a write attempt like anything else here,
+            // except the routine-guard probe connect sends (#1437), which reads `pg_proc` under
+            // `WHERE false` and changes nothing.
+            if (/^DO \$probe\$BEGIN PERFORM p\.xmin FROM pg_catalog\.pg_proc p WHERE false; END\$probe\$$/.test(text)) {
+              return { rows: [], fields: [], rowCount: 0 };
+            }
+            return this.write(text, keyword);
           default:
             // Everything else counts as a write attempt (conservative server model).
             return this.write(text, keyword);
@@ -4108,10 +4296,12 @@ describe("PostgresProvider", () => {
       const editor = new PostgresProvider(makePgConfig());
       await editor.connect();
 
-      // The EXPLAIN probe, then the maintenance probe's block (#1387). This fixture records what
-      // reaches the engine mock, and the statements inside the aborted block are refused before it.
+      // The EXPLAIN probe, the routine-guard probe (#1437), then the maintenance probe's block
+      // (#1387). This fixture records what reaches the engine mock, and the statements inside the
+      // aborted block are refused before it.
       expect(fresh.statements.map((s) => s.text)).toEqual([
         "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1",
+        "DO $probe$BEGIN PERFORM p.xmin FROM pg_catalog.pg_proc p WHERE false; END$probe$",
         "BEGIN",
         "ROLLBACK",
       ]);
@@ -4575,6 +4765,212 @@ describe("PostgresProvider declared column types", () => {
   });
 });
 
+/**
+ * Every column keeps its own value (D3). `pg`'s object rows key a value by its column's name, so of two
+ * columns one name declares, the row keeps only the last: measured 2026-10-07 on PostgreSQL 16, the join
+ * below answered the customer's id under both `id` headers and the order's id nowhere. The provider asks
+ * for array rows and keys them by `uniqueFieldNames`, so a repeat is `id (2)`. The fixtures answer the
+ * array rows that run measured, so the mock cannot drop a value the driver would have kept.
+ */
+describe("PostgresProvider result columns", () => {
+  const join = {
+    rows: [
+      [1, 100, "widget", 100, "Acme"],
+      [2, 200, "gadget", 200, "Globex"],
+    ],
+    fields: [
+      { name: "id", dataTypeID: 23 },
+      { name: "customer_id", dataTypeID: 23 },
+      { name: "item", dataTypeID: 25 },
+      { name: "id", dataTypeID: 23 },
+      { name: "name", dataTypeID: 25 },
+    ],
+    rowCount: 2,
+  };
+  const JOIN_SQL = "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id";
+  const joinFields = ["id", "customer_id", "item", "id (2)", "name"];
+  const joinRows = [
+    { id: 1, customer_id: 100, item: "widget", "id (2)": 100, name: "Acme" },
+    { id: 2, customer_id: 200, item: "gadget", "id (2)": 200, name: "Globex" },
+  ];
+
+  async function connected() {
+    const provider = new PostgresProvider(makePgConfig());
+    await provider.connect();
+    return provider;
+  }
+
+  test("query() asks pg for array rows and keeps both values of a repeated name", async () => {
+    const sent: unknown[] = [];
+    const query = spyOn(mockClient, "query");
+    mockQueryFn = (sql) =>
+      Promise.resolve(
+        sql === "SELECT 1 AS a, 2 AS a"
+          ? {
+              rows: [[1, 2]],
+              fields: [
+                { name: "a", dataTypeID: 23 },
+                { name: "a", dataTypeID: 25 },
+              ],
+              rowCount: 1,
+            }
+          : { rows: [], fields: [], rowCount: 0 },
+      );
+    try {
+      const provider = await connected();
+      const result = await provider.query("SELECT 1 AS a, 2 AS a", [7]);
+      sent.push(...query.mock.calls.at(-1)!);
+      expect(result.fields).toEqual(["a", "a (2)"]);
+      expect(result.rows).toEqual([{ a: 1, "a (2)": 2 }]);
+      expect(result.columnTypes).toEqual({ a: "integer", "a (2)": "text" });
+      expect(result.rowCount).toBe(1);
+      await provider.disconnect();
+    } finally {
+      query.mockRestore();
+    }
+    // The values still travel beside the config, so the protocol pg picks is the one it picked before.
+    expect(sent).toEqual([{ text: "SELECT 1 AS a, 2 AS a", rowMode: "array" }, [7]]);
+  });
+
+  test("query() keeps the order's id and the customer's id of a join apart", async () => {
+    mockQueryFn = () => Promise.resolve(join);
+    const provider = await connected();
+    const result = await provider.query(JOIN_SQL);
+    expect(result.fields).toEqual(joinFields);
+    expect(result.rows).toEqual(joinRows);
+    expect(result.columnTypes).toEqual({
+      id: "integer",
+      customer_id: "integer",
+      item: "text",
+      "id (2)": "integer",
+      name: "text",
+    });
+    await provider.disconnect();
+  });
+
+  test("query() numbers the unnamed columns PostgreSQL calls ?column?", async () => {
+    mockQueryFn = () =>
+      Promise.resolve({
+        rows: [[1, 2]],
+        fields: [
+          { name: "?column?", dataTypeID: 23 },
+          { name: "?column?", dataTypeID: 23 },
+        ],
+        rowCount: 1,
+      });
+    const provider = await connected();
+    const result = await provider.query("SELECT 1, 2");
+    expect(result.fields).toEqual(["?column?", "?column? (2)"]);
+    expect(result.rows).toEqual([{ "?column?": 1, "?column? (2)": 2 }]);
+    await provider.disconnect();
+  });
+
+  test("queryInTransaction() reads the same way", async () => {
+    mockQueryFn = (sql) => Promise.resolve(sql === JOIN_SQL ? join : { rows: [], fields: [], rowCount: 0 });
+    const provider = await connected();
+    await provider.beginTransaction();
+    const result = await provider.queryInTransaction(JOIN_SQL);
+    expect(result.fields).toEqual(joinFields);
+    expect(result.rows).toEqual(joinRows);
+    await provider.rollbackTransaction();
+    await provider.disconnect();
+  });
+
+  test("queryReadOnly() reads the same way, and measures its budget on the rows it answers", async () => {
+    const sent: unknown[] = [];
+    mockQueryFn = (arg) => {
+      sent.push(arg);
+      const text = typeof arg === "string" ? arg : (arg as unknown as { text: string }).text;
+      if (text === JOIN_SQL) return Promise.resolve(join);
+      return Promise.resolve({
+        rows: [
+          { is_superuser: false, reads_server_files: false, writes_server_files: false, executes_programs: false },
+        ],
+        fields: [],
+        rowCount: 1,
+      });
+    };
+    const provider = new PostgresProvider(makePgConfig(), {}, { readOnly: true });
+    await provider.connect();
+    const result = await provider.queryReadOnly(JOIN_SQL, {
+      statementTimeoutMs: 4500,
+      maxResultRows: 10,
+      maxResultBytes: 10_000,
+    } as ReadOnlyStatementBudget);
+    expect(result.fields).toEqual(joinFields);
+    expect(result.rows).toEqual(joinRows);
+    expect(sent).toContainEqual({ text: JOIN_SQL, queryMode: "extended", rowMode: "array" });
+
+    // The byte budget is measured on the keyed rows, which are what the agent receives.
+    const tight = { statementTimeoutMs: 4500, maxResultRows: 10, maxResultBytes: 60 } as ReadOnlyStatementBudget;
+    await expect(provider.queryReadOnly(JOIN_SQL, tight)).rejects.toThrow("exceeded the byte budget");
+    await provider.disconnect();
+  });
+
+  test("a multi-statement text answers its first result set, and every set when it has several", async () => {
+    mockQueryFn = () =>
+      Promise.resolve([
+        { rows: [], fields: [], rowCount: 3 },
+        join,
+        { rows: [[7]], fields: [{ name: "n", dataTypeID: 20 }], rowCount: 1 },
+        { rows: [], fields: [], rowCount: null },
+      ] as never);
+    const provider = await connected();
+    const result = await provider.query("INSERT INTO t SELECT 1; SELECT * FROM j; SELECT 7 AS n; COMMIT");
+    expect(result.fields).toEqual(joinFields);
+    expect(result.rows).toEqual(joinRows);
+    expect(result.rowCount).toBe(2);
+    expect(result.columnTypes?.["id (2)"]).toBe("integer");
+    expect(result.resultSets).toEqual([
+      {
+        rows: joinRows,
+        fields: joinFields,
+        columnTypes: { id: "integer", customer_id: "integer", item: "text", "id (2)": "integer", name: "text" },
+      },
+      { rows: [{ n: 7 }], fields: ["n"], columnTypes: { n: "bigint" } },
+    ]);
+    await provider.disconnect();
+  });
+
+  test("a multi-statement text with one result set answers it alone", async () => {
+    mockQueryFn = () =>
+      Promise.resolve([{ rows: [], fields: [], rowCount: 1 }, join, { rows: [], fields: [], rowCount: null }] as never);
+    const provider = await connected();
+    await provider.beginTransaction();
+    const result = await provider.queryInTransaction("INSERT INTO t VALUES (1); SELECT * FROM j; COMMIT");
+    expect(result.fields).toEqual(joinFields);
+    expect(result.rows).toEqual(joinRows);
+    expect(result.rowCount).toBe(2);
+    expect(Object.hasOwn(result, "resultSets")).toBe(false);
+    await provider.disconnect();
+  });
+
+  test("a multi-statement text with no result set answers its first statement's count", async () => {
+    mockQueryFn = () =>
+      Promise.resolve([
+        { rows: [], fields: [], rowCount: 2 },
+        { rows: [], fields: [], rowCount: 5 },
+      ] as never);
+    const provider = await connected();
+    const result = await provider.query("INSERT INTO t VALUES (1), (2); DELETE FROM u");
+    expect(result.rows).toEqual([]);
+    expect(result.fields).toEqual([]);
+    expect(result.rowCount).toBe(2);
+    expect(Object.hasOwn(result, "resultSets")).toBe(false);
+    await provider.disconnect();
+  });
+
+  test("a row whose value count differs from the column count is an error, not a guess", async () => {
+    mockQueryFn = () => Promise.resolve({ rows: [[1]], fields: [{ name: "a" }, { name: "b" }], rowCount: 1 });
+    const provider = await connected();
+    const refused = await provider.query("SELECT a, b FROM t").catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(QueryError);
+    expect((refused as QueryError).message).toBe("Row 1 carries 1 values for 2 result columns");
+    expect((refused as QueryError).query).toBe("SELECT a, b FROM t");
+    await provider.disconnect();
+  });
+});
+
 // ============================================================================
 // The connect-time EXPLAIN grammar probe (#597)
 // ============================================================================
@@ -4719,6 +5115,123 @@ describe("PostgresProvider EXPLAIN grammar probe", () => {
     await provider.connect();
 
     expect(provider.getCapabilities().explainFormat).toBe("postgres-text");
+    await provider.disconnect();
+  });
+});
+
+/**
+ * The routine-guard probe (#1437). A routine edit is applied between two `DO` blocks that run
+ * `PERFORM` and read `pg_proc.xmin`. Measured 2026-10-08 on CockroachDB v26.3.2: an empty
+ * `DO $$ BEGIN END $$` runs there, a block holding `PERFORM` is refused with the sentence below,
+ * and `pg_proc` has no `xmin`. So every apply there was refused after the reader had typed it.
+ */
+describe("PostgresProvider routine-guard probe (#1437)", () => {
+  const ROUTINE_GUARD_PROBE = "DO $probe$BEGIN PERFORM p.xmin FROM pg_catalog.pg_proc p WHERE false; END$probe$";
+  const COCKROACH_PERFORM_REFUSAL = Object.assign(
+    new Error('at or near ";": syntax error: unimplemented: this syntax'),
+    { code: "0A000" },
+  );
+  let sent: string[];
+
+  /** A server that refuses the probe when `refuse` is set and answers everything else as the fixture does. */
+  function server(refuse: boolean) {
+    return (sql: string) => {
+      sent.push(sql);
+      return refuse && sql === ROUTINE_GUARD_PROBE ? Promise.reject(COCKROACH_PERFORM_REFUSAL) : defaultMockQuery(sql);
+    };
+  }
+
+  const editableKinds = (provider: InstanceType<typeof PostgresProvider>) =>
+    (provider.getCapabilities().objectKinds ?? [])
+      .filter((kind) => kind.acceptsSourceEdits === true)
+      .map((kind) => kind.id)
+      .sort();
+
+  beforeEach(() => {
+    sent = [];
+    mockQueryFn = server(false);
+  });
+
+  test("before connect both routine kinds accept edits, as they always have", () => {
+    const provider = new PostgresProvider(makePgConfig());
+
+    // `POST /api/db/provider-meta` never connects (#457), so its answer stays what it was.
+    expect(editableKinds(provider)).toEqual(["function", "procedure"]);
+    expect(sent).toEqual([]);
+  });
+
+  test("a server that runs the probe keeps the edit on both routine kinds, after one statement", async () => {
+    const provider = new PostgresProvider(makePgConfig());
+    await provider.connect();
+
+    expect(editableKinds(provider)).toEqual(["function", "procedure"]);
+    expect(sent.filter((sql) => sql === ROUTINE_GUARD_PROBE)).toHaveLength(1);
+    await provider.disconnect();
+  });
+
+  test("a server that refuses the probe answers without acceptsSourceEdits on both routine kinds", async () => {
+    mockQueryFn = server(true);
+    const provider = new PostgresProvider(makePgConfig());
+    await provider.connect();
+    const kinds = provider.getCapabilities().objectKinds ?? [];
+
+    expect(editableKinds(provider)).toEqual([]);
+    // Absent rather than false, and the rest of each routine kind is unchanged: the Source tab
+    // still reads the definition.
+    for (const id of ["function", "procedure"]) {
+      const kind = kinds.find((candidate) => candidate.id === id);
+      expect(kind && Object.hasOwn(kind, "acceptsSourceEdits")).toBe(false);
+      expect(kind?.hasSource).toBe(true);
+    }
+    // A refused guard is a fact about the Edit control, not about the connection.
+    expect(provider.isConnected()).toBe(true);
+    await provider.disconnect();
+  });
+
+  test("the Source read of a routine on that server carries no edit affordance", async () => {
+    mockQueryFn = server(true);
+    const provider = new PostgresProvider(makePgConfig());
+    await provider.connect();
+    mockQueryFn = async () => ({
+      rows: [{ definition: MEASURED_FUNCTION_DEFINITION, may_replace: true, owner: "postgres" }],
+    });
+
+    const [part] = (await provider.readObjectSource(["app", "order_total(integer)"], "function")).parts;
+    if (isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.text).toBe(MEASURED_FUNCTION_DEFINITION);
+    expect(Object.hasOwn(part, "edit")).toBe(false);
+    await provider.disconnect();
+  });
+
+  test("an edit built on that server is refused before anything is sent", async () => {
+    mockQueryFn = server(true);
+    const provider = new PostgresProvider(makePgConfig());
+    await provider.connect();
+    sent = [];
+
+    await expect(
+      provider.buildObjectEdit({
+        path: ["app", "order_total(integer)"],
+        kind: "function",
+        partId: "definition",
+        text: MEASURED_FUNCTION_DEFINITION,
+      }),
+    ).rejects.toThrow('PostgreSQL does not apply an edited definition for the kind "function"');
+    expect(sent).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("the probe runs again on the next connect, because the next server may be another engine", async () => {
+    mockQueryFn = server(true);
+    const provider = new PostgresProvider(makePgConfig());
+    await provider.connect();
+    expect(editableKinds(provider)).toEqual([]);
+    await provider.disconnect();
+
+    mockQueryFn = server(false);
+    await provider.connect();
+
+    expect(editableKinds(provider)).toEqual(["function", "procedure"]);
     await provider.disconnect();
   });
 });
@@ -5974,6 +6487,209 @@ describe("PostgreSQL object listing and detail", () => {
 });
 
 /**
+ * Routines and relations an extension created inside a user's schema (#1429).
+ *
+ * Measured on PostgreSQL 18.6 after `CREATE EXTENSION pgcrypto; CREATE EXTENSION hstore;`
+ * with two user functions in `public`: `public` holds 99 functions and 97 of them have a
+ * `pg_depend` row with `deptype = 'e'`. `pg_stat_statements` installs its two views into
+ * `public` the same way. The mock stands in for that catalog and honours the ownership
+ * test only when the statement carries it for the right catalog and the right oid, so a
+ * statement without it answers the extension's objects exactly as the server did.
+ */
+describe("PostgreSQL extension-owned objects (#1429)", () => {
+  function makeProvider() {
+    return new PostgresProvider(makePgConfig());
+  }
+
+  const USER_FUNCTIONS = ["order_total", "touch_order"];
+  const EXTENSION_FUNCTIONS = ["crypt", "gen_salt", "hstore_to_json"];
+  const USER_VIEWS = ["order_summary"];
+  const EXTENSION_VIEWS = ["pg_stat_statements", "pg_stat_statements_info"];
+
+  function extensionCatalog(statements: string[], refuseOwnership = false) {
+    return async (sql: string) => {
+      statements.push(sql);
+      if (refuseOwnership && sql.includes("pg_depend")) {
+        throw Object.assign(new Error('relation "pg_depend" does not exist'), { code: "42P01" });
+      }
+      const functions = /p\.oid NOT IN \(SELECT d\.objid FROM pg_depend d [^)]*'pg_proc'::regclass/.test(sql)
+        ? USER_FUNCTIONS
+        : [...USER_FUNCTIONS, ...EXTENSION_FUNCTIONS];
+      const views = /c\.oid NOT IN \(SELECT d\.objid FROM pg_depend d [^)]*'pg_class'::regclass/.test(sql)
+        ? USER_VIEWS
+        : [...USER_VIEWS, ...EXTENSION_VIEWS];
+      if (sql.includes("GROUP BY kind")) {
+        return {
+          rows: [
+            { kind: "function", n: functions.length },
+            { kind: "view", n: views.length },
+          ],
+        };
+      }
+      if (sql.includes("described_columns")) {
+        return {
+          rows: views.map((name) => ({ name, columns: [], pk_columns: null, indexes: null, foreign_keys: null })),
+        };
+      }
+      if (sql.includes("prokind")) return { rows: functions.map((name) => ({ name, identity: `${name}()` })) };
+      if (sql.includes("relkind")) return { rows: views.map((name) => ({ name, row_count: null, size_bytes: null })) };
+      return { rows: [] };
+    };
+  }
+
+  test("the listing, the count and the bulk read leave out what an extension created", async () => {
+    mockQueryFn = extensionCatalog([]);
+    const provider = makeProvider();
+    await provider.connect();
+
+    expect((await provider.listObjects(["public"], "function")).map((object) => object.name)).toEqual(USER_FUNCTIONS);
+    expect((await provider.listObjects(["public"], "view")).map((object) => object.name)).toEqual(USER_VIEWS);
+    const counts = await provider.countObjects(["public"]);
+    expect(counts.function).toEqual({ count: 2 });
+    expect(counts.view).toEqual({ count: 1 });
+    const batch = await provider.describeObjects(["public"], "view");
+    expect(batch.details.map((detail) => detail.path)).toEqual([["public", "order_summary"]]);
+    await provider.disconnect();
+  });
+
+  test("every relation kind carries the test, not only views", async () => {
+    const statements: string[] = [];
+    mockQueryFn = extensionCatalog(statements);
+    const provider = makeProvider();
+    await provider.connect();
+
+    for (const kind of ["table", "view", "materialized_view", "sequence"]) {
+      await provider.listObjects(["public"], kind);
+      expect(statements.at(-1)).toContain("'pg_class'::regclass");
+    }
+    await provider.disconnect();
+  });
+
+  test("an engine without pg_depend still lists, counts and describes, with the test dropped", async () => {
+    // The driver serves PostgreSQL-wire engines nobody here has run. Without the retry,
+    // one that has no pg_depend would lose every folder to a clause it cannot answer.
+    const statements: string[] = [];
+    mockQueryFn = extensionCatalog(statements, true);
+    const provider = makeProvider();
+    await provider.connect();
+
+    expect(await provider.listObjects(["public"], "function")).toHaveLength(5);
+    expect(statements.at(-1)).not.toContain("pg_depend");
+    expect(await provider.listObjects(["public"], "view")).toHaveLength(3);
+    expect(statements.at(-1)).not.toContain("pg_depend");
+    const counts = await provider.countObjects(["public"]);
+    expect(counts.function).toEqual({ count: 5 });
+    expect(counts.view).toEqual({ count: 3 });
+    expect(statements.at(-1)).not.toContain("pg_depend");
+    expect((await provider.describeObjects(["public"], "view")).details).toHaveLength(3);
+    expect(statements.at(-1)).not.toContain("pg_depend");
+    await provider.disconnect();
+  });
+});
+
+/**
+ * The places #1429 did not reach, because they read other catalogs (#1599).
+ *
+ * With PostGIS in `public`, the Overview counted `spatial_ref_sys` as a table and its
+ * primary key as an index, and the Triggers folder listed a trigger on that table, while the
+ * Tables folder already hid the table. The mock answers the extension's objects unless the
+ * statement carries the ownership test for them, the same way the #1429 mock does.
+ */
+describe("PostgreSQL objects on extension-owned tables (#1599)", () => {
+  function makeProvider() {
+    return new PostgresProvider(makePgConfig());
+  }
+
+  const TRIGGER_DEFINITION =
+    "CREATE TRIGGER srs_audit AFTER UPDATE ON public.spatial_ref_sys FOR EACH ROW EXECUTE FUNCTION audit()";
+
+  function extensionTables(statements: string[], refuseOwnership = false) {
+    return async (sql: string) => {
+      statements.push(sql);
+      if (refuseOwnership && sql.includes("pg_depend")) {
+        throw Object.assign(new Error('relation "pg_depend" does not exist'), { code: "42P01" });
+      }
+      const tableOwnershipTested = /c\.oid NOT IN \(SELECT d\.objid FROM pg_depend d [^)]*'pg_class'::regclass/.test(
+        sql,
+      );
+      const tables = /table_schema, table_name\) NOT IN \(SELECT n\.nspname, c\.relname FROM pg_class c/.test(sql)
+        ? 1
+        : 2;
+      const indexes = /schemaname, tablename\) NOT IN \(SELECT n\.nspname, c\.relname FROM pg_class c/.test(sql)
+        ? 1
+        : 2;
+      const triggers = tableOwnershipTested
+        ? [{ name: "orders_stamp", parent: "orders" }]
+        : [
+            { name: "orders_stamp", parent: "orders" },
+            { name: "srs_audit", parent: "spatial_ref_sys" },
+          ];
+      if (sql.includes("as table_count")) {
+        return { rows: [{ table_count: String(tables), index_count: String(indexes) }] };
+      }
+      // COUNTS_SQL is one UNION whose relation arm carries the same pg_class test, so the trigger
+      // count is answered from the trigger arm's own text, which starts at SELECT 'trigger'.
+      if (sql.includes("GROUP BY kind")) {
+        const triggerArm = sql.slice(sql.indexOf("SELECT 'trigger'"));
+        const triggerArmTested = /c\.oid NOT IN \(SELECT d\.objid FROM pg_depend d [^)]*'pg_class'::regclass/.test(
+          triggerArm,
+        );
+        return { rows: [{ kind: "trigger", n: triggerArmTested ? 1 : 2 }] };
+      }
+      if (sql.includes("pg_get_triggerdef"))
+        return { rows: tableOwnershipTested ? [] : [{ definition: TRIGGER_DEFINITION }] };
+      if (sql.includes("tgname")) return { rows: triggers };
+      return defaultMockQuery(sql);
+    };
+  }
+
+  test("the Overview counts leave out a table an extension created, and its indexes", async () => {
+    mockQueryFn = extensionTables([]);
+    const provider = makeProvider();
+    await provider.connect();
+
+    const overview = await provider.getOverview();
+    expect(overview.tableCount).toBe(1);
+    expect(overview.indexCount).toBe(1);
+    await provider.disconnect();
+  });
+
+  test("the Triggers folder lists, counts and reads only triggers on the user's own tables", async () => {
+    mockQueryFn = extensionTables([]);
+    const provider = makeProvider();
+    await provider.connect();
+
+    expect((await provider.listObjects(["public"], "trigger")).map((object) => object.path)).toEqual([
+      ["public", "orders", "orders_stamp"],
+    ]);
+    expect((await provider.countObjects(["public"])).trigger).toEqual({ count: 1 });
+    await expect(provider.readObjectSource(["public", "spatial_ref_sys", "srs_audit"], "trigger")).rejects.toThrow(
+      /holds no trigger called "srs_audit"/,
+    );
+    await provider.disconnect();
+  });
+
+  test("an engine without pg_depend still counts, lists and reads, with the test dropped", async () => {
+    const statements: string[] = [];
+    mockQueryFn = extensionTables(statements, true);
+    const provider = makeProvider();
+    await provider.connect();
+
+    const overview = await provider.getOverview();
+    expect(overview.tableCount).toBe(2);
+    expect(overview.indexCount).toBe(2);
+    expect(await provider.listObjects(["public"], "trigger")).toHaveLength(2);
+    expect(statements.at(-1)).not.toContain("pg_depend");
+    expect((await provider.countObjects(["public"])).trigger).toEqual({ count: 2 });
+    expect(statements.at(-1)).not.toContain("pg_depend");
+    const document = await provider.readObjectSource(["public", "spatial_ref_sys", "srs_audit"], "trigger");
+    expect(statements.at(-1)).not.toContain("pg_depend");
+    expect(document.parts[0]).toMatchObject({ text: TRIGGER_DEFINITION });
+    await provider.disconnect();
+  });
+});
+
+/**
  * The fifth provider method (#789): every relation of one kind in one schema, described in
  * ONE round trip.
  *
@@ -6455,7 +7171,9 @@ const EXPECTED_TRIGGER_SOURCE_SQL =
   "FROM pg_catalog.pg_trigger t " +
   "JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid " +
   "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace " +
-  "WHERE n.nspname = $1 AND c.relname = $2 AND t.tgname = $3 AND NOT t.tgisinternal";
+  "WHERE n.nspname = $1 AND c.relname = $2 AND t.tgname = $3 AND NOT t.tgisinternal " +
+  "AND c.oid NOT IN (SELECT d.objid FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid " +
+  "WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'e')";
 
 describe("PostgreSQL object source", () => {
   function makeProvider() {

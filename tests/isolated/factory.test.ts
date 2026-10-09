@@ -353,19 +353,41 @@ const nodeEnvBefore = process.env.NODE_ENV;
 (process.env as Record<string, string>).NODE_ENV = "production";
 const {
   createDatabaseProvider,
-  getOrCreateProvider,
+  getOrCreateProvider: rawGetOrCreateProvider,
   removeProvider,
   clearProviderCache,
   getProviderCacheStats,
   evictIdleProviders,
   registerShutdownHandlers,
-  acquireExecutionProfileProvider,
+  acquireExecutionProfileProvider: rawAcquireExecutionProfileProvider,
+  profiledCacheKey,
   findOpenSingleWriterProvider,
   isSingleWriterFileOpen,
   getExecutionProfileCacheStats,
   withOneShotTunnel,
   assertReadOnlyHonoured,
 } = await import("@/lib/db/factory");
+// Existing SQLite cache tests exercise trusted callers. Explicitly grant their file posture;
+// denied callers are tested separately against the unwrapped factory below.
+function getOrCreateProvider(...args: Parameters<typeof rawGetOrCreateProvider>) {
+  const [connection, options, execution] = args;
+  return rawGetOrCreateProvider(
+    connection,
+    options,
+    execution ?? (connection.type === "sqlite" ? { allowExternalFileAccess: true } : {}),
+  );
+}
+// The same for the profiled path: existing SQLite agent tests exercise trusted requesters, and the
+// denied ones are tested against the unwrapped acquisition below.
+function acquireExecutionProfileProvider(...args: Parameters<typeof rawAcquireExecutionProfileProvider>) {
+  const [connection, profile, options, requester] = args;
+  return rawAcquireExecutionProfileProvider(
+    connection,
+    profile,
+    options,
+    requester ?? (connection.type === "sqlite" ? { allowExternalFileAccess: true } : {}),
+  );
+}
 if (nodeEnvBefore === undefined) {
   delete (process.env as Record<string, string>).NODE_ENV;
 } else {
@@ -537,6 +559,34 @@ describe("createDatabaseProvider", () => {
     const provider = await createDatabaseProvider(conn);
     expect(provider).toBeDefined();
     expect(provider.type).toBe("trino");
+  });
+
+  test('creates provider for type "databend"', async () => {
+    // Over a password to a non-loopback host without TLS, and with no Warehouse: the constructor validates nothing
+    // and opens nothing (Databend design 2.3), so the provider is built and declares SQL, the Databend plan format
+    // and no billed compute, with no server running; the plaintext refusal comes from connect().
+    const conn = makeConnection("databend", { port: 8000, database: undefined });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider.type).toBe("databend");
+    const capabilities = provider.getCapabilities();
+    expect(capabilities.queryLanguage).toBe("sql");
+    expect(capabilities.explainFormat).toBe("databend-text");
+    expect(capabilities.enforcesReadOnly).toBeUndefined();
+    expect(capabilities.resumesBilledCompute).toBeUndefined();
+    expect(provider.isConnected()).toBe(false);
+  });
+
+  test("a databend connection with readOnly: true is refused before anything is built (Databend design 5.7)", async () => {
+    const conn = { ...makeConnection("databend", { port: 8000 }), readOnly: true };
+    expect(() => assertReadOnlyHonoured(conn)).toThrow("readOnly: true is refused for databend");
+    await expect(createDatabaseProvider(conn)).rejects.toThrow(DatabaseConfigError);
+  });
+
+  test("the factory error lists databend after trino, in the SQL block", async () => {
+    const conn = makeConnection("not-an-engine");
+    await expect(createDatabaseProvider(conn)).rejects.toThrow(
+      /Supported types: .*\bdruid, trino, databend, cassandra\b/,
+    );
   });
 
   test('creates provider for type "cassandra"', async () => {
@@ -1023,6 +1073,28 @@ describe("getOrCreateProvider", () => {
     const tunnel = (await mockCreateSSHTunnel.mock.results[0]?.value) as { close: ReturnType<typeof mock> } | undefined;
     expect(tunnel?.close).not.toHaveBeenCalled();
     expect(getProviderCacheStats().size).toBe(0);
+  });
+
+  test("an inline connection without an id is refused before the cache key is computed (#1539)", async () => {
+    // The provider's own validate() refuses this record with DatabaseConfigError("Connection ID is
+    // required"), but the cache key is computed ahead of the provider: providerCacheKey length-frames
+    // connection.id, and a missing id crashed there with a TypeError, which createErrorResponse turned
+    // into a 500 INTERNAL_ERROR on query, health and multi-query. The refusal now happens first, as the
+    // same DatabaseConfigError the provider would have raised, so no cache key and no fallback key for a
+    // missing id.
+    const conn = makeConnection("sqlite", { id: undefined as unknown as string, database: ":memory:" });
+    await expect(getOrCreateProvider(conn)).rejects.toThrow("Connection ID is required");
+    await expect(getOrCreateProvider(conn)).rejects.toBeInstanceOf(DatabaseConfigError);
+    expect(getProviderCacheStats().size).toBe(0);
+  });
+
+  test("an execution-profile acquisition without an id is refused the same way (#1539)", async () => {
+    const conn = makeConnection("sqlite", { id: undefined as unknown as string, database: ":memory:" });
+    await expect(acquireExecutionProfileProvider(conn, "agent-operations")).rejects.toThrow(
+      "Connection ID is required",
+    );
+    await expect(acquireExecutionProfileProvider(conn, "agent-operations")).rejects.toBeInstanceOf(DatabaseConfigError);
+    expect(getExecutionProfileCacheStats().size).toBe(0);
   });
 });
 
@@ -1996,6 +2068,63 @@ describe("acquireExecutionProfileProvider", () => {
       expect((error as ExecutionProfileError).reasonCode).toBe("PROFILE_UNSUPPORTED_TARGET");
       expect(getExecutionProfileCacheStats().size).toBe(0);
     });
+
+    test("every profile opens a sqlite handle only under a trusted posture, as the editor does", async () => {
+      // SQLite's drivers cannot confine what a statement reads, read-only included, so a denied
+      // requester is refused at connect on the profiled path too, and an absent one reads as denied.
+      const conn = await seedFileConnection();
+
+      for (const profile of ["agent-read-only", "agent-operations", "agent-handover"] as const) {
+        for (const requester of [{ allowExternalFileAccess: false }, {}]) {
+          // oxlint-disable-next-line no-await-in-loop -- each refusal is read before the next call, and none may reach the cache.
+          const refusal: unknown = await rawAcquireExecutionProfileProvider(conn, profile, {}, requester).catch(
+            (e: unknown) => e,
+          );
+          expect(refusal).toBeInstanceOf(DatabaseConfigError);
+          expect((refusal as Error).message).toContain("require an administrator");
+        }
+      }
+      expect(getExecutionProfileCacheStats().size).toBe(0);
+
+      const agent = await rawAcquireExecutionProfileProvider(
+        conn,
+        "agent-read-only",
+        {},
+        { allowExternalFileAccess: true },
+      );
+      expect(await agent.queryReadOnly!("SELECT v FROM t", { ...AGENT_BUDGET })).toMatchObject({
+        rows: [{ v: "seeded" }],
+      });
+    });
+
+    test("a profiled sqlite handle a trusted requester opened is never served to a denied one", async () => {
+      // The profiled cache splits by posture for an engine that reads it, as the writable cache does;
+      // without that, the denied request below would be handed the trusted handle cached first.
+      const conn = await seedFileConnection();
+      await rawAcquireExecutionProfileProvider(conn, "agent-read-only", {}, { allowExternalFileAccess: true });
+
+      const refusal: unknown = await rawAcquireExecutionProfileProvider(
+        conn,
+        "agent-read-only",
+        {},
+        { allowExternalFileAccess: false },
+      ).catch((e: unknown) => e);
+
+      expect(refusal).toBeInstanceOf(DatabaseConfigError);
+      expect(getExecutionProfileCacheStats()).toEqual({ size: 1, connections: [conn.id] });
+    });
+  });
+
+  test("the profiled key carries the requester's posture only for an engine that reads it", async () => {
+    const sqlite = makeConnection("sqlite", { id: "sqlite-profiled-key", database: "/data/profiled-key.db" });
+    const denied = await profiledCacheKey(sqlite, "agent-read-only", { allowExternalFileAccess: false });
+
+    expect(await profiledCacheKey(sqlite, "agent-read-only", { allowExternalFileAccess: true })).not.toBe(denied);
+    // Absent reads as denied, as it does for the writable key.
+    expect(await profiledCacheKey(sqlite, "agent-read-only")).toBe(denied);
+    expect(await profiledCacheKey(pgConn(), "agent-read-only", { allowExternalFileAccess: false })).toBe(
+      await profiledCacheKey(pgConn(), "agent-read-only", { allowExternalFileAccess: true }),
+    );
   });
 });
 
@@ -3000,4 +3129,18 @@ describe("a tunnelled provider fingerprints the far end (X23)", () => {
     });
     expect(seen).toBe(await connectionFingerprint(stored));
   });
+});
+
+test("a denied SQLite caller cannot borrow a cached administrator handle", async () => {
+  const connection = makeConnection("sqlite", { database: ":memory:" });
+  const trusted = await getOrCreateProvider(connection, {}, { allowExternalFileAccess: true });
+  try {
+    await expect(getOrCreateProvider(connection, {}, { allowExternalFileAccess: false })).rejects.toThrow(
+      "require an administrator",
+    );
+    expect(trusted.isConnected()).toBe(true);
+    expect((await trusted.query("SELECT 1 AS value")).rows).toEqual([{ value: 1 }]);
+  } finally {
+    clearProviderCache();
+  }
 });

@@ -3,7 +3,9 @@ import { isBareIdentifier, quoteIdentifier } from "@/lib/sql/identifier";
 import { quoteLiteral } from "@/lib/sql/values";
 import { asBytes, binaryText } from "./binary";
 import { cellOf, resolveColumns, toCsv, type CsvDelimiter } from "./csv";
+import { htmlTable } from "./html";
 import { binaryCellsAsHex, jsonText } from "./json";
+import { markdownTable } from "./markdown";
 import { resolveUpdateTarget } from "@/lib/sql/update-target";
 import { cqlFrozenNested, typedLiteral, UnwritableValue } from "./typed-literals";
 import { isNonFiniteWord, nonFiniteWord, type NonFiniteWord } from "@/lib/non-finite";
@@ -18,7 +20,7 @@ import { isNonFiniteWord, nonFiniteWord, type NonFiniteWord } from "@/lib/non-fi
  * masking) is decided by the caller and arrives here as `rows`.
  */
 
-export type ResultExportFormat = "csv" | "json" | "sql-insert" | "sql-ddl";
+export type ResultExportFormat = "csv" | "json" | "sql-insert" | "sql-ddl" | "markdown" | "html";
 
 export interface ResultExportSource {
   /** The rows to write, already masked if the caller masks. */
@@ -178,6 +180,10 @@ const DIALECT_TYPES: Partial<Record<DatabaseType, Partial<Record<InferredKind, s
   // undefined name`, while BIGINT, DOUBLE PRECISION, BOOLEAN, TIMESTAMP and BLOB are whole types.
   // CLOB, the unbounded character type, rather than a VARCHAR whose bound a cell could pass (#786).
   db2: { text: "CLOB" },
+  // Databend's measured spellings (design 7.2, X01): M08a created `VARCHAR`, `DOUBLE` and `BINARY` columns on the
+  // pinned image and M08c read them back as `String`, `Float64` and `Binary`, unbounded. The standard `TEXT`,
+  // `DOUBLE PRECISION` and `BLOB` were not measured there. `BIGINT`, `BOOLEAN` and `TIMESTAMP` were, as they are.
+  databend: { text: "VARCHAR", numeric: "DOUBLE", binary: "BINARY" },
   oracle: {
     text: "VARCHAR2(4000)",
     integer: "NUMBER(19)",
@@ -569,6 +575,9 @@ const STANDS_ALONE: Record<DatabaseType, readonly string[]> = {
   influxdb3: NOTHING_STANDS_ALONE,
   // Oxia has no statement form for an export.
   oxia: NOTHING_STANDS_ALONE,
+  // Measured by M08a and M08c on the pinned image: each was created and read back unbounded (`String`, `Timestamp`
+  // with microseconds, `Binary`). Every other bare name is re-spelled from its family (design 7.2, X01).
+  databend: ["varchar", "timestamp", "binary"],
 };
 
 /**
@@ -582,6 +591,9 @@ const STANDS_ALONE: Record<DatabaseType, readonly string[]> = {
  * which `bit(64)`, MySQL's widest, takes for every width. MySQL's bare `datetime`,
  * `timestamp` and `time` have fractional precision 0, which ROUNDS a `.999` replayed into
  * them up to the next second, so they are written at precision 6.
+ *
+ * Databend has no row (design 7.2, X01): its `Timestamp` keeps microseconds without a precision and its `Decimal`
+ * always carries its own, so no bare name it reports narrows the value its INSERT writes back.
  */
 const DIALECT_BARE_SPELLING: Partial<Record<DatabaseType, Readonly<Record<string, string>>>> = {
   postgres: { bit: "bit varying" },
@@ -595,6 +607,10 @@ const DIALECT_BARE_SPELLING: Partial<Record<DatabaseType, Readonly<Record<string
  * The Cassandra driver reports a nested collection without its `frozen<...>` (measured on
  * 5.0.9: a `list<frozen<list<int>>>` column is declared `list<list<int>>`), and CQL refuses
  * that spelling: `Non-frozen collections are not allowed inside collections`.
+ *
+ * Databend has no row (design 7.2, X01): its declared types are written as its query schema spells them
+ * (`Nullable(Array(Int32 NULL))`), and the every-type replay of the provider's local pass is what proves or refutes
+ * that spelling in a CREATE TABLE.
  */
 const DECLARED_TYPE_REWRITE: Partial<Record<DatabaseType, (declared: string) => string>> = {
   cassandra: cqlFrozenNested,
@@ -783,6 +799,10 @@ const BINARY_LITERAL: Record<DatabaseType, BinaryLiteral> = {
   // zero-length blob (`octet_length` 0). `0x0102` is a parser error here.
   duckdb: "unhex",
   clickhouse: "unhex",
+  // Databend reads a quoted string into BINARY through `binary_input_format`, utf-8 by default, so the standard
+  // `X'…'` was not its measured spelling: M08b inserted `unhex('00ff10')` on the pinned image and M08c read back the
+  // three bytes as `00FF10` (design 7.2, X01).
+  databend: "unhex",
   couchbase: "text",
 };
 
@@ -860,21 +880,31 @@ function oracleDateShape(declared: string | undefined): OracleDateShape {
 }
 
 /**
- * How one Oracle column's date cells are written: `shape` for a `Date`, and `text` for the
- * zone-less text the provider reads a DATE and a TIMESTAMP as (#1131).
+ * How one Oracle column's date cells are written: `shape` for a `Date`, and `text` for a
+ * cell that arrives as a string: the zone-less text the provider reads a DATE and a
+ * TIMESTAMP as (#1131), or, for a zoned column, the `Date#toISOString` text a row carries
+ * once it has been through JSON over HTTP (#1224).
  *
- * `text` is set only for a column DECLARED `DATE` or `TIMESTAMP`, never by the fallback
- * `shape` takes. A VARCHAR2 holding `2026-09-01 10:30:00` is text, and converting it would
- * store the NLS rendering of a timestamp where the characters belonged.
+ * `text` is set only for a column DECLARED `DATE`, `TIMESTAMP[(n)]` or
+ * `TIMESTAMP[(n)] WITH [LOCAL] TIME ZONE`, never by the fallback `shape` takes. A VARCHAR2
+ * holding `2026-09-01 10:30:00` is text, and converting it would store the NLS rendering
+ * of a timestamp where the characters belonged.
  */
 interface OracleDateColumn {
   shape: OracleDateShape;
-  text?: "date" | "timestamp";
+  text?: "date" | "timestamp" | "zoned";
 }
 
 function oracleDateColumn(declared: string | undefined): OracleDateColumn {
   const bare = declared?.trim().toUpperCase() ?? "";
-  const text = bare === "DATE" ? "date" : /^TIMESTAMP\s*(\(\d\))?$/.test(bare) ? "timestamp" : undefined;
+  const text =
+    bare === "DATE"
+      ? "date"
+      : /^TIMESTAMP\s*(\(\d\))?$/.test(bare)
+        ? "timestamp"
+        : /^TIMESTAMP\s*(\(\d\))?\s+WITH\s+(LOCAL\s+)?TIME\s+ZONE$/.test(bare)
+          ? "zoned"
+          : undefined;
   return { shape: oracleDateShape(declared), ...(text === undefined ? {} : { text }) };
 }
 
@@ -936,6 +966,36 @@ function oracleTextLiteral(text: string, type: "date" | "timestamp"): string | u
 }
 
 /**
+ * The text `Date#toISOString` writes for a year from 0000 to 9999. A year outside that
+ * range is written with a sign and six digits (`-000044-…`, `+012026-…`) and does not
+ * match: Oracle has no year after 9999, and the `Date` path does not write a BC year
+ * Oracle reads back, so that text stays quoted instead of taking a literal the `Date`
+ * of the same instant would not get.
+ */
+const ISO_INSTANT_TEXT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * A zoned column's cell as it arrives over HTTP (#1224), as the literal the `Date` of that
+ * instant gets, or `undefined` when it is not that text.
+ *
+ * The driver hands a `TIMESTAMP WITH [LOCAL] TIME ZONE` over as the `Date` of its instant,
+ * and `POST /api/db/query` answers with JSON, so by the time an export over HTTP sees the
+ * row the cell is that `Date`'s ISO text. Quoted, Oracle reads it through the session's
+ * `NLS_TIMESTAMP_TZ_FORMAT` and refuses it (`ORA-01843`). The text is parsed back to its
+ * `Date` and written by `oracleDateLiteral`, so the two paths cannot drift apart, and only
+ * when that `Date` writes the same text again: `2026-02-30T…` and `T24:00:00.000Z` fit the
+ * form but are not what `toISOString` writes for any instant. The literal is built from
+ * the parsed fields, never from the text.
+ */
+function oracleZonedTextLiteral(text: string): string | undefined {
+  if (!ISO_INSTANT_TEXT.test(text)) return undefined;
+  const instant = new Date(text);
+  return !Number.isNaN(instant.getTime()) && instant.toISOString() === text
+    ? oracleDateLiteral(instant, "zoned")
+    : undefined;
+}
+
+/**
  * NaN and the infinities as each dialect reads them back into a float column.
  *
  * None of them is a number literal anywhere, the bare word `NaN` would read as a column
@@ -945,7 +1005,9 @@ function oracleTextLiteral(text: string, type: "date" | "timestamp"): string | u
  * infinities are quoted text anyway); SQLite reads `9e999` and `-9e999` as its
  * infinities in a `REAL` column, where a quoted `'Infinity'` is stored as TEXT, and has
  * no NaN at all (it stores one as NULL); Oracle AI Database 23.26.3 reads its own
- * constants into `BINARY_DOUBLE` and `BINARY_FLOAT`. Every other dialect, which either
+ * constants into `BINARY_DOUBLE` and `BINARY_FLOAT`; Databend (M08b, on the pinned image) inserted
+ * `'NaN'::FLOAT`, `'inf'::DOUBLE` and `'-inf'::FLOAT` into its `FLOAT` and `DOUBLE` columns and read back NaN,
+ * Infinity and -Infinity. Every other dialect, which either
  * cannot store these values or was not replayed, keeps writing NULL.
  */
 const NON_FINITE_LITERALS: Partial<Record<DatabaseType, Readonly<Record<NonFiniteWord, string>>>> = {
@@ -953,6 +1015,7 @@ const NON_FINITE_LITERALS: Partial<Record<DatabaseType, Readonly<Record<NonFinit
   duckdb: { NaN: "'NaN'", Infinity: "'Infinity'", "-Infinity": "'-Infinity'" },
   sqlite: { NaN: "NULL", Infinity: "9e999", "-Infinity": "-9e999" },
   oracle: { NaN: "BINARY_DOUBLE_NAN", Infinity: "BINARY_DOUBLE_INFINITY", "-Infinity": "-BINARY_DOUBLE_INFINITY" },
+  databend: { NaN: "'NaN'::FLOAT", Infinity: "'inf'::DOUBLE", "-Infinity": "'-inf'::FLOAT" },
 };
 
 function nonFiniteLiteral(word: NonFiniteWord, dialect: DatabaseType | undefined): string {
@@ -1002,7 +1065,7 @@ function sqlValue(
     return quoteLiteral(value.toISOString(), dialect);
   }
   if (typeof value === "string" && oracle?.text !== undefined) {
-    const literal = oracleTextLiteral(value, oracle.text);
+    const literal = oracle.text === "zoned" ? oracleZonedTextLiteral(value) : oracleTextLiteral(value, oracle.text);
     if (literal !== undefined) return literal;
   }
   // Before the object branch, which used to write a `bytea`/`BLOB` cell as the quoted
@@ -1022,11 +1085,14 @@ function sqlValue(
  * literal in the dialect (#1386). One refused statement stops the whole file on replay, so
  * the row is skipped and named instead. The column name is engine output, so it is written
  * as JSON with everything outside printable ASCII replaced: a line break in it would end
- * the comment and put the rest of the name in the file as a statement.
+ * the comment and put the rest of the name in the file as a statement. What the cell holds
+ * can carry engine output too (a Databend type is the server's own text), so it gets the
+ * same replacement.
  */
 function skippedRow(rowIndex: number, column: string, what: string, dialect: DatabaseType | undefined): string {
   const name = JSON.stringify(column).replace(/[^\x20-\x7e]/g, "?");
-  return `-- Row ${rowIndex + 1} skipped: column ${name} holds ${what}, which ${dialect ?? "this dialect"} has no literal for.`;
+  const held = what.replace(/[^\x20-\x7e]/g, "?");
+  return `-- Row ${rowIndex + 1} skipped: column ${name} holds ${held}, which ${dialect ?? "this dialect"} has no literal for.`;
 }
 
 /**
@@ -1047,6 +1113,14 @@ function exportTableName(source: ResultExportSource): string {
 export function buildResultExport(format: ResultExportFormat, source: ResultExportSource): ResultExportFile {
   const { rows, dialect } = source;
   const columns = resolveColumns(rows, source.fields);
+
+  if (format === "markdown") {
+    return { content: markdownTable(rows, columns), mimeType: "text/markdown;charset=utf-8", extension: "md" };
+  }
+
+  if (format === "html") {
+    return { content: htmlTable(rows, columns), mimeType: "text/html;charset=utf-8", extension: "html" };
+  }
 
   if (format === "json") {
     return { content: jsonText(rows.map(binaryCellsAsHex), 2), mimeType: "application/json", extension: "json" };

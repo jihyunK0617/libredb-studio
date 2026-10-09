@@ -60,7 +60,7 @@ import {
 import { comparePaths } from "@/lib/db/object-path";
 import { DatabaseConfigError, ConnectionError, QueryError, mapDatabaseError } from "../../errors";
 import { formatBytes } from "../../utils/pool-manager";
-import { unionFields } from "../../utils/result-fields";
+import { unionFields, uniquelyKeyedRows } from "../../utils/result-fields";
 import { CACHE_HIT_RATIO_UNAVAILABLE, formatCacheHitRatio, measuredNumber } from "@/lib/monitoring-cache-ratio";
 
 /**
@@ -520,6 +520,21 @@ const MONGODB_VIEW_TYPE = "view";
 const MONGODB_INTERNAL_PREFIX = "system.";
 
 /**
+ * The `type` a time series collection reports, and the reason one collection can appear
+ * twice in a listing: beside the collection itself the server also lists its internal
+ * bucket collection, and `collStats` answers the same bytes for each (#1455).
+ */
+const MONGODB_TIMESERIES_TYPE = "timeseries";
+
+/**
+ * The prefix the server gives the internal bucket collection behind a time series
+ * collection. `system.buckets.weather` is where the documents of the time series
+ * collection `weather` live, and `collStats` reports the same bytes under both names, so a
+ * byte total that counts both counts that collection twice (#1455).
+ */
+const MONGODB_TIMESERIES_BUCKET_PREFIX = `${MONGODB_INTERNAL_PREFIX}buckets.`;
+
+/**
  * The databases the server owns, by exact NAME.
  *
  * `admin`, `config` and `local` are MongoDB's own three. An exact list rather than a
@@ -527,6 +542,32 @@ const MONGODB_INTERNAL_PREFIX = "system.";
  * `adminx` are all creatable, measured, and the fixture holds the first.
  */
 const MONGODB_RESERVED_DATABASES: readonly string[] = Object.freeze(["admin", "config", "local"]);
+
+/**
+ * How long the driver's server selection waits before it gives up (#1458).
+ *
+ * `serverSelectionTimeoutMS` is a `MongoClient` option, not a connect-only one. The
+ * driver reads it when the client connects (`mongodb/lib/sdam/topology.js`) and again for
+ * every query and write for the life of that client
+ * (`mongodb/lib/operations/execute_operation.js`), so the value has to clear a replica set
+ * election as well as the initial dial. MongoDB documents the median election after an
+ * unplanned primary loss as up to 12 s and notes that network latency can extend it, so
+ * 30 s - the driver's own default - is the bound: above that window, and still half the
+ * 60 s that `pool.acquireTimeout` produced here.
+ *
+ * That 60 s was the defect (#1458). Server selection is a RETRY loop, not one attempt: the
+ * driver walks the topology it knows and re-attempts a member the moment a connect fails,
+ * until this deadline passes. Pointing it at a host and port where nothing listens
+ * therefore answered `connect ECONNREFUSED` only after the full deadline, so Test
+ * Connection spun for a minute over a typo in the port while Cassandra and Couchbase
+ * reported the same refusal in well under a second. `connectTimeoutMS` does not bound
+ * this: it caps ONE TCP attempt, and a refused connection fails that attempt immediately;
+ * it is the loop that kept going.
+ *
+ * `connectTimeoutMS` stays on `pool.acquireTimeout`, because that is the pool's own dial
+ * bound and not the selection loop's.
+ */
+const MONGODB_SERVER_SELECTION_TIMEOUT_MS = 30_000;
 
 /**
  * The `listDatabases` command, as one frozen document so the count and the listing of
@@ -881,6 +922,9 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       // The query language is JSON commands, not SQL, so the inline row editor's
       // `UPDATE ... SET` has nothing here to run against (issue #269).
       supportsInlineRowEdit: false,
+      // A different question from the flag above: the Generate Test Data dialog writes one
+      // `insertMany` command, which a collection takes (#1468).
+      supportsTestDataGeneration: true,
       // `prepareQuery` pins `offset` to 0 and returns the command untouched, so page two
       // would be page one. The find document's own `limit` stays the bound here.
       supportsResultPagination: false,
@@ -978,6 +1022,21 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       return;
     }
 
+    // The refusal the driver's monitoring saw, kept from the heartbeat events the
+    // client relays. When the request's deadline closes the client underneath a
+    // connect that is still selecting, the wait queue is drained with
+    // `MongoTopologyClosedError` (`topology.js`), which names no reason at all, so
+    // without this the person is told "client closed" over the `ECONNREFUSED` the
+    // driver already knew (#1573).
+    let lastRefusal: Error | undefined;
+    const onHeartbeatFailed = (event: mongodbDriver.ServerHeartbeatFailedEvent) => {
+      lastRefusal = event.failure;
+    };
+    // The client this connect created, for the second close on the deadline path:
+    // once the deadline has closed it, `this.client` is null and the settle handler
+    // in the race below would otherwise have nothing to close again.
+    let clientToClose: MongoClient | null = null;
+
     try {
       const connectionString = this.buildConnectionString();
       const options: MongoClientOptions = {
@@ -985,23 +1044,69 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         minPoolSize: this.poolConfig.min,
         maxIdleTimeMS: this.poolConfig.idleTimeout,
         connectTimeoutMS: this.poolConfig.acquireTimeout,
-        serverSelectionTimeoutMS: this.poolConfig.acquireTimeout,
+        serverSelectionTimeoutMS: MONGODB_SERVER_SELECTION_TIMEOUT_MS,
         ...this.buildTLSOptions(),
       };
 
       this.client = new MongoClient(connectionString, options);
-      await this.client.connect();
+      this.client.on("serverHeartbeatFailed", onHeartbeatFailed);
+      clientToClose = this.client;
 
-      // Get database name from connection string or config
-      const dbName = this.getDatabaseName();
-      this.db = this.client.db(dbName);
+      // The request's own bound on this connect (#1573). `serverSelectionTimeoutMS`
+      // is client-wide and has to clear a replica set election, so the driver holds
+      // a closed port for its full 30 s (#1458, #1518). `queryTimeout` is the
+      // deadline the request that started this connect already carries, so the race
+      // answers within it while every later operation keeps the 30 s election bound.
+      const connecting = this.client.connect();
+      let timedOut = false;
+      const deadline = new Promise<"deadline">((resolve) => {
+        const timer = setTimeout(() => {
+          timedOut = true;
+          resolve("deadline");
+        }, this.queryTimeout);
+        // The connect settled first: the timer must not hold the process open.
+        // When the deadline had already won, the settled connect closes the
+        // client a second time: over `mongodb+srv` the first close can land
+        // before the topology exists (`MongoClient._connect` resolves SRV
+        // before it creates the topology and never checks `hasBeenClosed`),
+        // so the topology created afterwards stays open. `finally` covers both
+        // settle outcomes; the catch below owns the cleanup when the driver
+        // refuses before the deadline.
+        connecting
+          .finally(() => {
+            if (timedOut) {
+              void clientToClose?.close().catch(() => {});
+            } else {
+              clearTimeout(timer);
+            }
+          })
+          .catch(() => {});
+      });
+      const first = await Promise.race([connecting, deadline]);
+      if (first !== "deadline" && !timedOut) {
+        await connecting;
 
-      // Test connection
-      await this.db.command({ ping: 1 });
+        // Get database name from connection string or config
+        const dbName = this.getDatabaseName();
+        this.db = this.client.db(dbName);
 
-      this.setConnected(true);
+        // Test connection
+        await this.db.command({ ping: 1 });
+
+        this.setConnected(true);
+        return;
+      }
     } catch (error) {
       this.setError(error instanceof Error ? error : new Error(String(error)));
+      // The error path must leave no client behind (#1573): `connect()` used to keep
+      // `this.client` set while `this.db` stayed null, so a later `connect()` found
+      // the half-open one and returned as if it were connected.
+      if (this.client) {
+        const client = this.client;
+        this.client = null;
+        this.db = null;
+        await client.close().catch(() => {});
+      }
       throw new ConnectionError(
         `Failed to connect to MongoDB: ${error instanceof Error ? error.message : error}`,
         "mongodb",
@@ -1009,6 +1114,27 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         this.config.port,
       );
     }
+
+    // The request's deadline closed this connect (#1573). Reached only on the timed
+    // out path, outside the catch above so the refusal is not wrapped twice.
+    // Draining the selection wait queue with `MongoTopologyClosedError` is what
+    // `Topology.close()` does (`topology.js:246-255`), so the in-flight connect
+    // rejects on its own. The client is closed again once the connect settles
+    // (`connecting.then` in the race above), so no client and no socket outlives
+    // the request even when the first close lands during the SRV window and is a
+    // no-op (`mongo_client.js`, see above).
+    const refusal = lastRefusal?.message ?? `timed out after ${this.queryTimeout} ms`;
+    const client = this.client;
+    this.client = null;
+    this.db = null;
+    this.setError(new Error(refusal));
+    void client?.close().catch(() => {});
+    throw new ConnectionError(
+      `Failed to connect to MongoDB: ${refusal}`,
+      "mongodb",
+      this.config.host,
+      this.config.port,
+    );
   }
 
   public async disconnect(): Promise<void> {
@@ -1241,10 +1367,9 @@ export class MongoDBProvider extends BaseDatabaseProvider {
           const serializedRows = rows.map((row) => this.serializeDocument(row));
 
           return {
-            rows: serializedRows,
             // Documents of one collection need not share keys, so the columns are every
-            // document's keys, not the first one's (see result-fields.ts).
-            fields: unionFields(serializedRows),
+            // document's keys, not the first one's, and an empty key is named (see result-fields.ts).
+            ...uniquelyKeyedRows(unionFields(serializedRows), serializedRows),
             affectedCount,
           };
         } catch (error) {
@@ -1323,9 +1448,16 @@ export class MongoDBProvider extends BaseDatabaseProvider {
 
   private inferSchemaFromDocuments(docs: Document[]): ColumnSchema[] {
     const fieldTypes = new Map<string, Set<string>>();
+    // In how many sampled documents each path is present. MongoDB declares no
+    // nullability, so a field is empty in two ways: absent, or present as `null`.
+    // Counting only the second marked a field most documents lack as NOT NULL (#1456).
+    // `_id` follows the same rule: present and non-null in every document of an ordinary
+    // collection, so not nullable there, but a `{_id: null}` document or a `$group` view
+    // answers null, and a fixed "never nullable" would contradict the sample.
+    const fieldPresence = new Map<string, number>();
 
     for (const doc of docs) {
-      this.extractFieldTypes(doc, "", fieldTypes);
+      this.extractFieldTypes(doc, "", fieldTypes, fieldPresence);
     }
 
     const columns: ColumnSchema[] = [];
@@ -1337,7 +1469,7 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       columns.push({
         name: fieldName,
         type,
-        nullable: types.has("null") || types.has("undefined"),
+        nullable: (fieldPresence.get(fieldName) ?? 0) < docs.length || types.has("null") || types.has("undefined"),
         isPrimary: fieldName === "_id",
         defaultValue: undefined,
       });
@@ -1359,13 +1491,21 @@ export class MongoDBProvider extends BaseDatabaseProvider {
     return columns.slice(0, MAX_INFERRED_FIELDS);
   }
 
-  private extractFieldTypes(doc: Document, prefix: string, fieldTypes: Map<string, Set<string>>, depth = 1): void {
+  private extractFieldTypes(
+    doc: Document,
+    prefix: string,
+    fieldTypes: Map<string, Set<string>>,
+    fieldPresence: Map<string, number>,
+    depth = 1,
+  ): void {
     for (const [key, value] of Object.entries(doc)) {
       const fieldName = prefix ? `${prefix}.${key}` : key;
 
       if (!fieldTypes.has(fieldName)) {
         fieldTypes.set(fieldName, new Set());
       }
+      // Once per document: keys are unique within a (sub)document and arrays are not descended.
+      fieldPresence.set(fieldName, (fieldPresence.get(fieldName) ?? 0) + 1);
 
       const type = this.getMongoType(value);
       fieldTypes.get(fieldName)!.add(type);
@@ -1384,7 +1524,7 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       // on an array what the same syntax means on a subdocument, and listing it
       // beside the others would invite exactly that confusion.
       if (type === "object" && depth < MAX_NESTED_FIELD_DEPTH) {
-        this.extractFieldTypes(value as Document, fieldName, fieldTypes, depth + 1);
+        this.extractFieldTypes(value as Document, fieldName, fieldTypes, fieldPresence, depth + 1);
       }
     }
   }
@@ -1479,11 +1619,20 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       // `freeStorage*` fields are gated, on the command's own `freeStorage: 1` option), so
       // this arm is not a deployment measured here; a database that really holds 0 bytes
       // still formats as "0 B".
-      const healthDataSize = measuredNumber(dbStats.dataSize);
+      //
+      // The figure is `dataSize + indexSize`, the same sum `getOverview()` publishes and
+      // under the same omit-when-either-is-missing rule. The two are shown side by side -
+      // the admin fleet view prints this one per row and adds the overview's bytes up as
+      // its total, and the Monitoring Overview's DB Size card reads the overview's - so
+      // publishing `dataSize` alone here made one MongoDB read two sizes at once.
+      const dataSizeBytes = measuredNumber(dbStats.dataSize);
+      const indexSizeBytes = measuredNumber(dbStats.indexSize);
+      const healthDatabaseSize =
+        dataSizeBytes === undefined || indexSizeBytes === undefined ? undefined : dataSizeBytes + indexSizeBytes;
 
       return {
         ...(currentConnections === undefined ? {} : { activeConnections: currentConnections }),
-        databaseSize: healthDataSize === undefined ? "N/A" : formatBytes(healthDataSize),
+        databaseSize: healthDatabaseSize === undefined ? "N/A" : formatBytes(healthDatabaseSize),
         cacheHitRatio:
           healthCacheHitRatio === undefined
             ? CACHE_HIT_RATIO_UNAVAILABLE
@@ -1533,6 +1682,44 @@ export class MongoDBProvider extends BaseDatabaseProvider {
     }
   }
 
+  /**
+   * Runs `validate` or `compact` on every entry `listCollections()` answers, for the
+   * whole-database actions that name no target (#1408).
+   *
+   * Views are skipped: the server refuses both commands on a view, and the first view
+   * used to abort the validate loop with a 500, so neither the collections before it
+   * nor the ones after it were reported. The test is view versus everything else, as in
+   * `mongoObjectKind`, so a time series collection is attempted rather than
+   * dropped. A refusal from any one collection is collected and named in the result
+   * instead of ending the run, and the compact loop no longer swallows it into a bare
+   * success.
+   */
+  private async maintainEachCollection(
+    command: "validate" | "compact",
+    verb: string,
+  ): Promise<Omit<MaintenanceResult, "executionTime">> {
+    const collections = await this.db!.listCollections().toArray();
+    let done = 0;
+    let views = 0;
+    const failed: string[] = [];
+    for (const coll of collections) {
+      if (readText(coll.type) === MONGODB_VIEW_TYPE) {
+        views++;
+        continue;
+      }
+      try {
+        await this.db!.command({ [command]: coll.name });
+        done++;
+      } catch (error) {
+        failed.push(`${coll.name} (${error instanceof Error ? error.message : String(error)})`);
+      }
+    }
+    const parts = [`${verb} ${done} ${done === 1 ? "collection" : "collections"}`];
+    if (views > 0) parts.push(`skipped ${views} ${views === 1 ? "view" : "views"}`);
+    if (failed.length > 0) parts.push(`failed on ${failed.length}: ${failed.join(", ")}`);
+    return { success: failed.length === 0, message: parts.join("; ") };
+  }
+
   public async runMaintenance(type: MaintenanceType, target?: string, container?: string): Promise<MaintenanceResult> {
     this.assertContainerIsBound(container);
     this.ensureConnected();
@@ -1551,11 +1738,7 @@ export class MongoDBProvider extends BaseDatabaseProvider {
               await this.db!.command({ validate: target });
               return { success: true, message: `Validated collection: ${target}` };
             } else {
-              const collections = await this.db!.listCollections().toArray();
-              for (const coll of collections) {
-                await this.db!.command({ validate: coll.name });
-              }
-              return { success: true, message: `Validated ${collections.length} collections` };
+              return await this.maintainEachCollection("validate", "Validated");
             }
 
           case "reindex":
@@ -1572,15 +1755,7 @@ export class MongoDBProvider extends BaseDatabaseProvider {
               await this.db!.command({ compact: target });
               return { success: true, message: `Compacted collection: ${target}` };
             } else {
-              const collections = await this.db!.listCollections().toArray();
-              for (const coll of collections) {
-                try {
-                  await this.db!.command({ compact: coll.name });
-                } catch {
-                  // Some collections might not be compactable
-                }
-              }
-              return { success: true, message: `Compacted collections` };
+              return await this.maintainEachCollection("compact", "Compacted");
             }
 
           case "check": {
@@ -1659,6 +1834,26 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       // measured here; it is the absence the optional field exists to carry, and the
       // Storage tab keys its whole breakdown off the key being present.
       const dataSizeBytes = measuredNumber(dbStats.dataSize);
+      const indexSizeBytes = measuredNumber(dbStats.indexSize);
+
+      // The published size is the SUM of the two measures the collection rows are built
+      // from, because it is the denominator of every share on the Storage tab and those
+      // numerators carry both: a collection's row is `collStats.size +
+      // collStats.totalIndexSize` (`getTableStats()`) and the Indexes card sums
+      // `totalIndexSize`. `dataSize` alone left index bytes in the numerator only, so the
+      // Indexes share and every collection carrying an index read far above 100% (measured
+      // on MongoDB 8.2: 1062.8% and 354.7%). The reason for the sum is FIELD PARITY, and
+      // MongoDB documents it: `dbStats.dataSize` and `dbStats.indexSize` are the
+      // database-level sums of the collection-level `collStats.size` and
+      // `collStats.totalIndexSize` - the two fields `getTableStats()` builds each row from -
+      // so the database figure is exactly the sum of the row figures. `dbStats.totalSize` is
+      // the other candidate and the wrong one: it is `storageSize + indexSize`, and
+      // `storageSize` is the on-disk footprint including pre-allocated space, so it is not
+      // the measure the rows are in. One absent addend is not a zero here: a sum of a
+      // reading and a guess is not a reading, and `dataSize` alone is the state the shares
+      // were wrong in.
+      const databaseSizeBytes =
+        dataSizeBytes === undefined || indexSizeBytes === undefined ? undefined : dataSizeBytes + indexSizeBytes;
 
       // Get index count
       let indexCount = 0;
@@ -1677,8 +1872,8 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         startTime: new Date(Date.now() - uptimeSeconds * 1000),
         ...(current === undefined ? {} : { activeConnections: current }),
         maxConnections: maxConnections ?? 0,
-        databaseSize: dataSizeBytes === undefined ? "N/A" : formatBytes(dataSizeBytes),
-        ...(dataSizeBytes === undefined ? {} : { databaseSizeBytes: dataSizeBytes }),
+        databaseSize: databaseSizeBytes === undefined ? "N/A" : formatBytes(databaseSizeBytes),
+        ...(databaseSizeBytes === undefined ? {} : { databaseSizeBytes }),
         tableCount: collections.length,
         indexCount,
       };
@@ -1819,8 +2014,37 @@ export class MongoDBProvider extends BaseDatabaseProvider {
     const collections = await this.db!.listCollections().toArray();
     const stats: TableStats[] = [];
 
+    // A time series collection is listed TWICE: the collection itself (`type:
+    // "timeseries"`) and the server's own bucket collection, `system.buckets.<name>`, and
+    // `collStats` answers the same bytes for both. Counting both put the collection's bytes
+    // into the rows twice, so the figures the Storage tab divides summed past
+    // `dbStats.dataSize + dbStats.indexSize`, every share read above 100% and the "Other
+    // (unattributed)" remainder went negative (measured on `mongo:8`: 110334 B of rows
+    // against a 105066 B total, #1455). Which rows are one collection is read from the
+    // listing itself rather than assumed: the bucket is skipped only when this same answer
+    // also reported the time series collection it belongs to.
+    const timeseriesCollections = new Set<string>();
+    for (const info of collections) {
+      if (readText(info.type) === MONGODB_TIMESERIES_TYPE) timeseriesCollections.add(readText(info.name));
+    }
+
     for (const collInfo of collections) {
       const collName = collInfo.name;
+
+      // `system.buckets.<name>` is the storage behind the time series collection `<name>`,
+      // which this answer already lists, and the two are one collection to a reader.
+      if (
+        collName.startsWith(MONGODB_TIMESERIES_BUCKET_PREFIX) &&
+        timeseriesCollections.has(collName.slice(MONGODB_TIMESERIES_BUCKET_PREFIX.length))
+      ) {
+        continue;
+      }
+
+      // Every other namespace the server reserves, `system.views` included. The object
+      // browser already skips these through `MONGODB_INTERNAL_PREFIX`; Monitoring was
+      // listing them as tables (#1428). `systemetrics` does not start with the prefix
+      // and stays.
+      if (collName.startsWith(MONGODB_INTERNAL_PREFIX)) continue;
 
       try {
         const collStats = await this.db!.command({ collStats: collName });
