@@ -87,7 +87,7 @@ docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
 npx @libredb/studio
 ```
 
-그런 다음 **http://localhost:3000**을 엽니다. 처음 실행하면 관리자 비밀번호가 로그에 출력되므로 별도의 설정이 필요하지 않습니다.
+그런 다음 http://localhost:3000을 엽니다. 처음 실행하면 관리자 비밀번호가 로그에 출력되므로 별도의 설정이 필요하지 않습니다.
 
 > localhost 또는 HTTPS가 아닌 주소로 Studio에 접속하는 경우(예: 로컬 네트워크의 `http://192.168.x.x:3000`)에는 `AUTH_COOKIE_SECURE=false`를 설정해야 합니다. 설정하지 않으면 상태 확인에는 문제가 없더라도 로그인이 실패하여 다시 로그인 페이지로 이동할 수 있습니다.
 
