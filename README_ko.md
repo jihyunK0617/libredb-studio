@@ -26,23 +26,32 @@
   ·
   <a href="https://wiki.postgresql.org/wiki/PostgreSQL_Clients#LibreDB_Studio">PostgreSQL Clients</a>
   ·
-  <a href="https://www.postgresql.org/download/products/1/">Software Catalogue</a>
+  <a href="https://www.postgresql.org/download/products/1/#:~:text=LibreDB%20Studio">Software Catalogue</a>
   ·
   <a href="https://wiki.postgresql.org/wiki/Community_Guide_to_PostgreSQL_GUI_Tools#LibreDB_Studio">Community Guide to GUI Tools</a>
 </p>
 <p align="center">
   또한
-  <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>、
-  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>、
-  <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB</a>、
-  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>、
-  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>、
-  <a href="https://docs.yugabyte.com/stable/integrations/tools/libredb-studio/">YugabyteDB</a>、
-  <a href="https://www.dragonflydb.io/docs/integrations/libredb-studio">DragonflyDB</a>、
-  <a href="https://opensearch.org/community-projects/">OpenSearch</a>、
-  <a href="https://duckdb.org/docs/preview/guides/sql_editors/libredb_studio">DuckDB</a>
+  <a href="https://node-oracledb.readthedocs.io/en/latest/user_guide/appendix_b.html#libredb-studio">Oracle</a>,
+  <a href="https://planet.mysql.com/showcase/?search=LibreDB">MySQL</a>,
+  <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>,
+  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>,
+  <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB</a>,
+  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>,
+  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>,
+  <a href="https://docs.yugabyte.com/stable/integrations/tools/libredb-studio/">YugabyteDB</a>,
+  <a href="https://www.tigerdata.com/docs/integrate/query-administration/libredb-studio">TimescaleDB</a>,
+  <a href="https://www.dragonflydb.io/docs/integrations/libredb-studio">DragonflyDB</a>,
+  <a href="https://microsoft.github.io/garnet/docs/welcome/compatibility#gui-tools">Garnet</a>,
+  <a href="https://opensearch.org/community-projects/#:~:text=LibreDB%20Studio">OpenSearch</a>,
+  <a href="https://duckdb.org/docs/preview/guides/sql_editors/libredb_studio">DuckDB</a>,
+  <a href="https://docs.starrocks.io/docs/integrations/IDE_integrations/LibreDB_Studio/">StarRocks</a>,
+  <a href="https://aiven.io/docs/products/postgresql/howto/connect-libredb-studio">Aiven for PostgreSQL</a>,
+  <a href="https://aiven.io/docs/products/mysql/howto/connect-libredb-studio">Aiven for MySQL</a>,
+  <a href="https://cwiki.apache.org/confluence/display/KAFKA/Ecosystem#:~:text=LibreDB%20Studio">Apache Kafka</a>,
+  <a href="https://cassandra.apache.org/_/ecosystem.html">Apache Cassandra</a>
   및
-  <a href="https://docs.starrocks.io/docs/integrations/IDE_integrations/LibreDB_Studio/">StarRocks</a>
+  <a href="https://druid.apache.org/libraries/#:~:text=LibreDB%20Studio">Apache Druid</a>
   공식 문서에도 등재되어 있습니다.
 </p>
 
@@ -72,7 +81,7 @@
   <a href="#빠른-시작"><strong>빠른 시작</strong></a> •
   <a href="#온라인-데모"><strong>온라인 데모</strong></a> •
   <a href="#설치-방법"><strong>설치 방법</strong></a> •
-  <a href="#libredb-studio-배포하기"><strong>LibreDB Studio 배포하기</strong></a>
+  <a href="#one-click-배포"><strong>LibreDB Studio 배포하기</strong></a>
 </p>
 
 ## 빠른 시작
@@ -87,7 +96,7 @@ docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
 npx @libredb/studio
 ```
 
-그런 다음 http://localhost:3000을 엽니다. 처음 실행하면 관리자 비밀번호가 로그에 출력되므로 별도의 설정이 필요하지 않습니다.
+그런 다음 [http://localhost:3000](http://localhost:3000)을 엽니다. 처음 실행하면 관리자 비밀번호가 로그에 출력되므로 별도의 설정이 필요하지 않습니다.
 
 > localhost 또는 HTTPS가 아닌 주소로 Studio에 접속하는 경우(예: 로컬 네트워크의 `http://192.168.x.x:3000`)에는 `AUTH_COOKIE_SECURE=false`를 설정해야 합니다. 설정하지 않으면 상태 확인에는 문제가 없더라도 로그인이 실패하여 다시 로그인 페이지로 이동할 수 있습니다.
 
@@ -135,9 +144,11 @@ LibreDB Studio는 다른 방식으로 접근합니다. **데이터를 도구가 
 
 LibreDB Studio는 데이터가 있는 환경에 직접 배포하는 방식을 지향합니다. Container, Helm chart, Operator, PaaS One-click template을 이용해 배포하거나, `npm i @libredb/studio`를 사용해 자신의 제품에 직접 임베드할 수도 있습니다. 데이터베이스를 외부에 노출할 필요도 없습니다.
 
-26개의 엔진을 하나의 인터페이스에서 사용할 수 있습니다. PostgreSQL, MySQL, Oracle, Db2 LUW, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Oxia를 모두 동일한 브라우저 환경에서 다룰 수 있으며, 각 엔진이 제공하는 정보에 따라 ER 다이어그램, schema 비교, 모니터링 기능도 사용할 수 있습니다. 이 가운데 Druid, Elasticsearch, OpenSearch는 SQL 인터페이스에서 데이터 조회만 지원하므로 LibreDB Studio에서도 읽기 전용으로 제공됩니다. 이들 엔진에서는 `UPDATE`나 `CREATE TABLE` 같은 명령을 지원하지 않기 때문에, LibreDB Studio에서도 해당 기능을 사용할 수 없는 것으로 명확하게 표시합니다. Cassandra의 경우 제공하는 행 수와 용량 정보가 정확하지 않아 객체 브라우저에 해당 정보를 표시하지 않습니다. 부정확한 값을 보여주는 것보다 아예 표시하지 않는 방식을 택한 것입니다. Cassandra에서 제공하는 파티션 수 추정치는 디스크에 기록된 파일을 기반으로 하는데, 실제 테스트에서는 500개의 행이 있는 테이블이 143개로 추정되기도 했습니다. Trino는 데이터베이스가 아니라 쿼리 엔진이라는 점에서 또 다른 차이가 있습니다. 따라서 primary key나 index 정보를 제공하지 않으며, 표시되는 데이터 크기 역시 Trino 자체가 아닌 연결된 각 connector의 시스템을 기준으로 합니다.
+27개의 엔진을 하나의 인터페이스에서 사용할 수 있습니다. PostgreSQL, MySQL, Oracle, Db2 LUW, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Databend, Apache Cassandra, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Oxia를 모두 동일한 브라우저 환경에서 다룰 수 있으며, 각 엔진이 제공하는 정보에 따라 ER 다이어그램, schema 비교, 모니터링 기능도 사용할 수 있습니다. 이 가운데 Druid, Elasticsearch, OpenSearch는 SQL 인터페이스에서 데이터 조회만 지원하므로 LibreDB Studio에서도 읽기 전용으로 제공됩니다. 이들 엔진에서는 `UPDATE`나 `CREATE TABLE` 같은 명령을 지원하지 않기 때문에, LibreDB Studio에서도 해당 기능을 사용할 수 없는 것으로 명확하게 표시합니다. Cassandra의 경우 제공하는 행 수와 용량 정보가 정확하지 않아 객체 브라우저에 해당 정보를 표시하지 않습니다. 부정확한 값을 보여주는 것보다 아예 표시하지 않는 방식을 택한 것입니다. Cassandra에서 제공하는 파티션 수 추정치는 디스크에 기록된 파일을 기반으로 하는데, 실제 테스트에서는 500개의 행이 있는 테이블이 143개로 추정되기도 했습니다. Trino는 데이터베이스가 아니라 쿼리 엔진이라는 점에서 또 다른 차이가 있습니다. 따라서 primary key나 index 정보를 제공하지 않으며, 표시되는 데이터 크기 역시 Trino 자체가 아닌 연결된 각 connector의 시스템을 기준으로 합니다.
 
-Oxia는 가장 최근에 추가된 엔진입니다. 에디터에 입력한 `oxia client` 읽기 명령을 gRPC client API를 통해 Oxia 0.16.10 또는 0.17.1 서버에서 실행합니다. 트리에는 shard가 표시되고 key 브라우저에서는 각 key를 확인할 수 있습니다. client는 네 가지 읽기 RPC와 health check만 호출할 수 있어 읽기 전용으로 동작하며, shard leader가 Connection에 지정된 주소 또는 조회된 data server 중 하나일 때만 Studio가 연결합니다.
+가장 최근에 추가된 엔진은 Databend입니다. SQL 편집기에서 입력한 쿼리는 별도의 드라이버 없이 Databend 자체 HTTP Query API를 통해 자체 호스팅 Databend 서버 또는 Databend Cloud 웨어하우스에서 실행되며, 데이터 조회와 쓰기를 모두 지원합니다. 객체 브라우저에서는 카탈로그와 데이터베이스를 비롯해 테이블, 뷰, 구체화된 뷰(Materialized View), 동적 테이블(Dynamic Table)을 확인할 수 있습니다. 각 SQL 문은 독립적인 세션에서 실행되므로 트랜잭션은 해당 트랜잭션을 시작한 문장이 종료될 때 함께 종료됩니다.
+
+Oxia는 Databend보다 먼저 추가된 엔진입니다. 에디터에 입력한 `oxia client` 읽기 명령을 gRPC client API를 통해 Oxia 0.16.10 또는 0.17.1 서버에서 실행합니다. 트리에는 shard가 표시되고 key 브라우저에서는 각 key를 확인할 수 있습니다. client는 네 가지 읽기 RPC와 health check만 호출할 수 있어 읽기 전용으로 동작하며, shard leader가 Connection에 지정된 주소 또는 조회된 data server 중 하나일 때만 Studio가 연결합니다.
 
 InfluxDB는 두 가지 Connection type으로 지원되며 각각 서로 다른 query language를 사용합니다. InfluxDB (InfluxQL)는 InfluxDB v1 HTTP API를 통해 InfluxDB 1.x, 2.x, 3에 InfluxQL을 전송하고, InfluxDB 3 (SQL)은 SQL API를 통해 InfluxDB 3 Core와 Enterprise에 SQL을 전송합니다. 브라우저에는 database와 measurement가 표시되며 InfluxDB 3에서는 measurement가 table로 표시됩니다. 두 Connection 모두 설정과 관계없이 읽기 전용으로 동작하며, 읽기 이외의 statement는 요청을 보내기 전에 거부되고 Studio는 write endpoint를 호출하지 않습니다.
 
@@ -159,7 +170,7 @@ Oxia, InfluxDB (InfluxQL), Milvus, Qdrant, Neo4j, etcd, Apache Kafka, Prometheus
 
 * **데이터가 있는 환경에 직접 배포**: Container, Helm chart, Rancher, OpenShift Operator, PaaS One-click template을 사용하거나 npm으로 직접 임베드할 수 있습니다.
 
-* **26개의 엔진, 하나의 인터페이스**: PostgreSQL, MySQL, Oracle, Db2 LUW, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Cassandra, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Oxia.
+* **27개의 엔진, 하나의 인터페이스**: PostgreSQL, MySQL, Oracle, Db2 LUW, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Databend, Cassandra, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Oxia.
 
 * **어디서든 사용 가능**: 브라우저와 모바일은 물론 Windows, macOS, Linux 데스크톱에서도 사용할 수 있습니다.
 
@@ -169,7 +180,7 @@ Oxia, InfluxDB (InfluxQL), Milvus, Qdrant, Neo4j, etcd, Apache Kafka, Prometheus
 
 
 <p align="center">
-  <img src="public/screenshots/connection-modal.png" alt="다중 데이터베이스 Connection 관리" width="100%" />  <br/><em>PostgreSQL, MySQL, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Cassandra, Redis, SQLite, DuckDB, libSQL, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Oxia에 연결할 수 있으며, SSL/TLS와 SSH 터널을 지원합니다. 단, Kafka는 TLS만 지원하며 SSH 터널은 지원하지 않습니다.</em>
+  <img src="public/screenshots/connection-modal.png" alt="다중 데이터베이스 Connection 관리" width="100%" />  <br/><em>PostgreSQL, MySQL, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Databend, Cassandra, Redis, SQLite, DuckDB, libSQL, Prometheus, Apache Kafka, etcd, Neo4j, Milvus, Qdrant, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Oxia에 연결할 수 있으며, SSL/TLS와 SSH 터널을 지원합니다. 단, Kafka는 TLS만 지원하며 SSH 터널은 지원하지 않습니다.</em>
 </p>
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/libredb/libredb-studio)
@@ -197,70 +208,7 @@ Oxia, InfluxDB (InfluxQL), Milvus, Qdrant, Neo4j, etcd, Apache Kafka, Prometheus
 
 ### Database Agent
 
-Studio의 주요 AI 인터페이스는 에디터 옆에 있는 **Agent 사이드바**이며, 아래의 모델 기반 기능들이 이를 보완합니다. **“어느 부서에 직원이 가장 많아?”**, **“이 쿼리는 왜 느리지?”**와 같이 원하는 작업을 입력하고 Start를 누르면 됩니다. Agent는 연결된 데이터베이스를 대상으로 SQL을 작성하고 결과를 조회한 뒤, 각 결론에 해당 결과의 출처가 명시된 보고서를 생성합니다.
-
-* **읽기 전용을 파서가 아닌 데이터베이스 자체에서 보장**: Agent가 실행하는 모든 쿼리는 전용 감사 파이프라인을 거칩니다. 드라이버에 전달되기 전에 정책을 확인하고, 감사 이벤트를 기록하고, 사용량 제한을 계산합니다(`executeAuditedOperation`, `src/lib/db/operations/execution.ts:129`). 또한 데이터베이스별 읽기 전용 설정을 사용합니다. PostgreSQL에서는 읽기 전용 transaction을 사용하고, SQLite에서는 각 쿼리마다 `PRAGMA query_only`를 다시 설정합니다. DuckDB에서는 `READ_ONLY` 엔진 핸들과 SQL guard를 함께 사용합니다. `READ_ONLY` 설정만으로는 `COPY … TO`, `EXPORT DATABASE`, 로컬 파일을 읽는 table function까지 차단할 수 없기 때문입니다. SQL Server에는 읽기 전용 transaction 자체가 없기 때문에 네 단계로 안전성을 확보합니다. Connection을 열 때 현재 session principal에 실제 쓰기 권한이 없는지 먼저 확인하고, optimizer가 쿼리를 실행하지 않은 상태에서 각 쿼리의 실행 가능 여부를 검증합니다. 서버에서 반환할 수 있는 행 수도 제한하며, 마지막으로 모든 쿼리를 항상 rollback되는 transaction 안에서 실행합니다. 쓰기 작업과 DDL은 데이터베이스에 도달하기 전에 차단되며, 실제 쿼리를 실행하는 `EXPLAIN ANALYZE`도 기본적으로 허용되지 않습니다. 이 파이프라인은 Agent에만 적용됩니다. 에디터에서 사용자가 직접 실행하는 쿼리는 provider를 바로 호출하며(`src/app/api/db/query/route.ts:44`), Agent의 정책 검사나 감사 기록을 거치지 않습니다.
-
-* **Agent 모드에서 읽기를 지원하는 엔진은 PostgreSQL, SQLite, DuckDB, SQL Server로 제한**: 데이터베이스 자체의 읽기 전용 기능을 이용하기 때문에 이를 구현한 provider에서만 사용할 수 있습니다. 현재 `queryReadOnly`가 구현된 provider는 `postgres.ts`, `sqlite.ts`, `duckdb/index.ts`, `mssql.ts`입니다. 다른 엔진에서 쿼리를 실행해야 하는 Agent 모드 workflow를 시작하면 실행이 시작되기 전에 차단됩니다. 요청이 provider factory까지 전달되더라도 `engine-unsupported`로 종료됩니다. **Plan** 모드는 모든 Connection에서 사용할 수 있습니다. Plan 모드에서는 모델이 tool을 사용하거나 쿼리를 직접 실행하지 않으며 데이터도 변경하지 않습니다. 대신 사용자가 직접 실행할 쿼리만 작성해 줍니다. GROUNDING은 모든 엔진을 지원합니다. PostgreSQL과 SQLite에서는 서버가 catalog query를 직접 구성하고, 다른 Connection에서는 해당 provider를 통해 schema 정보를 가져옵니다. 이는 사이드바에서 이미 사용하고 있는 조회 방식이므로 별도의 읽기 전용 쿼리 채널이 필요하지 않습니다. 따라서 두 제한은 서로 별개입니다. Agent 모드는 네 가지 엔진에서 지원되지만 GROUNDING은 모든 엔진에서 사용할 수 있습니다. schema를 읽지 못한 경우에는 이를 명확하게 알리며 존재하지 않는 테이블명을 임의로 만들어내지 않습니다.
-
-* **세 가지 workflow**: **Investigate**(질문에 대한 답변), **Optimize**(예상 실행 계획을 비교하고 index 추가 또는 쿼리 개선 방법 제안), **Assess**(테이블을 분석해 통계 정보를 제공하며 실제 데이터 값은 포함하지 않음).
-
-* **자동으로 실행하지 않음**: Agent가 스스로 실행을 시작하거나 에디터에 내용을 입력하지 않으며, 제안한 쿼리를 임의로 실행하지도 않습니다. 제안을 적용할지는 사용자가 직접 결정합니다.
-
-* **근거가 있는 결론만 제공**: 출처가 없는 결론은 보고서에 포함할 수 없습니다. 실행이 끝나면 **“Run answered”** 또는 **“Run did not answer”**로 결과를 판정하고 종료 상태와 함께 표시합니다.
-
-* **명확한 실행 제한**: workflow에 따라 한 번의 실행에서 18~45개의 쿼리를 실행할 수 있으며, 전체 실행 시간은 360~900초, 한 번의 조회 결과는 최대 200행으로 제한됩니다. workflow별 세부 제한은 [docs/AGENT.md](docs/AGENT.md)에서 확인할 수 있습니다.
-
-* **사용자가 원하는 모델 사용 가능**: Gemini(기본값), OpenAI, Ollama 또는 OpenAI-compatible endpoint를 사용할 수 있습니다. **Agent** 모드에서는 tool calling을 지원하는 모델이 필요합니다. Ollama의 경우 제조사의 설명만을 기준으로 판단하지 않고 실제 capability probe를 실행해 지원 여부를 확인합니다. 자세한 방법은 가이드에서 확인할 수 있습니다. **Plan** 모드는 tool을 사용하지 않으므로 capability probe도 수행하지 않습니다(`src/lib/agent/capability-gate.ts:74`). 따라서 Agent 모드에서 사용할 수 없는 모델이라도 Plan 모드에서는 사용할 수 있으며, 사이드바에서도 이 방법을 안내합니다.
-
-* **모델을 설정하지 않으면 AI 기능도 활성화되지 않음**: `LLM_*` 설정이 전혀 없다면 Agent 사이드바 자체가 표시되지 않으며 데이터가 네트워크 외부로 전송되지 않습니다. 단, API key의 유무 자체가 AI 기능의 활성화 여부를 결정하는 것은 아닙니다. Ollama와 custom endpoint는 API key 없이도 모델을 설정할 수 있으며, 이 경우 AI 기능은 활성화됩니다. Agent를 사용할 때 외부로 전송되는 데이터는 [`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md)에서 확인할 수 있습니다.
-
-Standalone 애플리케이션에서만 사용할 수 있습니다. 임베드용 `@libredb/studio` 패키지에는 Agent 인터페이스가 포함되지 않습니다.
-
-**가이드:** [`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) · **외부로 전송되는 데이터:** [`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md) · **동작 및 제한 사항:** [`docs/AGENT.md`](docs/AGENT.md) · **로컬 모델 선택 가이드:** [`docs/llms/`](docs/llms/README.md)
-
-### 모델 기반 기능
-
-* **다양한 LLM 지원**: 기본적으로 Gemini를 사용하며 OpenAI, Ollama 및 OpenAI-compatible endpoint(LM Studio, LiteLLM, vLLM)도 지원합니다.
-* **쿼리 안전성 분석**: 데이터에 영향을 줄 수 있는 쿼리(`DELETE`, `DROP`, `TRUNCATE`)를 실행하기 전에 AI를 이용해 위험 요소를 분석합니다. provider가 설정되어 있지 않은 경우에도 확인 대화상자는 표시되며 일반적인 쿼리 경고를 제공합니다. `LLM_PROVIDER`만 설정하고 필요한 인증 정보를 입력하지 않았다면 설정이 완료되지 않은 상태로 처리되며 해당 오류가 표시됩니다. 다른 설정 오류나 서비스 오류 역시 사용자에게 그대로 표시됩니다.
-* **AI 쿼리 설명**: EXPLAIN 실행 계획을 이해하기 쉬운 설명으로 바꾸고 최적화 방법을 제안합니다.
-* **Schema 인식**: 연결된 데이터베이스의 schema 정보를 함께 context로 전달하므로 사용자의 실제 테이블과 컬럼을 기반으로 설명할 수 있습니다.
-* **데이터 프로파일링 요약**: profiler가 수집한 컬럼별 통계를 읽기 쉬운 설명으로 정리합니다. 이때 전달되는 context에는 각 컬럼의 `min`, `max` 값이 포함되므로 실제 데이터 값이 모델에 전달될 수 있습니다. 자세한 내용은 [Agent 데이터 흐름](docs/AGENT_DATA_FLOW.md)을 참고하세요.
-
-### 전문 데이터 관리
-
-* **범용 Data Grid**: TanStack 기반의 virtualized rendering을 사용해 수백만 행 규모의 데이터를 처리할 수 있습니다.
-* **인라인 편집**: 셀을 더블 클릭해 Grid에서 값을 직접 수정할 수 있습니다. 단일 테이블의 행 업데이트를 SQL로 지원하는 엔진에서만 사용할 수 있으며, 지원하지 않는 엔진에서는 해당 기능이 표시되지 않습니다.
-* **컬럼 필터링**: 쿼리 결과를 컬럼별 텍스트로 필터링하여 데이터를 빠르게 탐색할 수 있습니다.
-* **인터랙티브 Pivot Table**: 클라이언트에서 Pivot Table을 구성할 수 있으며 COUNT, SUM, AVG, MIN, MAX의 5가지 aggregation function과 SQL 생성을 지원합니다.
-* **다양한 데이터 내보내기**: CSV와 JSON으로 바로 내보낼 수 있습니다. CSV 가져오기와 결과 내보내기에서는 쉼표(기본값), 세미콜론, 탭을 delimiter로 사용할 수 있습니다. 내보내기 메뉴에서 파일로 저장할 수 있는 모든 형식은 클립보드로 바로 복사할 수도 있습니다.
-
-### 고급 데이터 시각화
-
-* **8가지 차트 지원**: Bar, Line, Pie, Area, Scatter, Histogram, Stacked Bar, Stacked Area 차트를 지원하며 Recharts를 사용합니다.
-* **데이터 집계**: SUM, AVG, COUNT, MIN, MAX를 기준으로 데이터를 집계할 수 있습니다. 날짜 데이터는 시간, 일, 주, 월 또는 연도 단위로 그룹화할 수 있습니다.
-* **차트 저장**: 차트 설정을 저장해 언제든 다시 불러올 수 있으며 저장된 차트를 한곳에서 관리할 수 있습니다.
-* **차트 Dashboard**: 저장된 모든 차트를 Grid 형태로 표시하여 하단 패널에서 데이터를 한눈에 확인할 수 있습니다.
-
-### 화면 데이터 마스킹 (Preview)
-
-* **클라이언트 화면에서 민감 정보 마스킹**: 화면 공유나 데모 중 민감한 값이 노출되는 것을 줄이기 위해 브라우저 UI에서 값을 마스킹합니다. **서버에서 데이터를 차단하는 보안 기능은 아닙니다.** 인증된 사용자가 Query API를 통해 받는 응답에는 원본 값이 그대로 포함됩니다.
-* **컬럼명 패턴 매칭**: 이메일, 전화번호, 신용카드, SSN, 비밀번호, IP, 날짜, 금융 정보 등을 포함한 10개의 기본 패턴을 이용해 **결과 컬럼의 이름**을 정규식으로 검사합니다. 출력되는 컬럼명 자체가 패턴과 일치할 때 적용됩니다(예: `SELECT salary`). 현재 alias(`salary AS x`)를 사용하거나 aggregation(`SUM(salary)`)을 적용하면 마스킹되지 않습니다.
-* **설정 가능한 규칙**: Admin Panel에서 마스킹 패턴을 추가하거나 수정하고 활성화/비활성화할 수 있습니다. 이메일, 전화번호, 신용카드, SSN preset을 선택하면 “Add Pattern” 양식에 기본값이 입력되어 저장하기 전에 컬럼 패턴을 수정할 수 있습니다. Custom Pattern에는 정규식을 사용할 수 있습니다. 설정은 브라우저의 localStorage에 저장됩니다.
-* **RBAC 기반 UI 제어**: user 역할에서는 마스킹 기능을 끄거나 마스킹된 셀의 원본 값을 확인할 수 없습니다. admin 역할에서는 마스킹을 켜거나 끌 수 있으며 개별 셀의 원본 값을 일시적으로 확인할 수 있습니다. 공개된 값은 10초 후 자동으로 다시 숨겨집니다.
-* **내보내기 및 클립보드**: 화면에서 마스킹이 활성화되어 있다면 CSV, JSON, SQL INSERT를 파일로 저장하거나 클립보드에 복사할 때도 마스킹된 값이 사용됩니다. 단, API나 브라우저 DevTools를 사용하거나 admin 권한으로 원본 값을 확인하는 것까지 차단하는 기능은 아닙니다.
-* **UI 적용 범위**: Grid, 모바일 카드/테이블 View, Row Detail Panel, 클립보드 복사에서도 현재 적용 중인 마스킹 설정을 따릅니다.
-
-### 분석가 및 개발자 도구
-
-* **AI 데이터 프로파일링**: 한 번의 작업으로 테이블을 분석해 컬럼별 통계(null 비율, cardinality, 최솟값/최댓값, sample value)를 확인하고 AI가 이를 요약한 설명을 제공합니다.
-* **ORM 코드 생성기**: 실제 테이블 schema를 기반으로 TypeScript interface, Zod schema, Prisma model, Go struct, Python dataclass, Java POJO를 생성합니다.
-* **테스트 데이터 생성기**: schema를 기반으로 테스트용 데이터를 생성하며 이메일, 전화번호, 이름, 주소 등 30개 이상의 semantic column type을 자동으로 인식합니다. 결과를 INSERT 문 또는 MongoDB `insertMany` JSON으로 생성할 수 있습니다.
-* **데이터베이스 문서화**: 실제 schema를 기반으로 검색 가능한 Data Dictionary를 자동으로 생성합니다. AI 기반 설명을 추가할 수 있으며 Markdown 내보내기도 지원합니다.
-
-### Database Agent
-
-Studio의 주요 AI 인터페이스는 에디터 옆에 있는 **Agent 사이드바**이며, 아래에 설명된 모델 기반 기능들이 이를 보완합니다. *“어느 부서에 직원이 가장 많아?”*, *“이 쿼리는 왜 느리지?”*처럼 궁금한 내용을 입력하고 Start를 누르면 됩니다. Agent는 연결된 데이터베이스를 대상으로 SQL을 작성하고 결과를 조회한 뒤, 각 결론에 해당 결과의 출처가 명시된 보고서를 생성합니다.
+Studio의 주요 AI 인터페이스는 에디터 옆에 있는 **Agent 사이드바**이며, 아래에 설명된 모델 기반 기능들이 이를 보완합니다. “*어느 부서에 직원이 가장 많아?*”, “*이 쿼리는 왜 느리지?*”처럼 궁금한 내용을 입력하고 Start를 누르면 됩니다. Agent는 연결된 데이터베이스를 대상으로 SQL을 작성하고 결과를 조회한 뒤, 각 결론에 해당 결과의 출처가 명시된 보고서를 생성합니다.
 
 * **데이터를 변경할 수 없는 읽기 전용 Agent.** Agent가 실행하는 모든 쿼리는 별도의 실행 경로를 거칩니다. 데이터베이스 드라이버에 전달되기 전에 허용된 작업인지 확인하고, 실행 내역을 기록하고, 사용량 제한을 확인합니다(`executeAuditedOperation`, `src/lib/db/operations/execution.ts:129`). 또한 각 데이터베이스가 제공하는 읽기 전용 기능을 사용합니다. PostgreSQL에서는 읽기 전용 transaction을 사용하고, SQLite에서는 각 쿼리마다 `PRAGMA query_only`를 다시 설정합니다. DuckDB에서는 `READ_ONLY` 엔진 핸들과 SQL guard를 함께 사용합니다. `READ_ONLY` 설정만으로는 `COPY … TO`, `EXPORT DATABASE`, 로컬 파일을 읽는 table function까지 허용되기 때문입니다. SQL Server에는 읽기 전용 transaction이 없기 때문에 네 단계의 보호 장치를 사용합니다. Connection을 열 때 session principal에 쓰기 권한이 없는지 먼저 확인하고, optimizer를 통해 쿼리를 실제로 실행하지 않은 상태에서 각 쿼리의 허용 여부를 검증합니다. 서버에서 반환되는 행 수도 제한하며, 마지막으로 쿼리를 항상 rollback되는 transaction 안에서 실행합니다. 쓰기 작업과 DDL은 데이터베이스에 전달되기 전에 차단되며, 실제로 쿼리를 실행하는 `EXPLAIN ANALYZE`도 기본적으로 허용되지 않습니다. 이러한 실행 방식은 Agent에만 적용됩니다. 에디터에서 사용자가 직접 실행하는 쿼리는 provider를 바로 호출하며(`src/app/api/db/query/route.ts:44`), Agent에 적용되는 실행 확인이나 기록 과정은 거치지 않습니다.
 
@@ -270,9 +218,9 @@ Studio의 주요 AI 인터페이스는 에디터 옆에 있는 **Agent 사이드
 
 * **자동으로 실행하지 않음.** Agent는 스스로 실행을 시작하거나 에디터에 내용을 입력하지 않으며, 자신이 제안한 쿼리를 실행하지도 않습니다. 제안을 적용할지는 사용자가 직접 결정합니다.
 
-* **근거가 있는 결론만 제공.** 출처가 없는 결론은 보고서에 포함할 수 없습니다. 실행이 끝나면 *“Run answered”* 또는 *“Run did not answer”*로 질문에 답했는지를 판단하고 실행 종료 상태와 함께 표시합니다.
+* **근거가 있는 결론만 제공.** 출처가 없는 결론은 보고서에 포함할 수 없습니다. 실행이 끝나면 “*Run answered*” 또는 “*Run did not answer*”로 질문에 답했는지를 판단하고 실행 종료 상태와 함께 표시합니다.
 
-* **명확한 실행 제한**: workflow에 따라 한 번의 실행에서 18~45개의 쿼리를 실행할 수 있으며, 전체 실행 시간은 360~900초, 한 번의 조회 결과는 최대 200행으로 제한됩니다. workflow별 세부 제한은 [docs/AGENT.md](docs/AGENT.md)에서 확인할 수 있습니다.
+* **명확한 실행 제한**: workflow에 따라 한 번의 실행에서 18-45개의 쿼리를 실행할 수 있으며, 전체 실행 시간은 360-900초, 한 번의 조회 결과는 최대 200행으로 제한됩니다. workflow별 세부 제한은 [docs/AGENT.md](docs/AGENT.md)에서 확인할 수 있습니다.
 
 * **사용자가 원하는 모델 사용 가능.** Gemini(기본값), OpenAI, Ollama 또는 OpenAI-compatible endpoint를 사용할 수 있습니다. **Agent** 모드에서는 tool calling을 지원하는 모델이 필요합니다. Ollama에서는 제조사의 문서만을 기준으로 판단하지 않고 실제 테스트를 통해 지원 여부를 확인하며, 자세한 방법은 가이드에서 확인할 수 있습니다. **Plan** 모드는 tool을 사용하지 않으며 별도의 테스트도 수행하지 않습니다(`src/lib/agent/capability-gate.ts:74`). 따라서 Agent 모드에서 사용할 수 없는 모델이라도 Plan 모드에서는 사용할 수 있으며, 사이드바에서도 이 방법을 안내합니다.
 
@@ -377,6 +325,7 @@ Standalone 애플리케이션에서만 사용할 수 있습니다. 임베드용 
 | **Elasticsearch**    | Driver 없음, HTTP 사용(`POST /_sql?format=json`, 포트 9200)                   | 읽기 전용 SQL IDE, mapping 기반 index/field 브라우저, cluster health, index별 document 수 및 storage size. EXPLAIN, 유지보수 작업, slow query 및 session Panel은 제공하지 않습니다. 이러한 정보는 log file과 statistics API에 존재하지만 SQL 인터페이스에서는 접근할 수 없습니다. Elasticsearch SQL에는 `OFFSET`도 없기 때문에 결과의 두 번째 페이지를 요청할 수 없으며, 쿼리 조건을 좁히거나 조회 제한을 높여야 합니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | **OpenSearch**       | Driver 없음, HTTP 사용(`POST /_plugins/_sql`, 포트 9200)                      | Elasticsearch와 동일한 provider module을 사용하며 동일한 읽기 전용 SQL IDE와 브라우저를 제공합니다. OpenSearch에서는 `LIMIT n OFFSET m`을 사용할 수 있어 pagination도 지원합니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | **Trino**            | Driver 없음, HTTP 사용(Client Protocol, `POST /v1/statement`, 포트 8080)      | 설정된 모든 catalog를 대상으로 하는 전체 SQL IDE, `EXPLAIN (FORMAT JSON)` 실행 계획 트리, Connection에 지정된 catalog의 `information_schema` schema tree, `system.runtime` + `jmx` 모니터링, `SHOW STATS`를 통한 실제 행 수, 쿼리 취소 및 `kill_query` 유지보수를 지원합니다. Trino는 데이터를 직접 저장하지 않는 쿼리 엔진이므로 primary key, foreign key, index를 제공하지 않습니다. 따라서 ER 다이어그램에는 테이블만 표시되고 관계선은 표시되지 않으며 인라인 편집도 비활성화됩니다. 용량 Panel 역시 임의의 저장 용량을 표시하지 않고 catalog를 표시합니다. 실패한 쿼리도 HTTP 200으로 반환되며, 인증이 비활성화된 cluster에서도 일반 HTTP를 통한 비밀번호 전송은 거부됩니다.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Databend** | 없음 — HTTP (Databend 전용 Query API, `POST /v1/query`, 포트 8000) | 자체 호스팅 Databend 서버 또는 Databend Cloud Warehouse에 연결하는 SQL IDE입니다. 객체 브라우저에서 catalog, database, table, view, materialized view, dynamic table을 탐색할 수 있습니다. 일반 텍스트 `EXPLAIN` 실행 계획, 기본 catalog의 `system.*` 모니터링, Sessions 패널에서 `KILL QUERY`를 통한 쿼리 취소를 지원합니다. 각 statement는 독립된 session에서 실행되므로 transaction과 temporary table은 해당 statement가 끝날 때 종료됩니다. Databend는 key를 제공하지 않으므로 인라인 행 편집과 Create Table은 비활성화됩니다. loopback 또는 SSH tunnel을 사용하지 않는 호스트에 일반 HTTP로 비밀번호를 전송하려면 Connection에서 명시적으로 허용해야 합니다. Cloud Connection은 Warehouse를 지정하며, 객체 트리를 조회하는 첫 요청부터 Warehouse가 재개되고 과금될 수 있습니다. 사용자 지정 CA 및 client certificate를 사용하는 TLS와 SSH tunnel을 지원합니다. |
 | **Apache Cassandra** | `cassandra-driver`(순수 JavaScript, 네이티브 module 없음)                       | Native Protocol(포트 9042) 기반 CQL IDE, partition key와 clustering key를 표시하는 keyspace 브라우저, `system_views` 개요, uptime 및 실행 중인 statement를 제공합니다. EXPLAIN은 지원하지 않으며(CQL에 해당 keyword가 없음), 쿼리 취소 기능도 없고(protocol에서 지원하지 않음), 유지보수 작업도 제공하지 않습니다(각 작업은 `nodetool`을 통해 수행). 또한 **행 수와 용량을 표시하지 않습니다.** Cassandra가 제공하는 수치는 flush된 파일을 기반으로 한 partition 추정치와 정수 단위의 mebibyte뿐이므로, 부정확한 값을 표시하는 대신 아예 표시하지 않습니다.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | **Prometheus**       | Driver 없음, HTTP 사용(Prometheus HTTP API, 포트 9090)                        | PromQL Editor에서 입력한 텍스트를 그대로 서버로 전송하며 결과는 Table과 Chart 페이지에 표시됩니다. `rate(x[5m])[1h:1m]`처럼 step이 포함된 subquery는 timestamp를 X축으로 하는 Line Chart로 표시됩니다. 처음에는 첫 번째 series만 표시되며 나머지는 Y-Axis 메뉴에서 선택해 추가할 수 있습니다. series별로 하나의 선이 표시되고 최대 8개까지 동시에 표시되며, 이를 초과하면 “Showing first 8 of N series”가 표시됩니다. 단, Chart에서는 누락된 sample과 `NaN` 또는 `Inf` 값을 0으로 표시하므로 target별 scrape 시간이 다른 raw range query에서는 실제로 존재하지 않는 0 값이 표시될 수 있습니다. metric 브라우저는 label name을 컬럼으로 사용하고 metadata를 source로 사용합니다. rule group과 recording/alerting rule을 표시하며 현재 firing 중인 alert는 tree에서 별도로 표시됩니다. scrape pool과 scrape target을 확인할 수 있고 down 상태의 target도 tree에 표시됩니다. health, version, uptime, TSDB statistics도 제공합니다. 설계상 읽기 전용이며 관리 API를 호출하거나 remote write를 수행하지 않습니다. EXPLAIN과 유지보수 작업은 지원하지 않으며, parse endpoint는 아직 experimental 단계입니다. 일반 HTTP에서도 인증 정보 전송 자체를 차단하지 않으므로 신뢰할 수 없는 네트워크를 통과하는 경우 TLS를 사용해야 합니다. |
 | **Apache Kafka**     | `@platformatic/kafka`(순수 TypeScript, 포트 9092)                           | JSON 읽기 요청을 통해 partition, offset 또는 timestamp를 기준으로 topic을 읽거나 earliest offset 또는 최신 message부터 읽을 수 있습니다. key, value, header는 JSON, text 또는 base64로 decode되며 Confluent 형식의 value에는 schema id가 표시됩니다. topic 브라우저에서는 partition과 기본값이 아닌 설정을 확인할 수 있고 offline 상태이거나 replica가 부족한 topic은 별도로 표시됩니다. 두 protocol의 consumer group과 partition별 lag, broker와 해당 설정, health 상태, topic 수, disk usage도 확인할 수 있습니다. 설계상 읽기 전용으로, message를 produce하거나 offset을 commit하지 않으며 consumer group에 join하거나 topic을 생성하지 않습니다. custom CA와 client certificate를 사용하는 TLS를 지원하며 SASL PLAIN 또는 SCRAM은 TLS를 통해서만 사용할 수 있습니다. broker가 자신이 advertise한 주소를 통해 접근되기 때문에 SSH 터널은 지원하지 않습니다.                                                                                                                                                                                                                                |
@@ -389,7 +338,7 @@ Standalone 애플리케이션에서만 사용할 수 있습니다. 임베드용 
 | **Oxia**              | `@grpc/grpc-js`(순수 JavaScript, gRPC, 포트 6648) | 읽기 전용 `oxia client` 명령(`get`, `list`, `range-scan`)을 지원합니다. 트리에는 shard가 표시되고 key browser에서는 각 key를 확인할 수 있습니다. |
 | **Redis**            | `ioredis`                                                               | Command Editor, key 브라우저, INFO 기반 모니터링                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
-> **자체 Driver가 없는 엔진도 28개 더 지원합니다.** 위의 26개 엔진은 이 빌드에 포함된 Driver를 직접 사용합니다. 이외에도 28개 엔진이 동일한 wire protocol을 사용하는 기존 Driver를 통해 연결되므로, 26개의 Driver로 총 54개의 엔진을 지원합니다. MariaDB, Percona Server for MySQL, TiDB, Vitess, StarRocks, Apache Doris, OceanBase, SingleStore, Databend, Citus, Percona Distribution for PostgreSQL, ParadeDB, OrioleDB, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry(Incubating), CockroachDB, Materialize, RisingWave는 PostgreSQL 또는 MySQL 방식으로 연결됩니다. Valkey, DragonflyDB, KeyDB, Garnet은 Redis 방식으로, FerretDB는 MongoDB 방식으로, ScyllaDB는 Cassandra 방식으로, VictoriaMetrics는 Prometheus 방식으로, Redpanda는 Apache Kafka 방식으로 연결됩니다. 각 엔진은 실제 instance에 연결해 테스트했으며 사용할 수 있는 기능은 엔진에 따라 다릅니다. MariaDB, 두 Percona 배포판, TiDB, Vitess, AlloyDB Omni, Citus, TimescaleDB, YugabyteDB, ParadeDB, OrioleDB, Valkey, DragonflyDB, KeyDB, FerretDB는 기본적으로 해당 Driver의 원래 엔진과 동일하게 동작합니다. 다만 이 가운데 세 엔진은 신뢰하기 어려운 통계 값을 반환합니다. Citus의 distributed table과 TimescaleDB의 hypertable은 행 수와 용량을 누락하는 대신 잘못된 값을 반환하며, YugabyteDB는 `ANALYZE`를 실행하기 전까지 계속 0을 반환합니다. Vitess는 이 세 엔진에 포함되지 않습니다. 행 수와 용량을 byte 단위까지 정확하게 반환하지만 실행 중인 쿼리는 취소할 수 없습니다. vtgate가 `KILL QUERY`를 거부하므로 쿼리는 끝날 때까지 계속 실행됩니다. AlloyDB Omni 역시 이 세 엔진에 포함되지 않습니다. 2,000행은 정확히 2,000행으로, 270336 byte는 정확히 270336 byte로 표시합니다. 다만 두 가지 특이점이 있습니다. `version()` 결과 어디에도 AlloyDB라는 이름이 포함되지 않아 version Panel에서는 기본 PostgreSQL 17과 구분할 수 없습니다. 또한 AlloyDB의 `google_ml` 테이블 8개가 객체 브라우저에 표시되며 Connection 권한이 있는 모든 role에서 이를 읽을 수 있습니다. StarRocks는 자신을 MySQL 5.1로 표시하며 개요, health, session Panel을 사용할 수 없습니다. 모니터링 Panel은 6개만 표시되고 session Panel에는 해당 엔진에서 반환한 거부 사유가 표시됩니다. Apache Doris는 StarRocks에서 fork된 엔진으로 개요와 health Panel만 사용할 수 없습니다. Doris의 syntax에서 지원하지 않는 statement 형식이 원인입니다. 반면 실제 통계에서는 StarRocks보다 정확합니다. 실제로 해당 데이터가 있는 테이블에서 Doris는 2,000행과 10187 byte를 반환하지만 StarRocks는 처음에는 둘 다 0으로 표시합니다. StarRocks 자체의 background statistics collector가 더 느리기 때문이며, 3.3.22에서 실제 측정한 결과 StarRocks는 약 4.5분, Doris는 약 1분이 걸렸습니다. 또한 2026-09-16 수정 이전에는 StarRocks의 `INDEX_LENGTH`가 Doris처럼 실제 0이 아니라 NULL을 반환해 provider의 SQL에서 계산한 합계까지 NULL이 되면서 용량이 계속 0으로 표시되었습니다. index는 보고되지 않으며 foreign key는 생성할 수 있고 `SHOW CONSTRAINTS`에도 표시되지만 ER 다이어그램에서는 보이지 않고 실제로 강제되지도 않습니다. Cloudberry에서는 모니터링 Panel과 테이블/index 통계를 사용할 수 없습니다. 세 기능 모두 동일한 MPP planner 제한 때문입니다. 또한 foreign key가 실제로 강제되는 것처럼 읽히지만 실제로는 그렇지 않습니다. 다만 행 수는 정확합니다. CockroachDB에서는 객체 브라우저와 용량 Panel을 사용할 수 없습니다. OceanBase는 15개 화면 중 14개에서 응답하지만 실제로 유용한 화면은 12개입니다. health Panel은 tenant에 `performance_schema` 데이터베이스 자체가 없어 바로 실패하며 모든 용량 값은 0 B로 표시됩니다. 다만 `ANALYZE TABLE`을 실행한 이후에는 행 수가 정확하게 표시됩니다. SingleStore에서는 5개 화면을 사용할 수 없는데 원인은 SingleStore가 아니라 현재 provider 구현에 있습니다. provider가 모든 statement를 prepared statement protocol로 실행하지만 SingleStore는 4개 Panel에서 필요한 `SHOW`와 `EXPLAIN` statement에 이 protocol을 허용하지 않습니다. 현재 이 가운데 4개는 복구되었으며 아직 지원되지 않는 것은 Explain Panel입니다. 해당 syntax에는 `EXPLAIN JSON`이 필요하지만 이 statement는 두 protocol 모두에서 실패합니다. 통계 값은 잘못된 값이 아니라 누락된 상태로, 2,000행의 테이블도 0행과 0 B로 표시되며 `ANALYZE`를 실행해도 달라지지 않습니다. ScyllaDB에서는 Test Connection을 포함해 6개 화면을 사용할 수 없었으며 모두 동일하게 존재하지 않는 keyspace가 원인이었습니다. 개요, health, performance metric, active session, 모니터링 Panel이 Cassandra의 `system_views` virtual table을 읽지만 ScyllaDB에는 `system_views` keyspace가 없습니다. 현재는 이 다섯 화면이 오류를 발생시키는 대신 빈 상태로 처리되므로 Test Connection이 성공하고 Connection을 저장할 수 있습니다. 이 변경 전에는 Connection 자체를 저장할 수 없었습니다. Editor와 객체 브라우저는 정상적으로 사용할 수 있으며 18가지 CQL type 모두 같은 테스트에서 확인한 Cassandra 5.0.9와 동일한 byte를 반환합니다. ParadeDB와 OrioleDB는 모두 전체 기능을 사용할 수 있지만 서로 반대되는 특성이 있습니다. ParadeDB에서는 9개의 extension으로 인해 사용자 테이블이 2개뿐이어도 객체 브라우저에 41개의 객체가 표시되며 새로 설치한 환경에서는 Agent Plan 모드가 동작하지 않습니다. 반면 OrioleDB의 브라우저는 깔끔하지만 자체 storage가 PostgreSQL의 용량 함수에 표시되지 않기 때문에 모든 index가 0 byte로 표시되고 cache hit rate는 N/A로 표시됩니다. Materialize와 RisingWave는 일부 기능만 지원합니다. 객체 브라우저에서 table, view, materialized view와 해당 컬럼을 확인할 수 있지만 행 수, 크기, 모니터링 통계는 표시되지 않습니다. Databend에서는 Query Editor만 사용할 수 있습니다. catalog에 직접 요청하면 정상적으로 응답하지만 객체 브라우저는 비어 있는데, 현재 parameterized query에서 Databend가 구현하지 않은 prepared protocol을 사용하기 때문입니다. Garnet은 Redis와 동일하게 동작하며 Valkey, DragonflyDB와 함께 Redis와 유사한 세 엔진 중 하나입니다. 이들의 `INFO`에는 Redis compatibility level과 자체 version이 함께 표시되며, 개요에서는 자체 version을 먼저 표시합니다. 예를 들어 `Garnet 2.1.5 (Redis 7.4.3)`과 같이 표시됩니다. 다만 두 통계 값은 숫자로 표시되지만 실제로는 정보가 없는 경우입니다. `used_memory`를 제공하지 않아 모든 용량이 0 B로 표시되고 keyspace counter를 제공하지 않아 cache hit rate가 100%로 표시됩니다. VictoriaMetrics는 Prometheus Driver를 통해 PromQL을 실행하고 metric과 해당 label column, scrape target, series 수가 가장 많은 최대 50개의 metric을 표시합니다. 다만 single-node server에서는 rule을 평가하지 않으므로 rule folder는 비어 있습니다. 또한 Prometheus endpoint 가운데 필요한 세 가지를 제공하지 않아 개요, storage statistics, scrape pool folder는 동작하지 않습니다. metric source에는 unit이 표시되지 않고 target source에는 scrape interval과 timeout이 표시되지 않는데, VictoriaMetrics에서 해당 field를 보내지 않기 때문입니다. 아직 scrape되지 않은 target도 down으로 표시됩니다. 또한 string expression은 어떠한 행도 반환하지 않고 subquery의 data point는 evaluation time을 기준으로 이전 시점부터 계산되며, 결과 옆에는 PromQL의 info 또는 warning 메시지가 표시되지 않습니다. Redpanda는 Apache Kafka Driver를 통해 모든 Kafka 화면을 지원하며 topic, lag가 포함된 consumer group, broker, 데이터 읽기를 사용할 수 있습니다. 다만 개요에서는 최대 Connection 수가 0으로 표시되고 broker source에는 설정이 9개만 표시됩니다. Redpanda가 broker configuration 요청에 해당 항목만 반환하기 때문입니다. storage statistics에는 사용률이 표시되지 않습니다. 모든 consumer group은 classic으로 표시되며, Redpanda에서는 다른 group protocol을 지원하지 않으므로 이는 정상적인 결과입니다.
+> **자체 Driver가 없는 엔진도 27개 더 지원합니다.** 위의 27개 엔진은 이 빌드에 포함된 Driver를 직접 사용합니다. 이외에도 27개 엔진이 동일한 wire protocol을 사용하는 기존 Driver를 통해 연결되므로, 27개의 네이티브 엔진과 27개의 호환 엔진으로 총 54개의 엔진을 지원합니다. MariaDB, Percona Server for MySQL, TiDB, Vitess, StarRocks, Apache Doris, OceanBase, SingleStore, Citus, Percona Distribution for PostgreSQL, ParadeDB, OrioleDB, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry(Incubating), CockroachDB, Materialize, RisingWave는 PostgreSQL 또는 MySQL 방식으로 연결됩니다. Valkey, DragonflyDB, KeyDB, Garnet은 Redis 방식으로, FerretDB는 MongoDB 방식으로, ScyllaDB는 Cassandra 방식으로, VictoriaMetrics는 Prometheus 방식으로, Redpanda는 Apache Kafka 방식으로 연결됩니다. 각 엔진은 실제 instance에 연결해 테스트했으며 사용할 수 있는 기능은 엔진에 따라 다릅니다. MariaDB, 두 Percona 배포판, TiDB, Vitess, AlloyDB Omni, Citus, TimescaleDB, YugabyteDB, ParadeDB, OrioleDB, Valkey, DragonflyDB, KeyDB, FerretDB는 기본적으로 해당 Driver의 원래 엔진과 동일하게 동작합니다. 다만 이 가운데 세 엔진은 신뢰하기 어려운 통계 값을 반환합니다. Citus의 distributed table과 TimescaleDB의 hypertable은 행 수와 용량을 누락하는 대신 잘못된 값을 반환하며, YugabyteDB는 `ANALYZE`를 실행하기 전까지 계속 0을 반환합니다. Vitess는 이 세 엔진에 포함되지 않습니다. 행 수와 용량을 byte 단위까지 정확하게 반환하지만 실행 중인 쿼리는 취소할 수 없습니다. vtgate가 `KILL QUERY`를 거부하므로 쿼리는 끝날 때까지 계속 실행됩니다. AlloyDB Omni 역시 이 세 엔진에 포함되지 않습니다. 2,000행은 정확히 2,000행으로, 270336 byte는 정확히 270336 byte로 표시합니다. 다만 두 가지 특이점이 있습니다. `version()` 결과 어디에도 AlloyDB라는 이름이 포함되지 않아 version Panel에서는 기본 PostgreSQL 17과 구분할 수 없습니다. 또한 AlloyDB의 `google_ml` 테이블 8개가 객체 브라우저에 표시되며 Connection 권한이 있는 모든 role에서 이를 읽을 수 있습니다. StarRocks는 자신을 MySQL 5.1로 표시하며 개요, health, session Panel을 사용할 수 없습니다. 모니터링 Panel은 6개만 표시되고 session Panel에는 해당 엔진에서 반환한 거부 사유가 표시됩니다. Apache Doris는 StarRocks에서 fork된 엔진으로 개요와 health Panel만 사용할 수 없습니다. Doris의 syntax에서 지원하지 않는 statement 형식이 원인입니다. 반면 실제 통계에서는 StarRocks보다 정확합니다. 실제로 해당 데이터가 있는 테이블에서 Doris는 2,000행과 10187 byte를 반환하지만 StarRocks는 처음에는 둘 다 0으로 표시합니다. StarRocks 자체의 background statistics collector가 더 느리기 때문이며, 3.3.22에서 실제 측정한 결과 StarRocks는 약 4.5분, Doris는 약 1분이 걸렸습니다. 또한 2026-09-16 수정 이전에는 StarRocks의 `INDEX_LENGTH`가 Doris처럼 실제 0이 아니라 NULL을 반환해 provider의 SQL에서 계산한 합계까지 NULL이 되면서 용량이 계속 0으로 표시되었습니다. index는 보고되지 않으며 foreign key는 생성할 수 있고 `SHOW CONSTRAINTS`에도 표시되지만 ER 다이어그램에서는 보이지 않고 실제로 강제되지도 않습니다. Cloudberry에서는 모니터링 Panel과 테이블/index 통계를 사용할 수 없습니다. 세 기능 모두 동일한 MPP planner 제한 때문입니다. 또한 foreign key가 실제로 강제되는 것처럼 읽히지만 실제로는 그렇지 않습니다. 다만 행 수는 정확합니다. CockroachDB에서는 객체 브라우저와 용량 Panel을 사용할 수 없습니다. OceanBase는 15개 화면 중 14개에서 응답하지만 실제로 유용한 화면은 12개입니다. health Panel은 tenant에 `performance_schema` 데이터베이스 자체가 없어 바로 실패하며 모든 용량 값은 0 B로 표시됩니다. 다만 `ANALYZE TABLE`을 실행한 이후에는 행 수가 정확하게 표시됩니다. SingleStore에서는 5개 화면을 사용할 수 없는데 원인은 SingleStore가 아니라 현재 provider 구현에 있습니다. provider가 모든 statement를 prepared statement protocol로 실행하지만 SingleStore는 4개 Panel에서 필요한 `SHOW`와 `EXPLAIN` statement에 이 protocol을 허용하지 않습니다. 현재 이 가운데 4개는 복구되었으며 아직 지원되지 않는 것은 Explain Panel입니다. 해당 syntax에는 `EXPLAIN JSON`이 필요하지만 이 statement는 두 protocol 모두에서 실패합니다. 통계 값은 잘못된 값이 아니라 누락된 상태로, 2,000행의 테이블도 0행과 0 B로 표시되며 `ANALYZE`를 실행해도 달라지지 않습니다. ScyllaDB에서는 Test Connection을 포함해 6개 화면을 사용할 수 없었으며 모두 동일하게 존재하지 않는 keyspace가 원인이었습니다. 개요, health, performance metric, active session, 모니터링 Panel이 Cassandra의 `system_views` virtual table을 읽지만 ScyllaDB에는 `system_views` keyspace가 없습니다. 현재는 이 다섯 화면이 오류를 발생시키는 대신 빈 상태로 처리되므로 Test Connection이 성공하고 Connection을 저장할 수 있습니다. 이 변경 전에는 Connection 자체를 저장할 수 없었습니다. Editor와 객체 브라우저는 정상적으로 사용할 수 있으며 18가지 CQL type 모두 같은 테스트에서 확인한 Cassandra 5.0.9와 동일한 byte를 반환합니다. ParadeDB와 OrioleDB는 모두 전체 기능을 사용할 수 있지만 서로 반대되는 특성이 있습니다. ParadeDB에서는 9개의 extension으로 인해 사용자 테이블이 2개뿐이어도 객체 브라우저에 41개의 객체가 표시되며 Agent Plan 모드는 최소 권한 역할에서는 정상적으로 동작하지만, 일반 PostgreSQL과 마찬가지로 `postgres` 슈퍼유저로 실행하면 거부됩니다. 반면 OrioleDB의 브라우저는 깔끔하지만 자체 storage가 PostgreSQL의 용량 함수에 표시되지 않기 때문에 모든 index가 0 byte로 표시되고 cache hit rate는 N/A로 표시됩니다. Materialize와 RisingWave는 일부 기능만 지원합니다. 객체 브라우저에서 table, view, materialized view와 해당 컬럼을 확인할 수 있지만 행 수, 크기, 모니터링 통계는 표시되지 않습니다. Garnet은 Redis와 동일하게 동작하며 Valkey, DragonflyDB와 함께 Redis와 유사한 세 엔진 중 하나입니다. 이들의 `INFO`에는 Redis compatibility level과 자체 version이 함께 표시되며, 개요에서는 자체 version을 먼저 표시합니다. 예를 들어 `Garnet 2.1.5 (Redis 7.4.3)`과 같이 표시됩니다. 다만 두 통계 값은 숫자로 표시되지만 실제로는 정보가 없는 경우입니다. `used_memory`를 제공하지 않아 모든 용량이 0 B로 표시되고 keyspace counter를 제공하지 않아 cache hit rate가 100%로 표시됩니다. VictoriaMetrics는 Prometheus Driver를 통해 PromQL을 실행하고 metric과 해당 label column, scrape target, series 수가 가장 많은 최대 50개의 metric을 표시합니다. 다만 single-node server에서는 rule을 평가하지 않으므로 rule folder는 비어 있습니다. 또한 Prometheus endpoint 가운데 필요한 세 가지를 제공하지 않아 개요, storage statistics, scrape pool folder는 동작하지 않습니다. metric source에는 unit이 표시되지 않고 target source에는 scrape interval과 timeout이 표시되지 않는데, VictoriaMetrics에서 해당 field를 보내지 않기 때문입니다. 아직 scrape되지 않은 target도 down으로 표시됩니다. 또한 string expression은 어떠한 행도 반환하지 않고 subquery의 data point는 evaluation time을 기준으로 이전 시점부터 계산되며, 결과 옆에는 PromQL의 info 또는 warning 메시지가 표시되지 않습니다. Redpanda는 Apache Kafka Driver를 통해 모든 Kafka 화면을 지원하며 topic, lag가 포함된 consumer group, broker, 데이터 읽기를 사용할 수 있습니다. 다만 개요에서는 최대 Connection 수가 0으로 표시되고 broker source에는 설정이 9개만 표시됩니다. Redpanda가 broker configuration 요청에 해당 항목만 반환하기 때문입니다. storage statistics에는 사용률이 표시되지 않습니다. 모든 consumer group은 classic으로 표시되며, Redpanda에서는 다른 group protocol을 지원하지 않으므로 이는 정상적인 결과입니다.
 
 > 각 엔진의 세부 정보와 테스트에 사용한 정확한 version은 [`docs/providers/README.md`](docs/providers/README.md#wire-compatible-engines)에서 확인할 수 있습니다. 실제 엔진에 연결해 테스트한 경우에만 해당 엔진의 이름을 문서에 추가하므로, 이 문서에 없는 엔진은 지원하지 않는다는 의미가 아니라 아직 테스트하지 않았다는 의미입니다.
 
@@ -454,7 +403,7 @@ docker run \
 
 > **IPv6**: Container는 시작할 때 bind address를 자동으로 선택하며 `::`를 우선 사용합니다. 하나의 socket에서 IPv4와 IPv6를 모두 처리하므로 IPv6-only host에서도 추가 설정이 필요하지 않습니다. namespace에서 IPv6를 사용할 수 없다면 `0.0.0.0`으로 fallback하며 선택된 주소가 log에 기록됩니다. `-e HOSTNAME=0.0.0.0`을 추가하면 IPv4로 고정할 수 있습니다. 자세한 내용과 Kubernetes에서의 설정 방법은 [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md#network-exposure-bind-address)를 참고하세요.
 
-http://localhost:3000을 엽니다. 위 명령어에서는 비밀번호를 설정하지 않았으므로 처음 실행할 때 비밀번호가 자동으로 생성되어 Container log에 출력됩니다. `docker logs libredb-studio`로 확인한 뒤 `admin@libredb.org`와 출력된 비밀번호로 로그인하거나 `ADMIN_PASSWORD`를 직접 설정할 수 있습니다.
+[http://localhost:3000](http://localhost:3000)을 엽니다. 위 명령어에서는 비밀번호를 설정하지 않았으므로 처음 실행할 때 비밀번호가 자동으로 생성되어 Container log에 출력됩니다. `docker logs libredb-studio`로 확인한 뒤 `admin@libredb.org`와 출력된 비밀번호로 로그인하거나 `ADMIN_PASSWORD`를 직접 설정할 수 있습니다.
 
 > **인증 환경 변수 (local provider):** `AUTH_BOOTSTRAP=off`인 경우에만 `ADMIN_PASSWORD`와 `JWT_SECRET`을 반드시 설정해야 합니다. 그 외에는 두 값 모두 처음 실행할 때 자동으로 생성됩니다(아래 [별도 설정 없이 처음 실행](#별도-설정-없이-처음-실행) 참고). `USER_EMAIL` / `USER_PASSWORD`는 선택 사항이며, 설정하지 않으면 관리자 계정만 생성됩니다(기본 사용자 비밀번호를 임의로 설정하지 않습니다). `ADMIN_EMAIL`의 기본값은 `admin@libredb.org`입니다. OIDC(`NEXT_PUBLIC_AUTH_PROVIDER=oidc`)를 사용하는 경우에는 이 설정들이 필요하지 않습니다.
 
@@ -533,7 +482,7 @@ journalctl -u libredb-studio
    bun dev
    ```
 
-   http://localhost:3000을 엽니다.
+   [http://localhost:3000](http://localhost:3000)을 엽니다.
 
 
 ### 자체 애플리케이션에 임베드 (`@libredb/studio`)
